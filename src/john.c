@@ -64,6 +64,7 @@ static int john_omp_threads_new;
 #include "charset.h"
 #include "single.h"
 #include "wordlist.h"
+#include "fmt_alias.h"
 #include "inc.h"
 #include "mask.h"
 #include "mkv.h"
@@ -272,6 +273,7 @@ static int exit_status = 0;
 
 static void john_register_one(struct fmt_main *format)
 {
+	fmt_alias_register(format);
 	if (options.format) {
 		char *pos = strchr(options.format, '*');
 
@@ -474,6 +476,8 @@ static void john_register_all(void)
 		fprintf(stderr, "Unknown ciphertext format name requested\n");
 		error();
 	}
+
+	fmt_alias_init();
 }
 
 static void john_log_format(void)
