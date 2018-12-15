@@ -18,29 +18,64 @@
 #define _JOHN_MISC_H
 
 #include <stdio.h>
-#ifndef _MSC_VER
-#include <strings.h>
+#include "jumbo.h"
+
+#if !AC_BUILT
+ #include <string.h>
+ #ifndef _MSC_VER
+  #include <strings.h>
+ #endif
 #else
-#undef inline
-#define inline static
+ #include "autoconfig.h"
+ #if STRING_WITH_STRINGS
+  #include <string.h>
+  #include <strings.h>
+ #elif HAVE_STRING_H
+  #include <string.h>
+ #elif HAVE_STRINGS_H
+  #include <strings.h>
+ #endif
 #endif
-#include <string.h>
 
 /*
  * Exit on error. Logs the event, closes john.pot and the log file, and
  * terminates the process with non-zero exit status.
  */
-extern void error(void);
+extern void real_error(char *file, int line)
+#ifdef __GNUC__
+	__attribute__ ((__noreturn__));
+#else
+	;
+#endif
+
+#define error(...) real_error(__FILE__, __LINE__)
+
+/*
+ * Exit on error with message.  Will call real_error to do
+ * the final exiting, after printing error message.
+ */
+extern void real_error_msg(char *file, int line, char *format, ...)
+#ifdef __GNUC__
+	__attribute__ ((__noreturn__))
+	__attribute__ ((format (printf, 3, 4)));
+#else
+	;
+#endif
+
+#define error_msg(...) real_error_msg(__FILE__, __LINE__,  __VA_ARGS__)
 
 /*
  * Similar to perror(), but supports formatted output, and calls error().
  */
-extern void pexit(char *format, ...)
+extern void real_pexit(char *file, int line, char *format, ...)
 #ifdef __GNUC__
-	__attribute__ ((format (printf, 1, 2)));
+	__attribute__ ((__noreturn__))
+	__attribute__ ((format (printf, 3, 4)));
 #else
 	;
 #endif
+
+#define pexit(...) real_pexit(__FILE__, __LINE__, __VA_ARGS__)
 
 /*
  * Attempts to write all the supplied data. Returns the number of bytes
@@ -56,6 +91,17 @@ extern int write_loop(int fd, const char *buffer, int count);
 extern char *fgetl(char *s, int size, FILE *stream);
 
 /*
+ * Similar to fgetl(), but handles super long lines (longer than
+ * size, by allocating a buffer, and filling it. So, if the return
+ * to fgetll is a valid pointer, but NOT pointed to the original
+ * s buffer, then the caller MUST call MEM_FREE to that pointer
+ * once it is done with it.
+ */
+#ifndef _JOHN_MISC_NO_LOG
+extern char *fgetll(char *s, size_t size, FILE *stream);
+#endif
+
+/*
  * Similar to strncpy(), but terminates with only one NUL if there's room
  * instead of padding to the supplied size like strncpy() does.
  */
@@ -67,9 +113,19 @@ extern char *strnfcpy(char *dst, const char *src, int size);
 extern char *strnzcpy(char *dst, const char *src, int size);
 
 /*
+ * Similar to the above, but also converts to lowercase in a single pass
+ */
+extern char *strnzcpylwr(char *dst, const char *src, int size);
+
+/*
  * Similar to the strnzcpy, but returns the length of the string.
  */
 extern int strnzcpyn(char *dst, const char *src, int size);
+
+/*
+ * Similar to the strnzcpylwr, but returns the length of the string.
+ */
+extern int strnzcpylwrn(char *dst, const char *src, int size);
 
 /*
  * Similar to strncat(), but total buffer size is supplied, and always NUL
@@ -78,130 +134,22 @@ extern int strnzcpyn(char *dst, const char *src, int size);
 extern char *strnzcat(char *dst, const char *src, int size);
 
 /*
- * Portable basename() function.  DO NOT USE basename().  Use this
- * proper working equivelent.  The _r version is thread safe. In the
- * _r version, pass in a buffer that is at least strlen(name)+1 bytes
- * long, however, PATH_BUFFER_SIZE+1 can also be used.
- *
- *  here is what defined:
- *    if name is null, or points to a null string (0 byte), then a '.' is returned.
- *    if name is all / chars (or \ chars), then a single / (or \) is returned.
- *    DOS drive letters are ignored.
- *    / or \ chars are properly handled.
- *    Trailing / (or \) are removed, IF there was real path data in there.
- *
- *  here are some examples:
- *    jtr_basename("/user/lib")      == lib
- *    jtr_basename("/user/")         == user
- *    jtr_basename("/")              == /
- *    jtr_basename("//")             == /
- *    jtr_basename("///")            == /
- *    jtr_basename("//user//lib//")  == lib
- *    jtr_basename("c:\\txt.doc")    == txt.doc
- *    jtr_basename("c:txt.doc")      == txt.doc
- *    jtr_basename("c:b/c\\txt.doc/")== txt.doc
- *    jtr_basename("c:\\txt.doc\\")  == txt.doc
- *    jtr_basename("c:")             == .
- *    jtr_basename("")               == .
- *    jtr_basename(NULL)             == .
- *    jtr_basename("\\user\\lib")    == lib
- *    jtr_basename("\\user\\")       == user
- *    jtr_basename("\\")             == \
- *    jtr_basename("\\\\")           == \
- *    jtr_basename("one")            == one
+ * Similar to atoi(), but properly handles unsigned int.  Do not use
+ * atoi() for unsigned data if the data can EVER be over MAX_INT.
  */
-extern char *jtr_basename(const char *name);
-extern char *jtr_basename_r(const char *name, char *buf);
-#undef basename
-#define basename(a) jtr_basename(a)
+extern unsigned atou(const char *src);
 
 /*
- * Removes suffixes frome src.
+ * Similar to strtok(), but properly handles adjacent delimiters as
+ * empty strings.  strtok() in the CRTL merges adjacent delimiters
+ * and sort of 'skips' them. This one also returns 'empty' tokens
+ * for any leading or trailing delims. strtok() strips those off
+ * also.
  */
-extern char *strip_suffixes(const char *src, const char *suffixes[], int count);
-
-/* Return the first occurrence of NEEDLE in HAYSTACK.
-   Faster implementation by Christian Thaeter <ct at pipapo dot org>
-   http://sourceware.org/ml/libc-alpha/2007-12/msg00000.html
-   LGPL 2.1+ */
-#ifndef INCLUDED_FROM_MISC_C
-#if __GNUC__ && !__GNUC_STDC_INLINE__
-extern
-#endif
-inline
-#endif
-void *jtr_memmem(const void *haystack, size_t haystack_len,
-                        const void *needle, size_t needle_len)
-{
-	/* not really Rabin-Karp, just using additive hashing */
-	char* haystack_ = (char*)haystack;
-	char* needle_ = (char*)needle;
-	int hash = 0;		/* static hash value of the needle */
-	int hay_hash = 0;	/* rolling hash over the haystack */
-	char* last;
-	size_t i;
-
-	if (haystack_len < needle_len)
-		return NULL;
-
-	if (!needle_len)
-		return haystack_;
-
-	/* initialize hashes */
-	for (i = needle_len; i; --i)
-	{
-		hash += *needle_++;
-		hay_hash += *haystack_++;
-	}
-
-	/* iterate over the haystack */
-	haystack_ = (char*)haystack;
-	needle_ = (char*)needle;
-	last = haystack_+(haystack_len - needle_len + 1);
-	for (; haystack_ < last; ++haystack_)
-	{
-		if (hash == hay_hash &&
-		    *haystack_ == *needle_ &&	/* prevent calling memcmp */
-		    !memcmp (haystack_, needle_, needle_len))
-			return haystack_;
-
-		/* roll the hash */
-		hay_hash -= *haystack_;
-		hay_hash += *(haystack_+needle_len);
-	}
-
-	return NULL;
-}
-
-/*
- * Converts a string to lowercase.
- */
-#ifndef _MSC_VER
-extern char *strlwr(char *s);
-extern char *strupr(char *s);
-#else
-#define bzero(a,b) memset(a,0,b)
-#define strlwr _strlwr
-#define strupr _strupr
-#include "memdbg_defines.h"
-#ifndef MEMDBG_ON
-#define strdup _strdup
-#endif
-#define strncasecmp _strnicmp
-#define strcasecmp _stricmp
-#define alloca _alloca
-#define unlink _unlink
-#define fileno _fileno
-#pragma warning (disable : 4018 297 )
-#undef inline
-#define inline _inline
-#undef  snprintf
-#define snprintf sprintf_s
-#define atoll _atoi64
-#endif
+char *strtokm(char *s1, const char *delimit);
 
 #ifndef __has_feature
-# define __has_feature(x) 0
+ #define __has_feature(x) 0
 #endif
 
 #if /* is ASAN enabled? */ \
@@ -210,8 +158,31 @@ extern char *strupr(char *s);
   #define ATTRIBUTE_NO_ADDRESS_SAFETY_ANALYSIS \
         __attribute__((no_address_safety_analysis)) \
         __attribute__((noinline))
+  #define WITH_ASAN
 #else
   #define ATTRIBUTE_NO_ADDRESS_SAFETY_ANALYSIS
 #endif
+
+/*
+ * itoa type functions. Thread and buffer safe. Handles base from 2 to 36
+ * note if buffer empty (result_len < 1), then a constant "" is returned
+ * otherwise all work is done in the result buffer (which should be
+ * result_len bytes long). If the buffer is too small, the number returned
+ * will be truncated, but the LSB of data will be returned.  Not exactly
+ * the right result, BUT buffer safe.
+ * A truncated example would be: jtr_itoa(-1234567,b,6,10) returns "-4567"
+ * note, itoa and utoa exist on certain systems (even though not stdC funcs)
+ * so they have been renamed.
+ */
+const char *jtr_itoa(int num, char *result, int result_len, int base);
+const char *jtr_utoa(unsigned int num, char *result, int result_len, int base);
+const char *jtr_lltoa(long long num, char *result, int result_len, int base);
+const char *jtr_ulltoa(unsigned long long num, char *result, int result_len, int base);
+
+/*
+ * Change some large number to a string possibly using SI prefix
+ * eg. 437281954 -> "417 M"
+ */
+extern char *human_prefix(uint64_t num);
 
 #endif

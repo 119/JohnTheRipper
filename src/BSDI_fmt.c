@@ -1,6 +1,6 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 1996-2001,2010-2012 by Solar Designer
+ * Copyright (c) 1996-2001,2010-2012,2015,2017 by Solar Designer
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted.
@@ -8,6 +8,7 @@
  * There's ABSOLUTELY NO WARRANTY, express or implied.
  */
 
+#include <stdint.h>
 #include <string.h>
 
 #include "arch.h"
@@ -38,6 +39,9 @@ static struct fmt_tests tests[] = {
 	{"_J9..XXXXsqM/YSSP..Y", "*U*U*U*U*"},
 	{"_J9..XXXXVL7qJCnku0I", "*U*U*U*U*U*U*U*U"},
 	{"_J9..XXXXAj8cFbP5scI", "*U*U*U*U*U*U*U*U*"},
+	{"_J9..XXXXAj8cFbP5scI",
+	    "\xaa\xd5\xaa\xd5\xaa\xd5\xaa\xd5"
+	    "\xaa\xd5\xaa\xd5\xaa\xd5\xaa\xd5\xaa"},
 	{"_J9..SDizh.vll5VED9g", "ab1234567"},
 	{"_J9..SDizRjWQ/zePPHc", "cr1234567"},
 	{"_J9..SDizxmRI1GjnQuE", "zxyDPWgydbQjgq"},
@@ -50,8 +54,8 @@ static struct fmt_tests tests[] = {
 
 #define ALGORITHM_NAME			DES_BS_ALGORITHM_NAME
 
-#define BINARY_SIZE			sizeof(ARCH_WORD_32)
-#define BINARY_ALIGN			sizeof(ARCH_WORD_32)
+#define BINARY_SIZE			sizeof(uint32_t)
+#define BINARY_ALIGN			sizeof(uint32_t)
 #define SALT_SIZE			(ARCH_SIZE * 2)
 #define SALT_ALIGN			ARCH_SIZE
 
@@ -143,37 +147,37 @@ static void *salt(char *ciphertext)
 
 static int binary_hash_0(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & 0xF;
+	return *(uint32_t *)binary & PH_MASK_0;
 }
 
 static int binary_hash_1(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & 0xFF;
+	return *(uint32_t *)binary & PH_MASK_1;
 }
 
 static int binary_hash_2(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & 0xFFF;
+	return *(uint32_t *)binary & PH_MASK_2;
 }
 
 static int binary_hash_3(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & 0xFFFF;
+	return *(uint32_t *)binary & PH_MASK_3;
 }
 
 static int binary_hash_4(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & 0xFFFFF;
+	return *(uint32_t *)binary & PH_MASK_4;
 }
 
 static int binary_hash_5(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & 0xFFFFFF;
+	return *(uint32_t *)binary & PH_MASK_5;
 }
 
 static int binary_hash_6(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & 0x7FFFFFF;
+	return *(uint32_t *)binary & PH_MASK_6;
 }
 
 #define get_hash_0 DES_bs_get_hash_0
@@ -207,11 +211,7 @@ static int binary_hash_1(void *binary)
 	return DES_STD_HASH_1(*(ARCH_WORD *)binary);
 }
 
-static int binary_hash_2(void *binary)
-{
-	return DES_STD_HASH_2(*(ARCH_WORD *)binary);
-}
-
+#define binary_hash_2 NULL
 #define binary_hash_3 NULL
 #define binary_hash_4 NULL
 #define binary_hash_5 NULL
@@ -219,7 +219,10 @@ static int binary_hash_2(void *binary)
 
 static int get_hash_0(int index)
 {
-	return DES_STD_HASH_0(buffer[index].binary[0]);
+	ARCH_WORD binary;
+
+	binary = buffer[index].binary[0];
+	return DES_STD_HASH_0(binary);
 }
 
 static int get_hash_1(int index)
@@ -230,14 +233,7 @@ static int get_hash_1(int index)
 	return DES_STD_HASH_1(binary);
 }
 
-static int get_hash_2(int index)
-{
-	ARCH_WORD binary;
-
-	binary = buffer[index].binary[0];
-	return DES_STD_HASH_2(binary);
-}
-
+#define get_hash_2 NULL
 #define get_hash_3 NULL
 #define get_hash_4 NULL
 #define get_hash_5 NULL
@@ -245,7 +241,7 @@ static int get_hash_2(int index)
 
 static int salt_hash(void *salt)
 {
-	return DES_STD_HASH_2(*(ARCH_WORD *)salt) & (SALT_HASH_SIZE - 1);
+	return DES_STD_HASH_1(*(ARCH_WORD *)salt) & (SALT_HASH_SIZE - 1);
 }
 
 static void set_salt(void *salt)
@@ -279,7 +275,8 @@ static void set_key(char *key, int index)
 		ptr -= 8;
 		for (word = 0; word < 2; word++)
 		for (pos = 0; pos < 4; pos++)
-			block[word] ^= (ARCH_WORD)*ptr++ << (1 + (pos << 3));
+			block[word] ^= ((unsigned ARCH_WORD)(unsigned char)
+			    *ptr++ & 0x7f) << (1 + (pos << 3));
 
 #if !DES_BS
 		if (current_salt)
@@ -325,14 +322,14 @@ static char *get_key(int index)
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
+	const int count = *pcount;
 	DES_bs_crypt(saved_count, count);
 	return count;
 }
 
 static int cmp_one(void *binary, int index)
 {
-	return DES_bs_cmp_one((ARCH_WORD_32 *)binary, 32, index);
+	return DES_bs_cmp_one((uint32_t *)binary, 32, index);
 }
 
 static int cmp_exact(char *source, int index)
@@ -394,6 +391,11 @@ static int cmp_exact(char *source, int index)
 
 #endif
 
+static unsigned int iteration_count(void *salt)
+{
+	return (unsigned int) ((ARCH_WORD *)salt)[1];
+}
+
 struct fmt_main fmt_BSDI = {
 	{
 		FORMAT_LABEL,
@@ -401,6 +403,7 @@ struct fmt_main fmt_BSDI = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
 		BINARY_ALIGN,
@@ -416,9 +419,10 @@ struct fmt_main fmt_BSDI = {
 #else
 		FMT_CASE,
 #endif
-#if FMT_MAIN_VERSION > 11
+		{
+			"iteration count",
+		},
 		{ NULL },
-#endif
 		tests
 	}, {
 		init,
@@ -434,9 +438,9 @@ struct fmt_main fmt_BSDI = {
 			DES_std_get_binary,
 #endif
 		salt,
-#if FMT_MAIN_VERSION > 11
-		{ NULL },
-#endif
+		{
+			iteration_count,
+		},
 		fmt_default_source,
 		{
 			binary_hash_0,
@@ -448,6 +452,7 @@ struct fmt_main fmt_BSDI = {
 			binary_hash_6
 		},
 		salt_hash,
+		NULL,
 		set_salt,
 		set_key,
 		get_key,

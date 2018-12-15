@@ -18,17 +18,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "os.h"
-#if HAVE_UNISTD_H
+#if (!AC_BUILT || HAVE_UNISTD_H) && !_MSC_VER
 #include <unistd.h>
 #endif
 #include <string.h>
+#include "memory.h"
 
-/*
- * within the next included file, there is a single line that will turn on or off ALL
- * malloc debugging. There are other defines that will increase the level of debugging
- * to check for more things.  By default, there will be no malloc debugging.
- */
-#include "memdbg_defines.h"
 #if defined (MEMDBG_ON)
 
 /*
@@ -53,7 +48,7 @@
  *   free, most buffer overwrites.  Also, tracking of non-freed
  *   data, showing memory leaks, can also be shown.
  *
- *  Compilation Options (in the memdbg_defines.h file)
+ *  Compilation Options (provided from Makefile CFLAGS)
  *
  *   MEMDBG_ON     If this is NOT defined, then memdbg will
  *       get out of your way, and most normal memory functions
@@ -79,11 +74,11 @@
  *  self test code, etc, and not within OMP.  But this warning is here, so that
  *  it is known NOT to call within OMP.
  */
-extern unsigned long MemDbg_Used(int show_freed);
-extern void          MemDbg_Display(FILE *);
-extern void	     MemDbg_Validate(int level);
-extern void	     MemDbg_Validate_msg(int level, const char *pMsg);
-extern void	     MemDbg_Validate_msg2(int level, const char *pMsg, int bShowExData);
+extern size_t	MemDbg_Used(int show_freed);
+extern void		MemDbg_Display(FILE *);
+extern void		MemDbg_Validate(int level);
+extern void		MemDbg_Validate_msg(int level, const char *pMsg);
+extern void		MemDbg_Validate_msg2(int level, const char *pMsg, int bShowExData);
 
 /* these functions should almost NEVER be called by any client code. They
  * are listed here, because the macros need to know their names. Client code
@@ -98,11 +93,13 @@ extern void	     MemDbg_Validate_msg2(int level, const char *pMsg, int bShowExDa
  * at almost all costs, and performance will usually go up.
  */
 extern void *MEMDBG_alloc(size_t, char *, int);
-extern void *MEMDBG_realloc(const void *, size_t, char *, int);
+extern void *MEMDBG_alloc_align(size_t, int, char *, int);
+extern void *MEMDBG_calloc(size_t count, size_t, char *, int);
+extern void *MEMDBG_realloc(void *, size_t, char *, int);
 extern void MEMDBG_free(const void *, char *, int);
 extern char *MEMDBG_strdup(const char *, char *, int);
 
-#if !defined(__MEMDBG__)
+#if !defined(__MEMDBG_C_FILE__)
 /* we get here on every file compiled EXCEPT memdbg.c */
 #undef malloc
 #undef realloc
@@ -111,27 +108,44 @@ extern char *MEMDBG_strdup(const char *, char *, int);
 #undef libc_free
 #undef libc_calloc
 #undef libc_malloc
-#define libc_free(a)    do {if(a) MEMDBG_libc_free(a); a=0; } while(0)
+#define libc_free(a)    MEMDBG_libc_free(a)
 #define libc_malloc(a)   MEMDBG_libc_alloc(a)
-#define libc_calloc(a)   MEMDBG_libc_calloc(a)
+#define libc_calloc(a,b) MEMDBG_libc_calloc(a,b)
 #define malloc(a)     MEMDBG_alloc((a),__FILE__,__LINE__)
+#define calloc(a,b)   MEMDBG_calloc(a,b,__FILE__,__LINE__)
 #define realloc(a,b)  MEMDBG_realloc((a),(b),__FILE__,__LINE__)
-/* this code mimicks JtR's FREE_MEM(a) but does it for any MEMDBG_free(a,F,L) call (a hooked free(a) call) */
-#define free(a)       do { if (a) MEMDBG_free((a),__FILE__,__LINE__); a=0; } while(0)
+#define free(a)       MEMDBG_free((a),__FILE__,__LINE__)
 #define strdup(a)     MEMDBG_strdup((a),__FILE__,__LINE__)
 
-#endif
+#endif /* !defined __MEMDBG_C_FILE__ */
 
 /* pass the file handle to write to (normally stderr) */
 #define MEMDBG_PROGRAM_EXIT_CHECKS(a) do { \
-    if (MemDbg_Used(0) > 0) MemDbg_Display(a); \
+    if (MemDbg_Used(0) > 0 || getenv("MEMDBG")) MemDbg_Display(a); \
     MemDbg_Validate_msg2(MEMDBG_VALIDATE_DEEPEST, "At Program Exit", 1); } while(0)
 
 typedef struct MEMDBG_HANDLE_t {
 	unsigned id;
 	unsigned alloc_cnt;
-	unsigned long mem_size;
+	size_t mem_size;
 } MEMDBG_HANDLE;
+
+/*
+ * these functions give a caller some of the INSIDE information about the
+ * allocated object. We simply return data from inside the memdbg header.
+ * NOTE, if fence post is not valid, we still return something, BUT will
+ * also return something in the err_msg stating this may not be valid.
+ */
+
+/* The count 'id' of an allocated block. Same as used in leak report */
+unsigned    MEMDBG_get_cnt (const void *ptr, const char **err_msg);
+/* the size allocated of the contained block */
+size_t      MEMDBG_get_size(const void *ptr, const char **err_msg);
+/* what file (source) did the allocation */
+const char *MEMDBG_get_file(const void *ptr, const char **err_msg);
+/* what file (source) line number did the allocation */
+unsigned    MEMDBG_get_line(const void *ptr, const char **err_msg);
+
 
 /*
  * these functions allow taking a memory snapshot, calling some code, then validating that memory
@@ -155,28 +169,17 @@ void MEMDBG_checkSnapshot_possible_exit_on_error(MEMDBG_HANDLE, int exit_on_any_
 
 void MEMDBG_tag_mem_from_alloc_tiny(void *);
 
-#else
-/* NOTE, we DO keep one special function here.  We make free a little
- * smarter. this function gets used, even when we do NOT compile with
- * any memory debugging on. This makes free work more like C++ delete,
- * in that it is valid to call it on a NULL. Also, it sets the pointer
- * to NULL, so that we can call free(x) on x multiple times, without
- * causing a crash. NOTE, the multiple frees SHOULD be caught when
- * someone builds and runs with MEMDBG_ON. But when it is off, we do
- * try to protect the program.
- */
-#undef libc_free
-#undef libc_calloc
-#undef libc_malloc
-#define libc_free(a)  do {if(a) MEMDBG_libc_free(a); a=0; } while(0)
-#define libc_malloc(a)   MEMDBG_libc_alloc(a)
-#define libc_calloc(a)   MEMDBG_libc_calloc(a)
+extern void MEMDBG_libc_free(void *);
+extern void *MEMDBG_libc_alloc(size_t size);
+extern void *MEMDBG_libc_calloc(size_t count, size_t size);
 
-#if !defined(__MEMDBG__)
-/* this code mimicks JtR's FREE_MEM(a) but does it for any normal free(a) call */
-extern void MEMDBG_off_free(void *a);
-#define free(a)   do { if(a) MEMDBG_off_free(a); a=0; } while(0)
-#endif
+#else
+
+#define libc_alloc alloc
+#define libc_calloc calloc
+#define libc_malloc malloc
+#define libc_free free
+
 #define MemDbg_Used(a) 0
 #define MemDbg_Display(a)
 #define MemDbg_Validate(a)
@@ -187,13 +190,9 @@ extern void MEMDBG_off_free(void *a);
 
 #define MEMDBG_HANDLE int
 #define MEMDBG_getSnapshot(a) 0
-#define MEMDBG_checkSnapshot(a) if(a) printf(" \b")
-#define MEMDBG_checkSnapshot_possible_exit_on_error(a, b) if(a) printf(" \b")
+#define MEMDBG_checkSnapshot(a) if (a) printf(" \b")
+#define MEMDBG_checkSnapshot_possible_exit_on_error(a, b) if (a) printf(" \b")
 
 #endif /* MEMDBG_ON */
-
-extern void MEMDBG_libc_free(void *);
-extern void *MEMDBG_libc_alloc(size_t size);
-extern void *MEMDBG_libc_calloc(size_t size);
 
 #endif /* __MEMDBG_H_ */

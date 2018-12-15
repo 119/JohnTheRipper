@@ -39,6 +39,16 @@ userName2:$B$107$dd494cb03ac1c5b8f8d2dddafca2f7a6:1552:0::emailaddress@gmail.com
  *
  */
 
+#if AC_BUILT
+#include "autoconfig.h"
+#endif
+#ifndef DYNAMIC_DISABLED
+
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_mediawiki;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_mediawiki);
+#else
 
 #include <string.h>
 
@@ -61,11 +71,16 @@ userName2:$B$107$dd494cb03ac1c5b8f8d2dddafca2f7a6:1552:0::emailaddress@gmail.com
 #define BINARY_SIZE			MD5_BINARY_SIZE
 
 #define SALT_SIZE			9
+// dynamic alignment
+#define BINARY_ALIGN		MEM_ALIGN_WORD
+#define SALT_ALIGN			MEM_ALIGN_WORD
 
-#define PLAINTEXT_LENGTH	32
+// set PLAINTEXT_LENGTH to 0, so dyna will set this
+#define PLAINTEXT_LENGTH	0
 
 static struct fmt_tests mediawiki_tests[] = {
 	{"$B$113$de2874e33da25313d808d2a8cbf31485",      "qwerty"},
+	{"$dynamic_9$de2874e33da25313d808d2a8cbf31485$113-",      "qwerty"},
 	{"$B$bca6c557$8d187736f828e4cb032bd6c7a268cd95", "abc123"},
 	{"$B$6$70b3e0907f028877ea47c16496d6df6d",        ""},
 	{"$B$761$3ae7c8e25addfd82544c0c0b1ca8f5e4",      "password"},
@@ -97,20 +112,43 @@ static char *Convert(char *Buf, char *ciphertext)
 	// now append salt, and the '-' char
 	while (*ciphertext && i < sizeof(Conv_Buf) - 3 && *ciphertext != '$')
 		Buf[i++] = *ciphertext++;
-	Buf[i++] = '-';
-	Buf[i] = 0;
+	if (i < sizeof(Conv_Buf) - 2) {
+		Buf[i++] = '-';
+		Buf[i] = 0;
+	}
 	return Buf;
 }
 
 static char *our_split(char *ciphertext, int index, struct fmt_main *self)
 {
-	return Convert(Conv_Buf, ciphertext);
-}
-
-static char *our_prepare(char *split_fields[10], struct fmt_main *self)
-{
-	get_ptr();
-	return pDynamic_9->methods.prepare(split_fields, self);
+	// Convert from dyna_9 back into $B$ (only if last byte of salt is '-'
+	char *cp;
+	if (!strncmp(ciphertext, "$dynamic_9$", 11) && ciphertext[strlen(ciphertext)-1] == '-') {
+		static char Buf[128], *cp;
+		strcpy(Buf, "$B$");
+		cp = strrchr(ciphertext, '$');
+		if (cp && strlen(cp) < 65 && strlen(cp) > 2) {
+			int len;
+			strcat(Buf, &cp[1]);
+			Buf[strlen(Buf)-1] = '$';  // remove the '-' char, simply replace it with the '$'
+			len = strlen(Buf);
+			sprintf(&Buf[len], "%32.32s", &ciphertext[11]);
+			strlwr(&Buf[len]);
+			return Buf;
+		}
+	}
+	// we may stil have to unify case (to lower) since we have FMT_SPLIT_UNIFIES_CASE set.
+	if (!strncmp(ciphertext, "$B$", 3)) {
+		cp = strchr(&ciphertext[3], '$');
+		if (cp) {
+			static char Buf[128];
+			strnzcpy(Buf, ciphertext, sizeof(Buf));
+			cp = strchr(&Buf[3], '$')+1;
+			strlwr(cp);
+			return Buf;
+		}
+	}
+	return ciphertext;
 }
 
 static int mediawiki_valid(char *ciphertext, struct fmt_main *self)
@@ -149,6 +187,7 @@ static void * our_salt(char *ciphertext)
 }
 static void * our_binary(char *ciphertext)
 {
+	get_ptr();
 	return pDynamic_9->methods.binary(Convert(Conv_Buf, ciphertext));
 }
 
@@ -158,10 +197,9 @@ struct fmt_main fmt_mediawiki =
 		// setup the labeling and stuff. NOTE the max and min crypts are set to 1
 		// here, but will be reset within our init() function.
 		FORMAT_LABEL, FORMAT_NAME, ALGORITHM_NAME, BENCHMARK_COMMENT, BENCHMARK_LENGTH,
-		PLAINTEXT_LENGTH, BINARY_SIZE, DEFAULT_ALIGN, SALT_SIZE+1, DEFAULT_ALIGN, 1, 1, FMT_CASE | FMT_8_BIT,
-#if FMT_MAIN_VERSION > 11
+		0, PLAINTEXT_LENGTH, BINARY_SIZE, BINARY_ALIGN, SALT_SIZE+1, SALT_ALIGN, 1, 1, FMT_CASE | FMT_8_BIT | FMT_DYNAMIC | FMT_SPLIT_UNIFIES_CASE,
 		{ NULL },
-#endif
+		{ NULL },
 		mediawiki_tests
 	},
 	{
@@ -170,41 +208,32 @@ struct fmt_main fmt_mediawiki =
 		mediawiki_init,
 		fmt_default_done,
 		fmt_default_reset,
-		our_prepare,
-		mediawiki_valid
+		fmt_default_prepare,
+		mediawiki_valid,
+		our_split
 	}
 };
-
 
 static void mediawiki_init(struct fmt_main *self)
 {
 	if (self->private.initialized == 0) {
-		pDynamic_9 = dynamic_THIN_FORMAT_LINK(&fmt_mediawiki, Convert(Conv_Buf, mediawiki_tests[0].ciphertext), "mediawiki", 1);
+		get_ptr();
+		pDynamic_9->methods.init(pDynamic_9);
 		self->private.initialized = 1;
-		fmt_mediawiki.methods.salt   = our_salt;
-		fmt_mediawiki.methods.binary = our_binary;
-		fmt_mediawiki.methods.split = our_split;
-		fmt_mediawiki.methods.prepare = our_prepare;
-		fmt_mediawiki.params.algorithm_name = pDynamic_9->params.algorithm_name;
 	}
 }
 
 static void get_ptr() {
 	if (!pDynamic_9) {
 		pDynamic_9 = dynamic_THIN_FORMAT_LINK(&fmt_mediawiki, Convert(Conv_Buf, mediawiki_tests[0].ciphertext), "mediawiki", 0);
+		fmt_mediawiki.params.algorithm_name = pDynamic_9->params.algorithm_name;
 		fmt_mediawiki.methods.salt   = our_salt;
 		fmt_mediawiki.methods.binary = our_binary;
 		fmt_mediawiki.methods.split = our_split;
-		fmt_mediawiki.methods.prepare = our_prepare;
+		fmt_mediawiki.methods.prepare = fmt_default_prepare;
 	}
 }
 
+#endif /* plugin stanza */
 
-/**
- * GNU Emacs settings: K&R with 1 tab indent.
- * Local Variables:
- * c-file-style: "k&r"
- * c-basic-offset: 8
- * indent-tabs-mode: t
- * End:
- */
+#endif /* DYNAMIC_DISABLED */

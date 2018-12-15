@@ -42,6 +42,12 @@
  *
  */
 
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_NETNTLM_old;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_NETNTLM_old);
+#else
+
 #include <string.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -64,6 +70,8 @@
 
 #define FORMAT_LABEL         "netntlm-naive"
 #define FORMAT_NAME          "NTLMv1 C/R"
+#define FORMAT_TAG           "$NETNTLM$"
+#define FORMAT_TAG_LEN       (sizeof(FORMAT_TAG)-1)
 #define ALGORITHM_NAME       "MD4 DES (ESS MD5) " DES_BS_ALGORITHM_NAME " naive"
 #define BENCHMARK_COMMENT    ""
 #define BENCHMARK_LENGTH     0
@@ -80,6 +88,7 @@
 #define MAX_KEYS_PER_CRYPT      DES_BS_DEPTH
 
 static struct fmt_tests tests[] = {
+	{"", "FooBarGerg",                    {"User", "", "", "lm-hash", "35B62750E1B9B3205C50D6BA351092C12A1B9B3CDC65D44A", "1122334455667788"} },
 	{"$NETNTLM$1122334455667788$BFCCAF26128EC95F9999C9792F49434267A1D9B0EF89BFFB", "g3rg3g3rg3g3rg3"},
 	{"$NETNTLM$1122334455667788$E463FAA5D868ECE20CAE622474A2F440A652D642156AF863", "M1xedC4se%^&*@)##(blahblah!@#"},
 	{"$NETNTLM$c75c20bff9baa71f4765f360625700b0$81f5ecd8a77fe819f7f6689a08a27ac705fc2e1bb00cecb2", "password"},
@@ -89,7 +98,6 @@ static struct fmt_tests tests[] = {
 	{"$NETNTLM$1122334455667788$B2B2220790F40C88BCFF347C652F67A7C4A70D3BEBD70233", "cory21"},
 	{"", "g3rg3g3rg3g3rg3",               {"User", "", "", "lm-hash", "BFCCAF26128EC95F9999C9792F49434267A1D9B0EF89BFFB", "1122334455667788"} },
 	{"", "M1xedC4se%^&*@)##(blahblah!@#", {"User", "", "", "lm-hash", "E463FAA5D868ECE20CAE622474A2F440A652D642156AF863", "1122334455667788"} },
-	{"", "FooBarGerg",                    {"User", "", "", "lm-hash", "35B62750E1B9B3205C50D6BA351092C12A1B9B3CDC65D44A", "1122334455667788"} },
 	{"", "visit www.foofus.net",          {"User", "", "", "lm-hash", "A4765EBFE83D345A7CB1660B8899251905164029F8086DDE", "1122334455667788"} },
 	{"", "password",                      {"ESS", "", "", "4765f360625700b000000000000000000000000000000000", "81f5ecd8a77fe819f7f6689a08a27ac705fc2e1bb00cecb2", "c75c20bff9baa71f"} },
 	{"", "cory21",                        {"User", "", "", "lm-hash", "B2B2220790F40C88BCFF347C652F67A7C4A70D3BEBD70233", "1122334455667788"} },
@@ -112,23 +120,34 @@ static void init(struct fmt_main *self)
 	self->params.min_keys_per_crypt = DES_bs_min_kpc;
 	self->params.max_keys_per_crypt = DES_bs_max_kpc;
 #endif
-	saved_plain = mem_calloc_tiny(sizeof(*saved_plain) * self->params.max_keys_per_crypt, MEM_ALIGN_NONE);
-	saved_len = mem_calloc_tiny(sizeof(*saved_len) * self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	output = mem_calloc_tiny(sizeof(*output) * self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	saved_key = mem_calloc_tiny(sizeof(*saved_key) * self->params.max_keys_per_crypt, MEM_ALIGN_NONE);
+	saved_plain = mem_calloc(self->params.max_keys_per_crypt,
+	                         sizeof(*saved_plain));
+	saved_len = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*saved_len));
+	output = mem_calloc(self->params.max_keys_per_crypt, sizeof(*output));
+	saved_key = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*saved_key));
+}
+
+static void done(void)
+{
+	MEM_FREE(saved_key);
+	MEM_FREE(output);
+	MEM_FREE(saved_len);
+	MEM_FREE(saved_plain);
 }
 
 static int valid(char *ciphertext, struct fmt_main *self)
 {
 	char *pos;
 
-	if (strncmp(ciphertext, "$NETNTLM$", 9)!=0) return 0;
+	if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN)!=0) return 0;
 
 	if ((strlen(ciphertext) != 74) && (strlen(ciphertext) != 90)) return 0;
 
 	if ((ciphertext[25] != '$') && (ciphertext[41] != '$')) return 0;
 
-	for (pos = &ciphertext[9]; atoi16[ARCH_INDEX(*pos)] != 0x7F; pos++);
+	for (pos = &ciphertext[FORMAT_TAG_LEN]; atoi16[ARCH_INDEX(*pos)] != 0x7F; pos++);
 	if (*pos != '$') return 0;
 
 	for (pos++;atoi16[ARCH_INDEX(*pos)] != 0x7F; pos++);
@@ -143,29 +162,32 @@ static char *prepare(char *split_fields[10], struct fmt_main *self)
 {
 	char *cp;
 	char clientChal[17];
+	char *srv_challenge = split_fields[3];
+	char *nethashv2     = split_fields[4];
+	char *cli_challenge = split_fields[5];
 
-	if (!strncmp(split_fields[1], "$NETNTLM$", 9))
+	if (!strncmp(split_fields[1], FORMAT_TAG, FORMAT_TAG_LEN))
 		return split_fields[1];
-	if (!split_fields[3]||!split_fields[4]||!split_fields[5])
+	if (!srv_challenge || !nethashv2 || !cli_challenge)
 		return split_fields[1];
 
-	if (strlen(split_fields[4]) != CIPHERTEXT_LENGTH)
+	if (strlen(nethashv2) != CIPHERTEXT_LENGTH)
 		return split_fields[1];
 
 	// this string suggests we have an improperly formatted NTLMv2
-	if (!strncmp(&split_fields[4][32], "0101000000000000", 16))
+	if (!strncmp(&nethashv2[32], "0101000000000000", 16))
 		return split_fields[1];
 
 	// Handle ESS (8 byte client challenge in "LM" field padded with zeros)
-	if (strlen(split_fields[3]) == 48 && !strncmp(&split_fields[3][16],
+	if (strlen(srv_challenge) == 48 && !strncmp(&srv_challenge[16],
 	        "00000000000000000000000000000000", 32)) {
-		memcpy(clientChal, split_fields[3],16);
+		memcpy(clientChal, srv_challenge,16);
 		clientChal[16] = 0;
 	}
 	else
 		clientChal[0] = 0;
-	cp = mem_alloc(9+strlen(split_fields[5])+strlen(clientChal)+1+strlen(split_fields[4])+1);
-	sprintf(cp, "$NETNTLM$%s%s$%s", split_fields[5], clientChal, split_fields[4]);
+	cp = mem_alloc(FORMAT_TAG_LEN+strlen(cli_challenge)+strlen(clientChal)+1+strlen(nethashv2)+1);
+	sprintf(cp, "%s%s%s$%s", FORMAT_TAG, cli_challenge, clientChal, nethashv2);
 
 	if (valid(cp,self)) {
 		char *cp2 = str_alloc_copy(cp);
@@ -181,15 +203,15 @@ static char *split(char *ciphertext, int index, struct fmt_main *self)
 	static char out[TOTAL_LENGTH + 1];
 
 	memset(out, 0, TOTAL_LENGTH + 1);
-	memcpy(&out, ciphertext, TOTAL_LENGTH);
-	strlwr(&out[8]); /* Exclude: $NETNTLM$ */
+	strcpy(out, ciphertext);
+	strlwr(&out[FORMAT_TAG_LEN]); /* Exclude: $NETNTLM$ */
 
 	return out;
 }
 
-static ARCH_WORD_32 *generate_des_format(uchar* binary)
+static uint32_t *generate_des_format(uchar* binary)
 {
-	static ARCH_WORD_32 out[6];
+	static uint32_t out[6];
 	ARCH_WORD block[6];
 	int chr, src,dst,i;
 	uchar value, mask;
@@ -200,14 +222,14 @@ static ARCH_WORD_32 *generate_des_format(uchar* binary)
 	for (chr = 0; chr < 24; chr=chr + 8)
 	{
 		dst = 0;
-		for(i=0; i<8; i++)
+		for (i=0; i<8; i++)
 		{
 			value = binary[chr + i];
 			mask = 0x80;
 
 			for (src = 0; src < 8; src++) {
 				if (value & mask)
-					block[(chr/4) + (dst>>5)]|= 1 << (dst & 0x1F);
+					block[(chr/4) + (dst>>5)] |= 1U << (dst & 0x1F);
 				mask >>= 1;
 				dst++;
 			}
@@ -215,7 +237,7 @@ static ARCH_WORD_32 *generate_des_format(uchar* binary)
 	}
 
 	/* Apply initial permutation on ciphertext blocks */
-	for(i=0; i<6; i=i+2)
+	for (i=0; i<6; i=i+2)
 	{
 		ptr = DES_do_IP(&block[i]);
 		out[i] = ptr[1];
@@ -229,7 +251,7 @@ static void *get_binary(char *ciphertext)
 {
 	uchar binary[BINARY_SIZE];
 	int i;
-	ARCH_WORD_32 *ptr;
+	uint32_t *ptr;
 
 	ciphertext = strrchr(ciphertext, '$') + 1;
 	for (i=0; i<BINARY_SIZE; i++) {
@@ -242,7 +264,7 @@ static void *get_binary(char *ciphertext)
 	return ptr;
 }
 
-static inline void setup_des_key(unsigned char key_56[], int index)
+inline static void setup_des_key(unsigned char key_56[], int index)
 {
 	char key[8];
 
@@ -264,7 +286,7 @@ static inline void setup_des_key(unsigned char key_56[], int index)
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
+	const int count = *pcount;
 	int i;
 
 	if (!keys_prepared) {
@@ -297,47 +319,44 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 static int cmp_all(void *binary, int count)
 {
-	return DES_bs_cmp_all((ARCH_WORD_32 *)binary, count);
+	return DES_bs_cmp_all((uint32_t *)binary, count);
 }
 
 static int cmp_one(void *binary, int index)
 {
-	return DES_bs_cmp_one((ARCH_WORD_32 *)binary, 32, index);
+	return DES_bs_cmp_one((uint32_t *)binary, 32, index);
 }
 
 static int cmp_exact(char *source, int index)
 {
-	ARCH_WORD_32 *binary;
+	uint32_t *binary = get_binary(source);
+
+	if (!DES_bs_cmp_one(binary, 64, index))
+		return 0;
+
+	setup_des_key(&saved_key[index][7], 0);
+	DES_bs_crypt_plain(1);
+	if (!DES_bs_cmp_one(&binary[2], 64, 0))
+	{
+		setup_des_key(saved_key[0], 0);
+		DES_bs_crypt_plain(1);
+		return 0;
+	}
 
 	/* NULL-pad 16-byte NTLM hash to 21-bytes (postponed until now) */
 	memset(&saved_key[index][16], 0, 5);
 
-	binary = get_binary(source);
-	if (!DES_bs_cmp_one(binary, 64, index))
-	{
-		setup_des_key(saved_key[0], 0);
-		return 0;
-	}
-
-	setup_des_key(&saved_key[index][7], 0);
-	DES_bs_crypt_plain(1);
-	binary = get_binary(source);
-	if (!DES_bs_cmp_one(&binary[2], 64, 0))
-	{
-		setup_des_key(saved_key[0], 0);
-		return 0;
-	}
-
 	setup_des_key(&saved_key[index][14], 0);
 	DES_bs_crypt_plain(1);
-	binary = get_binary(source);
 	if (!DES_bs_cmp_one(&binary[4], 64, 0))
 	{
 		setup_des_key(saved_key[0], 0);
+		DES_bs_crypt_plain(1);
 		return 0;
 	}
 
 	setup_des_key(saved_key[0], 0);
+	DES_bs_crypt_plain(1);
 	return 1;
 }
 
@@ -351,14 +370,14 @@ static void *get_salt(char *ciphertext)
 
 	if (ciphertext[25] == '$') {
 		// Server challenge
-		ciphertext += 9;
+		ciphertext += FORMAT_TAG_LEN;
 		for (i = 0; i < SALT_SIZE; ++i)
 			binary_salt[i] = (atoi16[ARCH_INDEX(ciphertext[i*2])] << 4) + atoi16[ARCH_INDEX(ciphertext[i*2+1])];
 	} else {
 		uchar es_salt[2*SALT_SIZE], k1[2*SALT_SIZE];
 		MD5_CTX ctx;
 
-		ciphertext += 9;
+		ciphertext += FORMAT_TAG_LEN;
 		// Extended Session Security,
 		// Concatenate Server & Client challenges
 		for (i = 0;i < 2 * SALT_SIZE; ++i)
@@ -391,8 +410,7 @@ static void set_salt(void *salt)
 
 static void netntlm_set_key(char *key, int index)
 {
-	saved_len[index] = strlen(key);
-	memcpy(saved_plain[index], key, saved_len[index] + 1);
+	saved_len[index] = strnzcpyn(saved_plain[index], key, sizeof(*saved_plain));
 	keys_prepared = 0;
 }
 
@@ -403,7 +421,7 @@ static char *get_key(int index)
 
 static int salt_hash(void *salt)
 {
-	return *(ARCH_WORD_32 *)salt & (SALT_HASH_SIZE - 1);
+	return *(uint32_t *)salt & (SALT_HASH_SIZE - 1);
 }
 
 struct fmt_main fmt_NETNTLM_old = {
@@ -413,6 +431,7 @@ struct fmt_main fmt_NETNTLM_old = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
 		BINARY_ALIGN,
@@ -426,23 +445,20 @@ struct fmt_main fmt_NETNTLM_old = {
 		FMT_OMP |
 #endif
 #endif
-		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_UNICODE | FMT_UTF8,
-#if FMT_MAIN_VERSION > 11
+		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_UNICODE | FMT_ENC,
 		{ NULL },
-#endif
+		{ FORMAT_TAG },
 		tests
 	}, {
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		prepare,
 		valid,
 		split,
 		get_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash_0,
@@ -454,6 +470,7 @@ struct fmt_main fmt_NETNTLM_old = {
 			fmt_default_binary_hash_6
 		},
 		salt_hash,
+		NULL,
 		set_salt,
 		netntlm_set_key,
 		get_key,
@@ -473,3 +490,5 @@ struct fmt_main fmt_NETNTLM_old = {
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

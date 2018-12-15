@@ -8,17 +8,21 @@
  * Kholia).
  */
 
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_lotus_85;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_lotus_85);
+#else
+
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 
-#include <openssl/sha.h>
+#include "sha.h"
 #include <openssl/rc2.h>
 
 #ifdef _OPENMP
 #include <omp.h>
-#define OMP_SCALE               64  // XXX tune me!
-static int omp_t = 1;
 #endif
 
 #include "formats.h"
@@ -32,22 +36,24 @@ static int omp_t = 1;
 #define BENCHMARK_COMMENT     ""
 #define BENCHMARK_LENGTH      -1
 #define PLAINTEXT_LENGTH      32
-#define CIPHERTEXT_LENGTH     0x64
-#define BINARY_SIZE           5  // XXX probably should rename this!
+#define CIPHERTEXT_LENGTH     (LOTUS85_MAX_BLOB_SIZE * 2)
+#define BINARY_SIZE           0
+#define BINARY_LENGTH         5
 #define BINARY_ALIGN          1
 #define SALT_SIZE             sizeof(struct custom_salt)
 #define SALT_ALIGN            4
 #define MIN_KEYS_PER_CRYPT    1
-// #define MAX_KEYS_PER_CRYPT    0x900 // WTF?
-#define MAX_KEYS_PER_CRYPT    1
+#define MAX_KEYS_PER_CRYPT    4
+
+#ifndef OMP_SCALE
+#define OMP_SCALE             16  // Tuned w/ MKPC for core i7
+#endif
 
 #define LOTUS85_MAX_BLOB_SIZE 0x64
 #define LOTUS85_MIN_BLOB_SIZE 40 // XXX fictional value, but isn't this length fixed?
 
 /* Globals */
 static const char LOTUS85_UNIQUE_STRING[] = "Lotus Notes Password Pad Uniquifier";
-
-static const char LOTUS85_BASE16_CHARSET[] = "0123456789ABCDEFabcdef";
 
 static uint8_t ebits_to_num[256]=
 {
@@ -85,7 +91,7 @@ static uint8_t ebits_to_num[256]=
 	0x29, 0x39, 0xb9, 0xe9, 0x4c, 0xff, 0x43, 0xab,
 };
 
-struct custom_salt {
+static struct custom_salt {
 	uint8_t lotus85_user_blob[LOTUS85_MAX_BLOB_SIZE];
 	uint32_t lotus85_user_blob_len;
 } *cur_salt;
@@ -95,8 +101,8 @@ struct custom_salt {
  * As the password is used to derive a RC2 key and decipher the user blob
  * the reference digest is always different and we should track them all
  */
-static uint8_t (*lotus85_last_binary_hash1)[BINARY_SIZE];
-static uint8_t (*lotus85_last_binary_hash2)[BINARY_SIZE];
+static uint8_t (*lotus85_last_binary_hash1)[BINARY_LENGTH];
+static uint8_t (*lotus85_last_binary_hash2)[BINARY_LENGTH];
 
 /* Plaintext passwords history requested by JtR engine */
 static char (*lotus85_saved_passwords)[PLAINTEXT_LENGTH+1];
@@ -129,7 +135,7 @@ static void custom_password_hash_trans(uint8_t *data, uint8_t *out, uint8_t *sta
 	memcpy(buffer, state, 16);
 	memcpy(buffer + 16, data, 16);
 
-	for(i=0;i<16;i+=4)
+	for (i=0;i<16;i+=4)
 	{
 		buffer[32+i] = data[i] ^ state[i];
 		buffer[32+i+1] = data[i+1] ^ state[i+1];
@@ -137,9 +143,9 @@ static void custom_password_hash_trans(uint8_t *data, uint8_t *out, uint8_t *sta
 		buffer[32+i+3] = data[i+3] ^ state[i+3];
 	}
 
-	for(j=c=0;j<18;j++)
+	for (j=c=0;j<18;j++)
 	{
-		for(i=0;i<sizeof(buffer);i+=6)
+		for (i=0;i<sizeof(buffer);i+=6)
 		{
 			buffer[i] ^= ebits_to_num[(c-i+48) & 0xFF];
 			buffer[i+1] ^= ebits_to_num[(buffer[i]-i+47) & 0xFF];
@@ -155,7 +161,7 @@ static void custom_password_hash_trans(uint8_t *data, uint8_t *out, uint8_t *sta
 
 	c = out[15];
 
-	for(i=0;i<16;i+=4)
+	for (i=0;i<16;i+=4)
 	{
 		out[i] ^= ebits_to_num[data[i] ^ c];
 		out[i+1] ^= ebits_to_num[data[i+1] ^ out[i]];
@@ -182,7 +188,7 @@ static void custom_password_hash(const char *password, uint8_t *out)
 		block_pos += 16;
 	}
 
-	if(block_pos != len)
+	if (block_pos != len)
 	{
 		rlen = len - block_pos;
 		memcpy(block1, password+block_pos, rlen);
@@ -222,11 +228,11 @@ static void compute_key_mac(uint8_t *key, size_t len, uint8_t *mac, size_t mac_l
 	size_t i, j, mlen=mac_len-1;
 	uint8_t k;
 
-	for(i=0;i<16;i++)
+	for (i=0;i<16;i++)
 	{
 		k = ebits_to_num[mac[0] ^ mac[1]];
 
-		for(j=0;j<mlen;j++)
+		for (j=0;j<mlen;j++)
 		{
 			mac[j] = mac[j+1];
 		}
@@ -241,9 +247,9 @@ static void compute_msg_mac(uint8_t *msg, size_t len, uint8_t *msg_mac)
 	size_t i, j;
 	uint8_t c;
 
-	for(i=j=0;i<len;i++)
+	for (i=j=0;i<len;i++)
 	{
-		if(j!=4)
+		if (j!=4)
 		{
 			msg_mac[j] = msg[i] ^ ebits_to_num[msg_mac[j] ^ msg_mac[j+1]];
 			j++;
@@ -256,7 +262,7 @@ static void compute_msg_mac(uint8_t *msg, size_t len, uint8_t *msg_mac)
 	}
 
 	c = msg_mac[0];
-	for(i=0;i<4;i++)
+	for (i=0;i<4;i++)
 	{
 		msg_mac[i] = msg_mac[i+1];
 	}
@@ -286,42 +292,41 @@ static void get_user_id_secret_key(const char *password, uint8_t *secret_key)
 /* Plugin initialization */
 static void lotus85_init(struct fmt_main *self)
 {
-#if defined (_OPENMP)
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
-	lotus85_saved_passwords = mem_calloc_tiny(
-		(PLAINTEXT_LENGTH + 1) * self->params.max_keys_per_crypt,
-		MEM_ALIGN_CACHE);
-	lotus85_last_binary_hash1 = mem_calloc_tiny(
-		BINARY_SIZE * self->params.max_keys_per_crypt,
-		MEM_ALIGN_CACHE);
-	lotus85_last_binary_hash2 = mem_calloc_tiny(
-		BINARY_SIZE * self->params.max_keys_per_crypt,
-		MEM_ALIGN_CACHE);
+	omp_autotune(self, OMP_SCALE);
+
+	lotus85_saved_passwords = mem_calloc(self->params.max_keys_per_crypt,
+	                                     PLAINTEXT_LENGTH + 1);
+	lotus85_last_binary_hash1 = mem_calloc(self->params.max_keys_per_crypt,
+	                                       BINARY_LENGTH);
+	lotus85_last_binary_hash2 = mem_calloc(self->params.max_keys_per_crypt,
+	                                       BINARY_LENGTH);
+}
+
+static void done(void)
+{
+	MEM_FREE(lotus85_last_binary_hash2);
+	MEM_FREE(lotus85_last_binary_hash1);
+	MEM_FREE(lotus85_saved_passwords);
 }
 
 /* Check if given ciphertext (hash) format is valid */
 static int lotus85_valid(char *ciphertext,struct fmt_main *self)
 {
-	int i,len;
+	int len, extra;
 
-	len = strlen(ciphertext);
+	len = strnlen(ciphertext, CIPHERTEXT_LENGTH + 1);
 
-	if(len % 2)
+	if (len % 2)
 		return 0;
 
-	if((len >> 1) > LOTUS85_MAX_BLOB_SIZE)
+	if ((len >> 1) > LOTUS85_MAX_BLOB_SIZE)
 		return 0;
 
-	if((len >> 1) < LOTUS85_MIN_BLOB_SIZE)
+	if ((len >> 1) < LOTUS85_MIN_BLOB_SIZE)
 		return 0;
 
-	for (i=0;i<len;i++)
-		if(!strchr(LOTUS85_BASE16_CHARSET,ciphertext[i]))
-			return 0;
+	if (hexlenu(ciphertext, &extra)  != len || extra)
+		return 0;
 
 	return 1;
 }
@@ -331,6 +336,7 @@ static void *get_salt(char *ciphertext)
 	int i,len;
 	static struct custom_salt cs;
 
+	memset(&cs, 0, sizeof(cs));
 	len = strlen(ciphertext) >> 1;
 
 	for (i = 0; i < len; i++)
@@ -349,7 +355,7 @@ static void set_salt(void *salt)
 /* Set password at given index */
 static void lotus85_set_key(char *key,int index)
 {
-	strnzcpy(lotus85_saved_passwords[index],key,strlen(key)+1);
+	strnzcpy(lotus85_saved_passwords[index],key,sizeof(lotus85_saved_passwords[index]));
 }
 
 /* Return password at given index as string */
@@ -371,8 +377,8 @@ static int lotus85_crypt_all(int *pcount, struct db_salt *salt)
 	for (index = 0; index < count; index++)
 	{
 		unsigned char user_key[8], deciphered_userid[LOTUS85_MAX_BLOB_SIZE];
-		memset(lotus85_last_binary_hash1[index], 0, BINARY_SIZE);
-		memset(lotus85_last_binary_hash2[index], 0, BINARY_SIZE);
+		memset(lotus85_last_binary_hash1[index], 0, BINARY_LENGTH);
+		memset(lotus85_last_binary_hash2[index], 0, BINARY_LENGTH);
 		memset(user_key, 0, sizeof(user_key));
 		memset(deciphered_userid, 0, sizeof(deciphered_userid));
 
@@ -383,10 +389,10 @@ static int lotus85_crypt_all(int *pcount, struct db_salt *salt)
 		decipher_userid_blob(cur_salt->lotus85_user_blob, cur_salt->lotus85_user_blob_len, user_key, deciphered_userid);
 
 		/* Store first deciphered digest */
-		memcpy(lotus85_last_binary_hash1[index], deciphered_userid + cur_salt->lotus85_user_blob_len - BINARY_SIZE, BINARY_SIZE);
+		memcpy(lotus85_last_binary_hash1[index], deciphered_userid + cur_salt->lotus85_user_blob_len - BINARY_LENGTH, BINARY_LENGTH);
 
 		/* Compute digest of deciphered message */
-		compute_msg_mac(deciphered_userid, cur_salt->lotus85_user_blob_len - BINARY_SIZE, lotus85_last_binary_hash2[index]);
+		compute_msg_mac(deciphered_userid, cur_salt->lotus85_user_blob_len - BINARY_LENGTH, lotus85_last_binary_hash2[index]);
 	}
 	return count;
 }
@@ -396,9 +402,9 @@ static int lotus85_cmp_all(void *binary,int count)
 {
 	int i;
 
-	for(i = 0; i < count; i++)
+	for (i = 0; i < count; i++)
 	{
-		if(!memcmp(lotus85_last_binary_hash1[i],lotus85_last_binary_hash2[i],BINARY_SIZE))
+		if (!memcmp(lotus85_last_binary_hash1[i],lotus85_last_binary_hash2[i],BINARY_LENGTH))
 			return 1;
 	}
 
@@ -408,7 +414,7 @@ static int lotus85_cmp_all(void *binary,int count)
 /* Check if last computed hash match */
 static int lotus85_cmp_one(void *binary,int index)
 {
-	return !memcmp(lotus85_last_binary_hash1[index],lotus85_last_binary_hash2[index],BINARY_SIZE);
+	return !memcmp(lotus85_last_binary_hash1[index],lotus85_last_binary_hash2[index],BINARY_LENGTH);
 }
 
 /* No ASCII ciphertext, thus returns true */
@@ -433,45 +439,40 @@ struct fmt_main fmt_lotus_85 =
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
-		PLAINTEXT_LENGTH,
 		0,
+		PLAINTEXT_LENGTH,
+		BINARY_SIZE,
 		BINARY_ALIGN,
 		SALT_SIZE,
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
+		{ NULL },
 		lotus85_tests
 	}, {
 		lotus85_init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		fmt_default_prepare,
 		lotus85_valid,
 		fmt_default_split,
 		fmt_default_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
-			fmt_default_binary_hash,
-			fmt_default_binary_hash,
 			fmt_default_binary_hash
 		},
 		fmt_default_salt_hash,
+		NULL,
 		set_salt,
 		lotus85_set_key,          /*  Set plaintext password  */
 		lotus85_get_key,          /*  Get plaintext password  */
 		fmt_default_clear_keys,
-		lotus85_crypt_all,        /*  Main hash funcion       */
+		lotus85_crypt_all,        /*  Main hash function       */
 		{
-			fmt_default_get_hash,
-			fmt_default_get_hash,
 			fmt_default_get_hash
 		},
 		lotus85_cmp_all,          /* Compare * hash (binary)  */
@@ -479,3 +480,5 @@ struct fmt_main fmt_lotus_85 =
 		lotus85_cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

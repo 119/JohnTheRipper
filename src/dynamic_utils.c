@@ -25,26 +25,42 @@
 
 #include <string.h>
 
+#if AC_BUILT
+#include "autoconfig.h"
+#endif
+
 #include "arch.h"
 
-/* OMP code is b0rken - it assumes all PARA's are the same */
-#if defined(_OPENMP) && defined(MMX_COEF) &&	  \
-	(SHA1_SSE_PARA != MD5_SSE_PARA || \
-	SHA1_SSE_PARA != MD4_SSE_PARA || \
-	 MD4_SSE_PARA != MD5_SSE_PARA)
+#if defined(SIMD_COEF_32) && !ARCH_LITTLE_ENDIAN
+	#undef SIMD_COEF_32
+	#undef SIMD_COEF_64
+	#undef SIMD_PARA_MD5
+	#undef SIMD_PARA_MD4
+	#undef SIMD_PARA_SHA1
+	#undef SIMD_PARA_SHA256
+	#undef SIMD_PARA_SHA512
+	#define BITS ARCH_BITS_STR
+#endif
+
+#if !FAST_FORMATS_OMP
+#ifdef _OPENMP
+  #define FORCE_THREAD_MD5_body
+#endif
 #undef _OPENMP
 #endif
 
-#if defined (MMX_COEF) && MMX_COEF==2 && defined (_OPENMP)
-#undef _OPENMP
-#endif
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
 #include "config.h"
 #include "md5.h"
 #include "dynamic.h"
+#ifndef UNICODE_NO_OPTIONS
+#include "options.h"
+#endif
 #include "memdbg.h"
+
+#ifndef DYNAMIC_DISABLED
 
 void dynamic_DISPLAY_ALL_FORMATS()
 {
@@ -55,31 +71,24 @@ void dynamic_DISPLAY_ALL_FORMATS()
 		char Type[14], *cp;
 		if (!sz)
 			break;
-		if (!IsOMP_Valid(i))
-			continue;
-		strncpy(Type, sz, sizeof(Type));
-		Type[13] = 0;
+		strnzcpy(Type, sz, sizeof(Type));
 		cp = strchr(Type, ':');
 		if (cp) *cp = 0;
-		printf ("Format = %s%s  type = %s\n", Type, strlen(Type)<10?" ":"", sz);
+		printf("Format = %s%s  type = %s\n", Type, strlen(Type)<10?" ":"", sz);
 	}
 
 	// The config has not been loaded, so we have to load it now, if we want to 'check'
 	// and show any user set md5-generic functions.
 #if JOHN_SYSTEMWIDE
 	cfg_init(CFG_PRIVATE_FULL_NAME, 1);
-	cfg_init(CFG_PRIVATE_ALT_NAME, 1);
 #endif
 	cfg_init(CFG_FULL_NAME, 1);
-	cfg_init(CFG_ALT_NAME, 0);
 
 	for (i = 1000; i < 10000; ++i)
 	{
 		char *sz = dynamic_LOAD_PARSER_SIGNATURE(i);
-		if (sz &&
-		    // dynamic_IS_PARSER_VALID(i)) // this would include "reserved" formats 
-		    dynamic_IS_VALID(i) == 1) // skip "reserved" formats 
-			printf ("UserFormat = dynamic_%d  type = %s\n", i, sz);
+		if (sz && dynamic_IS_VALID(i, 0) == 1)
+			printf("UserFormat = dynamic_%d  type = %s\n", i, sz);
 	}
 }
 
@@ -164,24 +173,28 @@ char *dynamic_FIX_SALT_TO_HEX(char *ciphertext) {
 	if (!cp)
 		return ciphertext;  // not a salted format.
 
-	// we will HAVE to get this much more functional.  But for now, we simply convert
+	// We will HAVE to get this much more functional.  But for now, we simply convert
 	// anything where we find a ':' or '$' or one of the line feed chars, in the salt,
 	// into a HEX string.  Otherwise the .pot file output can easily be 'broken'.
 	// it would be nice to also handle 'null' bytes (since some salts CAN have them), however
 	// since we are a C program, we already have problems with them. With recent changes
 	// in john, john CAN find them, but I do not think it can properly store them to pot
 	// file, unless the $HEX$ part is maintained (it may be maintained, I have to test that).
-
+	// Since the loader also strips trailing ' ' or '\t' characters,
+	// we need to convert to hex if the last character is either ' ' or '\t'.
 	++cp;
-	if ( strchr(cp, ':') || strchr(cp, '$') || strchr(cp, '\n') || strchr(cp, '\r') ) {
+	if ( strchr(cp, ':') || strchr(cp, '$') || strchr(cp, '\n') || strchr(cp, '\r') ||
+	     cp[strlen(cp) - 1] == ' ' || cp[strlen(cp) - 1] == '\t' ) {
 		// ok, we are going to convert to a 'HEX'  The length is length of ciphertext, the null, the HEX$ and 2 bytes per char of salt string.
 		char *cpx, *cpNew = mem_alloc_tiny(strlen(ciphertext) + 1 + 4 + strlen(cp), MEM_ALIGN_NONE);
 		cpx = cpNew;
-		// put the hash, including first '$' into the ouput string, AND the starting HEX$
+		// put the hash, including first '$' into the output string, AND the starting HEX$
 		cpx += sprintf(cpNew, "%*.*sHEX$", (int)(cp-ciphertext), (int)(cp-ciphertext), ciphertext);
 		while (*cp)
-			cpx += sprintf(cpx, "%02x", *cp++);
+			cpx += sprintf(cpx, "%02x", (unsigned char)(*cp++));
 		return cpNew;
 	}
 	return ciphertext;
 }
+
+#endif /* DYNAMIC_DISABLED */

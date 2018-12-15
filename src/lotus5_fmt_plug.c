@@ -3,6 +3,12 @@
 /* OpenMP support and further optimizations (including some code rewrites)
  * by Solar Designer */
 
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_lotus5;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_lotus5);
+#else
+
 #include <stdio.h>
 #include <string.h>
 #include "misc.h"
@@ -10,6 +16,10 @@
 #include "common.h"
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+
+#ifndef OMP_SCALE
+#define OMP_SCALE 2 // core i7
 #endif
 
 #include "memdbg.h"
@@ -32,6 +42,8 @@
 #define CIPHERTEXT_LENGTH              32
 #define BINARY_SIZE                    16
 #define SALT_SIZE                      0
+#define BINARY_ALIGN			sizeof(uint32_t)
+#define SALT_ALIGN				1
 #define MIN_KEYS_PER_CRYPT             LOTUS_N
 /* Must be divisible by any LOTUS_N (thus, by 2 and 3) */
 #define MAX_KEYS_PER_CRYPT             0x900
@@ -88,37 +100,37 @@ static const unsigned char lotus_magic_table[] = {
 };
 
 /*Some more JTR variables*/
-static ARCH_WORD_32 (*crypt_key)[BINARY_SIZE / 4];
+static uint32_t (*crypt_key)[BINARY_SIZE / 4];
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
 
 static void init(struct fmt_main *self)
 {
 #ifdef _OPENMP
-	int n = omp_get_max_threads();
-	if (n < 1)
-		n = 1;
-	n *= 2;
-	if (n > self->params.max_keys_per_crypt)
-		n = self->params.max_keys_per_crypt;
-	self->params.min_keys_per_crypt = n;
+	omp_autotune(self, OMP_SCALE);
 #endif
 
-	crypt_key = mem_calloc_tiny(
-	    (sizeof(*crypt_key) + sizeof(*saved_key)) *
-	    self->params.max_keys_per_crypt,
-	    MEM_ALIGN_CACHE);
-	saved_key = (void *)((char *)crypt_key +
-	    sizeof(*crypt_key) * self->params.max_keys_per_crypt);
+	crypt_key = mem_calloc_align(sizeof(*crypt_key),
+	    self->params.max_keys_per_crypt, MEM_ALIGN_CACHE);
+	saved_key = mem_calloc_align(sizeof(*saved_key),
+	    self->params.max_keys_per_crypt, MEM_ALIGN_CACHE);
+}
+
+static void done(void)
+{
+	MEM_FREE(crypt_key);
+	MEM_FREE(saved_key);
 }
 
 /*Utility function to convert hex to bin */
-static void * binary (char *ciphertext)
+static void * get_binary(char *ciphertext)
 {
-  static char realcipher[BINARY_SIZE];
+  static uint32_t out[BINARY_SIZE/4];
+  char *realcipher = (char*)out;
   int i;
+
   for (i = 0; i < BINARY_SIZE; i++)
       realcipher[i] = atoi16[ARCH_INDEX(ciphertext[i*2])]*16 + atoi16[ARCH_INDEX(ciphertext[i*2+1])];
-  return ((void *) realcipher);
+  return (void*)out;
 }
 
 /*Another function required by JTR: decides whether we have a valid
@@ -130,7 +142,7 @@ valid (char *ciphertext, struct fmt_main *self)
 
   for (i = 0; i < CIPHERTEXT_LENGTH; i++)
 	  if (!(((ciphertext[i] >= '0') && (ciphertext[i] <= '9'))
-				  || ((ciphertext[i] >= 'a') && (ciphertext[i] <= 'f'))
+				  //|| ((ciphertext[i] >= 'a') && (ciphertext[i] <= 'f'))
 				  || ((ciphertext[i] >= 'A') && (ciphertext[i] <= 'F'))))
 	  {
 		  return 0;
@@ -172,7 +184,7 @@ static int cmp_exact (char *source, int index)
 /*Beginning of private functions*/
 /* Takes the plaintext password and generates the second row of our
  * working matrix for the final call to the mixing function*/
-static void MAYBE_INLINE
+MAYBE_INLINE static void
 #if LOTUS_N == 3
 lotus_transform_password (unsigned char *i0, unsigned char *o0,
     unsigned char *i1, unsigned char *o1,
@@ -260,7 +272,7 @@ static void lotus_mix (unsigned char *m0, unsigned char *m1)
 /*the last public function; generates ciphertext*/
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
+	const int count = *pcount;
 	int index;
 
 #ifdef _OPENMP
@@ -335,20 +347,8 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	return count;
 }
 
-static int get_hash1(int index) { return crypt_key[index][0] & 0xf; }
-static int get_hash2(int index) { return crypt_key[index][0] & 0xff; }
-static int get_hash3(int index) { return crypt_key[index][0] & 0xfff; }
-static int get_hash4(int index) { return crypt_key[index][0] & 0xffff; }
-static int get_hash5(int index) { return crypt_key[index][0] & 0xfffff; }
-static int get_hash6(int index) { return crypt_key[index][0] & 0xffffff; }
-static int get_hash7(int index) { return crypt_key[index][0] & 0x7ffffff; }
-static int binary_hash1(void * binary) { return *(ARCH_WORD_32 *)binary & 0xf; }
-static int binary_hash2(void * binary) { return *(ARCH_WORD_32 *)binary & 0xff; }
-static int binary_hash3(void * binary) { return *(ARCH_WORD_32 *)binary & 0xfff; }
-static int binary_hash4(void * binary) { return *(ARCH_WORD_32 *)binary & 0xffff; }
-static int binary_hash5(void * binary) { return *(ARCH_WORD_32 *)binary & 0xfffff; }
-static int binary_hash6(void * binary) { return *(ARCH_WORD_32 *)binary & 0xffffff; }
-static int binary_hash7(void * binary) { return *(ARCH_WORD_32 *)binary & 0x7ffffff; }
+#define COMMON_GET_HASH_VAR crypt_key
+#include "common-get-hash.h"
 
 /* C's version of a class specifier */
 struct fmt_main fmt_lotus5 = {
@@ -358,57 +358,53 @@ struct fmt_main fmt_lotus5 = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
-		DEFAULT_ALIGN,
+		BINARY_ALIGN,
 		SALT_SIZE,
-		DEFAULT_ALIGN,
+		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
+		{ NULL },
 		tests
 	}, {
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		fmt_default_prepare,
 		valid,
 		fmt_default_split,
-		binary,
+		get_binary,
 		fmt_default_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
-			binary_hash1,
-			binary_hash2,
-			binary_hash3,
-			binary_hash4,
-			binary_hash5,
-			binary_hash6,
-			binary_hash7
+			fmt_default_binary_hash_0,
+			fmt_default_binary_hash_1,
+			fmt_default_binary_hash_2,
+			fmt_default_binary_hash_3,
+			fmt_default_binary_hash_4,
+			fmt_default_binary_hash_5,
+			fmt_default_binary_hash_6
 		},
 		fmt_default_salt_hash,
+		NULL,
 		fmt_default_set_salt,
 		set_key,
 		get_key,
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash1,
-			get_hash2,
-			get_hash3,
-			get_hash4,
-			get_hash5,
-			get_hash6,
-			get_hash7
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

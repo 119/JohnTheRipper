@@ -1,10 +1,9 @@
-/* androidfde.c
+/*
+ * This code is based on androidfde.c file from hashkill (a hash cracking tool)
+ * project. Copyright (C) 2010 Milen Rangelov <gat3way@gat3way.eu>.
  *
- * hashkill - a hash cracking tool
- * Copyright (C) 2010 Milen Rangelov <gat3way@gat3way.eu>
- *
- * Modified for JtR and made stuff more generic
- * This software is Copyright (c) 2013 Dhiru Kholia <dhiru at openwall.com>
+ * Modified for JtR and made stuff more generic - Dhiru.
+ * This software is Copyright (c) 2013 Dhiru Kholia <dhiru at openwall.com>.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -22,17 +21,21 @@
  */
 
 
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_fde;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_fde);
+#else
+
 #include <stdio.h>
 #include <string.h>
-#include <assert.h>
-#include <errno.h>
-#include "os.h"
 #include <stdint.h>
 #include <stdlib.h>
-#include <sys/types.h>
-#include <openssl/aes.h>
 
-#include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
 #include "johnswap.h"
 #include "misc.h"
@@ -41,37 +44,37 @@
 #include "params.h"
 #include "options.h"
 #include "memory.h"
-#undef MMX_COEF // FIXME
 #include "pbkdf2_hmac_sha1.h"
-// NOTE, this format FAILS for generic sha2.  It could be due to interaction between openssl/aes and generic sha2 code.
+#include "aes.h"
 #include "sha2.h"
-#ifdef _OPENMP
-static int omp_t = 1;
-#include <omp.h>
-#define OMP_SCALE           1
-#endif
 #include "memdbg.h"
 
 #define FORMAT_TAG          "$fde$"
-#define TAG_LENGTH          5
+#define TAG_LENGTH          (sizeof(FORMAT_TAG)-1)
 #define FORMAT_LABEL        "fde"
 #define FORMAT_NAME         "Android FDE"
-#ifdef MMX_COEF
-#define ALGORITHM_NAME      "PBKDF2-SHA1 " SHA1_N_STR MMX_TYPE
+#ifdef SIMD_COEF_32
+#define ALGORITHM_NAME      "PBKDF2-SHA1 " SHA1_ALGORITHM_NAME " SHA256/AES"
 #else
-#define ALGORITHM_NAME      "PBKDF2-SHA1 32/" ARCH_BITS_STR
+#define ALGORITHM_NAME      "PBKDF2-SHA1 SHA256/AES 32/" ARCH_BITS_STR
 #endif
 #define BENCHMARK_COMMENT   ""
 #define PLAINTEXT_LENGTH    64
 #define BENCHMARK_LENGTH    -1
 #define BINARY_SIZE         0
+#define BINARY_ALIGN        1
+#define SALT_ALIGN          8
 #define SALT_SIZE           sizeof(struct custom_salt)
-#ifdef MMX_COEF
+#ifdef SIMD_COEF_32
 #define MIN_KEYS_PER_CRYPT  SSE_GROUP_SZ_SHA1
-#define MAX_KEYS_PER_CRYPT  SSE_GROUP_SZ_SHA1
+#define MAX_KEYS_PER_CRYPT  (SSE_GROUP_SZ_SHA1 * 4)
 #else
 #define MIN_KEYS_PER_CRYPT  1
-#define MAX_KEYS_PER_CRYPT  1
+#define MAX_KEYS_PER_CRYPT  4
+#endif
+
+#ifndef OMP_SCALE
+#define OMP_SCALE           16 // Tuned w/ MKPC for core i7
 #endif
 
 static struct fmt_tests fde_tests[] = {
@@ -81,12 +84,13 @@ static struct fmt_tests fde_tests[] = {
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
 static int *cracked;
+static int max_cracked;
 
 static struct custom_salt {
 	int loaded;
 	unsigned char *cipherbuf;
 	int keysize;
-	int iterations;
+	int iterations; // NOTE, not used. Hard coded to 2000 for FDE from Android <= 4.3 (PBKDF2-SHA1)
 	int saltlen;
 	unsigned char data[512 * 3];
 	unsigned char salt[16];
@@ -97,22 +101,25 @@ static struct custom_salt {
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
-	saved_key = mem_calloc_tiny(sizeof(*saved_key) *
-			self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	cracked = mem_calloc_tiny(sizeof(*cracked) *
-			self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
+	omp_autotune(self, OMP_SCALE);
+
+	max_cracked = self->params.max_keys_per_crypt;
+	saved_key = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*saved_key));
+	cracked   = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*cracked));
+}
+
+static void done(void)
+{
+	MEM_FREE(cracked);
+	MEM_FREE(saved_key);
 }
 
 static int valid(char *ciphertext, struct fmt_main *self)
 {
 	char *ctcopy, *keeptr;
-	int saltlen, keysize;
+	int saltlen, keysize, extra;
 	char *p;
 
 	if (strncmp(ciphertext, FORMAT_TAG, TAG_LENGTH) != 0)
@@ -121,27 +128,31 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	ctcopy = strdup(ciphertext);
 	keeptr = ctcopy;
 	ctcopy += TAG_LENGTH;
-	if ((p = strtok(ctcopy, "$")) == NULL)
+	if ((p = strtokm(ctcopy, "$")) == NULL)
+		goto err;
+	if (!isdec(p))
 		goto err;
 	saltlen = atoi(p);
-	if(saltlen > 16)			/* saltlen */
+	if (saltlen > 16)			/* saltlen */
 		goto err;
-	if ((p = strtok(NULL, "$")) == NULL)	/* salt */
+	if ((p = strtokm(NULL, "$")) == NULL)	/* salt */
 		goto err;
-	if (strlen(p) != saltlen * 2)
+	if (hexlenl(p, &extra) != saltlen * 2 || extra)
 		goto err;
-	if ((p = strtok(NULL, "*$")) == NULL)	/* keysize */
+	if ((p = strtokm(NULL, "$")) == NULL)	/* keysize */
+		goto err;
+	if (!isdec(p))
 		goto err;
 	keysize = atoi(p);
-	if(keysize > 64)
+	if (keysize > 64)
 		goto err;
-	if ((p = strtok(NULL, "$")) == NULL)	/* key */
+	if ((p = strtokm(NULL, "$")) == NULL)	/* key */
 		goto err;
-	if(strlen(p) != keysize * 2)
+	if (hexlenl(p, &extra) != keysize * 2 || extra)
 		goto err;
-	if ((p = strtok(NULL, "$")) == NULL)	/* data */
+	if ((p = strtokm(NULL, "$")) == NULL)	/* data */
 		goto err;
-	if(strlen(p) != 512 * 3 * 2)
+	if (hexlenl(p, &extra) != 512 * 3 * 2 || extra)
 		goto err;
 
 	MEM_FREE(keeptr);
@@ -157,25 +168,25 @@ static void *get_salt(char *ciphertext)
 	char *ctcopy = strdup(ciphertext);
 	char *keeptr = ctcopy;
 	char *p;
-	// int res;
 	int i;
 	static struct custom_salt cs;
+	memset(&cs, 0, sizeof(cs));
 	ctcopy += TAG_LENGTH;
-	p = strtok(ctcopy, "$");
+	p = strtokm(ctcopy, "$");
 	cs.saltlen = atoi(p);
-	p = strtok(NULL, "$");
+	p = strtokm(NULL, "$");
 	for (i = 0; i < cs.saltlen; i++) {
 		cs.salt[i] = (atoi16[ARCH_INDEX(*p)] << 4) | atoi16[ARCH_INDEX(p[1])];
 		p += 2;
 	}
-	p = strtok(NULL, "$");
+	p = strtokm(NULL, "$");
 	cs.keysize = atoi(p);
-	p = strtok(NULL, "$");
+	p = strtokm(NULL, "$");
 	for (i = 0; i < cs.keysize; i++) {
 		cs.mkey[i] = (atoi16[ARCH_INDEX(*p)] << 4) | atoi16[ARCH_INDEX(p[1])];
 		p += 2;
 	}
-	p = strtok(NULL, "$");
+	p = strtokm(NULL, "$");
 	for (i = 0; i < 512 * 3; i++) {
 		cs.data[i] = (atoi16[ARCH_INDEX(*p)] << 4) | atoi16[ARCH_INDEX(p[1])];
 		p += 2;
@@ -190,7 +201,7 @@ static void set_salt(void *salt)
 }
 
 // Not reference implementation - this is modified for use by androidfde!
-static void AES_cbc_essiv(unsigned char *src, unsigned char *dst, unsigned char *key, int startsector,int size)
+static void AES_cbc_essiv(unsigned char *src, unsigned char *dst, unsigned char *key, int startsector, int size)
 {
 	AES_KEY aeskey;
 	unsigned char essiv[16];
@@ -202,81 +213,93 @@ static void AES_cbc_essiv(unsigned char *src, unsigned char *dst, unsigned char 
 	SHA256_Init(&ctx);
 	SHA256_Update(&ctx, key, cur_salt->keysize);
 	SHA256_Final(essivhash, &ctx);
-	memset(sectorbuf,0,16);
-	memset(zeroiv,0,16);
-	memset(essiv,0,16);
-	memcpy(sectorbuf,&startsector,4);
+	memset(sectorbuf, 0, 16);
+	memset(zeroiv, 0, 16);
+	memset(essiv, 0, 16);
+	memcpy(sectorbuf, &startsector, 4);
 	AES_set_encrypt_key(essivhash, 256, &aeskey);
 	AES_cbc_encrypt(sectorbuf, essiv, 16, &aeskey, zeroiv, AES_ENCRYPT);
-	AES_set_decrypt_key(key, cur_salt->keysize*8, &aeskey);
+	AES_set_decrypt_key(key, cur_salt->keysize * 8, &aeskey);
 	AES_cbc_encrypt(src, dst, size, &aeskey, essiv, AES_DECRYPT);
 }
 
-int hash_plugin_check_hash(char *password)
+void hash_plugin_check_hash(int index)
 {
-	unsigned char keycandidate[255];
 	unsigned char keycandidate2[255];
 	unsigned char decrypted1[512]; // FAT
 	unsigned char decrypted2[512]; // ext3/4
 	AES_KEY aeskey;
 	uint16_t v2,v3,v4;
 	uint32_t v1,v5;
+	int j = 0;
 
-	pbkdf2_sha1((const uint8_t*)password, strlen(password),
-		(const uint8_t*)(cur_salt->salt),
-		16,
-		2000,
-		keycandidate,
-		cur_salt->keysize + 16, 0);
-#if !ARCH_LITTLE_ENDIAN
-	{
-		int i;
-		for (i = 0; i < (cur_salt->keysize + 16)/sizeof(ARCH_WORD_32); ++i) {
-			((ARCH_WORD_32*)keycandidate)[i] = JOHNSWAP(((ARCH_WORD_32*)keycandidate)[i]);
-		}
+#ifdef SIMD_COEF_32
+	unsigned char *keycandidate, Keycandidate[SSE_GROUP_SZ_SHA1][255];
+	int lens[SSE_GROUP_SZ_SHA1], i;
+	unsigned char *pin[SSE_GROUP_SZ_SHA1];
+	union {
+		uint32_t *pout[SSE_GROUP_SZ_SHA1];
+		unsigned char *poutc;
+	} x;
+	for (i = 0; i < SSE_GROUP_SZ_SHA1; ++i) {
+		lens[i] = strlen(saved_key[index+i]);
+		pin[i] = (unsigned char*)saved_key[index+i];
+		x.pout[i] = (uint32_t*)(Keycandidate[i]);
 	}
+	pbkdf2_sha1_sse((const unsigned char **)pin, lens, cur_salt->salt, 16,
+		2000, &(x.poutc), cur_salt->keysize + 16, 0);
+#else
+	unsigned char keycandidate[255];
+	char *password = saved_key[index];
+	pbkdf2_sha1((const uint8_t*)password, strlen(password), (const uint8_t*)(cur_salt->salt),
+		16, 2000, keycandidate, cur_salt->keysize + 16, 0);
 #endif
-
+	j = 0;
+#ifdef SIMD_COEF_32
+	for (; j < SSE_GROUP_SZ_SHA1; ++j) {
+	keycandidate = Keycandidate[j];
+#endif
 	AES_set_decrypt_key(keycandidate, cur_salt->keysize*8, &aeskey);
 	AES_cbc_encrypt(cur_salt->mkey, keycandidate2, 16, &aeskey, keycandidate+16, AES_DECRYPT);
-	AES_cbc_essiv(cur_salt->data, decrypted1, keycandidate2,0,32);
-	AES_cbc_essiv(cur_salt->data + 1024, decrypted2, keycandidate2,2,128);
+	AES_cbc_essiv(cur_salt->data, decrypted1, keycandidate2, 0, 32);
+	AES_cbc_essiv(cur_salt->data + 1024, decrypted2, keycandidate2, 2, 128);
 
 	// Check for FAT
-	if ((memcmp(decrypted1+3,"MSDOS5.0",8)==0)) {
-	    return 1;
-	}
-	// Check for extfs
-	memcpy(&v1,decrypted2+72,4);
-	memcpy(&v2,decrypted2+0x3a,2);
-	memcpy(&v3,decrypted2+0x3c,2);
-	memcpy(&v4,decrypted2+0x4c,2);
-	memcpy(&v5,decrypted2+0x48,4);
+	if (!memcmp(decrypted1 + 3, "MSDOS5.0", 8))
+	    cracked[index+j] = 1;
+	else {
+		// Check for extfs
+		memcpy(&v1, decrypted2+72, 4);
+		memcpy(&v2, decrypted2+0x3a, 2);
+		memcpy(&v3, decrypted2+0x3c, 2);
+		memcpy(&v4, decrypted2+0x4c, 2);
+		memcpy(&v5, decrypted2+0x48, 4);
 #if !ARCH_LITTLE_ENDIAN
-	v1 = JOHNSWAP(v1);
-	v2 = JOHNSWAP(v2);
-	v3 = JOHNSWAP(v3);
-	v4 = JOHNSWAP(v4);
-	v5 = JOHNSWAP(v5);
+		v1 = JOHNSWAP(v1);
+		v2 = JOHNSWAP(v2);
+		v3 = JOHNSWAP(v3);
+		v4 = JOHNSWAP(v4);
+		v5 = JOHNSWAP(v5);
 #endif
-	if ((v1<5)&&(v2<4)&&(v3<5)&&(v4<2)&&(v5<5)) {
-	    return 1;
+		if ((v1<5)&&(v2<4)&&(v3<5)&&(v4<2)&&(v5<5))
+			cracked[index+j] = 1;
 	}
-
-    return 0;
+#ifdef SIMD_COEF_32
+	}
+#endif
 }
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
+	const int count = *pcount;
 	int index = 0;
 
+	memset(cracked, 0, sizeof(cracked[0])*max_cracked);
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index += MAX_KEYS_PER_CRYPT)
 #endif
-	{
-		cracked[index] = hash_plugin_check_hash(saved_key[index]);
+	for (index = 0; index < count; index += MIN_KEYS_PER_CRYPT) {
+		hash_plugin_check_hash(index);
 	}
 	return count;
 }
@@ -302,11 +325,7 @@ static int cmp_exact(char *source, int index)
 
 static void fde_set_key(char *key, int index)
 {
-	int saved_key_length = strlen(key);
-	if (saved_key_length > PLAINTEXT_LENGTH)
-		saved_key_length = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, saved_key_length);
-	saved_key[index][saved_key_length] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -321,35 +340,34 @@ struct fmt_main fmt_fde = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
-		DEFAULT_ALIGN,
+		BINARY_ALIGN,
 		SALT_SIZE,
-		DEFAULT_ALIGN,
+		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
+		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_HUGE_INPUT,
 		{ NULL },
-#endif
+		{ FORMAT_TAG },
 		fde_tests
 	}, {
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		fmt_default_prepare,
 		valid,
 		fmt_default_split,
 		fmt_default_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash
 		},
 		fmt_default_salt_hash,
+		NULL,
 		set_salt,
 		fde_set_key,
 		get_key,
@@ -363,3 +381,5 @@ struct fmt_main fmt_fde = {
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

@@ -10,10 +10,16 @@
  * 6 but not 8. I presume this is for getting unpadded base64. Anyway we store
  * an extra byte but for now we will only compare 256 bits. I doubt that will
  * pose any problems. Actually I'm not quite sure the last bits end up correct
- * from the current version of binary().
+ * from the current version of get_binary().
  *
  * Based on [old thick] phpass-md5.
  */
+
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_drupal7;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_drupal7);
+#else
 
 #include "sha2.h"
 
@@ -21,43 +27,50 @@
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
+#include "johnswap.h"
+#include "simd-intrinsics.h"
+
 #ifdef _OPENMP
 #include <omp.h>
+#ifndef OMP_SCALE
 #define OMP_SCALE			8
+#endif
 #endif
 #include "memdbg.h"
 
+#include "drupal7_common.h"
+
 #define FORMAT_LABEL			"Drupal7"
-#define FORMAT_NAME			"$S$"
-#if ARCH_BITS >= 64
-#define ALGORITHM_NAME			"SHA512 64/" ARCH_BITS_STR " " SHA2_LIB
-#else
-#define ALGORITHM_NAME			"SHA512 32/" ARCH_BITS_STR " " SHA2_LIB
-#endif
+#define ALGORITHM_NAME			"SHA512 " SHA512_ALGORITHM_NAME
 
-#define BENCHMARK_COMMENT		" (x16385)"
-#define BENCHMARK_LENGTH		-1
-
-#define PLAINTEXT_LENGTH		63
-#define CIPHERTEXT_LENGTH		55
+#define PLAINTEXT_LENGTH		47
 
 #define DIGEST_SIZE			(512/8)
 
 #define BINARY_SIZE			(258/8) // ((258+7)/8)
 #define BINARY_ALIGN			4
-#define SALT_SIZE			8
-#define SALT_ALIGN			4
 
+#ifdef SIMD_COEF_64
+#define MIN_KEYS_PER_CRYPT      (SIMD_COEF_64*SIMD_PARA_SHA512)
+#define MAX_KEYS_PER_CRYPT      (SIMD_COEF_64*SIMD_PARA_SHA512)
+#if ARCH_LITTLE_ENDIAN
+#define GETPOS(i, index)        ( (index&(SIMD_COEF_64-1))*8 + ((i)&(0xffffffff-7))*SIMD_COEF_64 + (7-((i)&7)) + (unsigned int)index/SIMD_COEF_64*SHA_BUF_SIZ*SIMD_COEF_64*8 )
+#else
+#define GETPOS(i, index)        ( (index&(SIMD_COEF_64-1))*8 + ((i)&(0xffffffff-7))*SIMD_COEF_64 + ((i)&7) + (unsigned int)index/SIMD_COEF_64*SHA_BUF_SIZ*SIMD_COEF_64*8 )
+#endif
+#else
 #define MIN_KEYS_PER_CRYPT		1
 #define MAX_KEYS_PER_CRYPT		1
+#endif
 
-static struct fmt_tests tests[] = {
-	{"$S$CwkjgAKeSx2imSiN3SyBEg8e0sgE2QOx4a/VIfCHN0BZUNAWCr1X", "virtualabc"},
-	{"$S$CFURCPa.k6FAEbJPgejaW4nijv7rYgGc4dUJtChQtV4KLJTPTC/u", "password"},
-	{"$S$C6x2r.aW5Nkg7st6/u.IKWjTerHXscjPtu4spwhCVZlP89UKcbb/", "NEW_TEMP_PASSWORD"},
-	{NULL}
-};
-
+/*
+ * NOTE, due to the 0x4000 iteration count, I am not wasting time pre-loading
+ * keys/salts.  We will simply add SIMD code to the crypt_all.  We could only
+ * gain < .1% worrying about all the extra stuff from set_key, get_key, the
+ * hashes, etc needed to split out SIMD.  We just keep all input data in 'flat'
+ * format, switch to SIMD, do the 0x4000 loops, and put output back into 'flat'
+ * layout again.  So we have no 'static' SIMD objects.
+ */
 static unsigned char *cursalt;
 static unsigned loopCnt;
 static unsigned char (*EncKey)[PLAINTEXT_LENGTH + 1];
@@ -67,36 +80,21 @@ static char (*crypt_key)[DIGEST_SIZE];
 static void init(struct fmt_main *self)
 {
 #if defined (_OPENMP)
-	int omp_t;
-
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
+	omp_autotune(self, OMP_SCALE);
 #endif
-	EncKey = mem_calloc_tiny(sizeof(*EncKey) * self->params.max_keys_per_crypt, MEM_ALIGN_NONE);
-	EncKeyLen = mem_calloc_tiny(sizeof(*EncKeyLen) * self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	crypt_key = mem_calloc_tiny(sizeof(*crypt_key) * self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
+	EncKey    = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*EncKey));
+	EncKeyLen = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*EncKeyLen));
+	crypt_key = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*crypt_key));
 }
 
-static int valid(char *ciphertext, struct fmt_main *self)
+static void done(void)
 {
-	int i;
-	unsigned count_log2;
-
-	if (strlen(ciphertext) != CIPHERTEXT_LENGTH)
-		return 0;
-	if (strncmp(ciphertext, "$S$", 3) != 0)
-		return 0;
-	for (i = 3; i < CIPHERTEXT_LENGTH; ++i)
-		if (atoi64[ARCH_INDEX(ciphertext[i])] == 0x7F)
-			return 0;
-
-	count_log2 = atoi64[ARCH_INDEX(ciphertext[3])];
-	if (count_log2 < 7 || count_log2 > 31)
-		return 0;
-
-	return 1;
+	MEM_FREE(crypt_key);
+	MEM_FREE(EncKeyLen);
+	MEM_FREE(EncKey);
 }
 
 static void set_salt(void *salt)
@@ -107,11 +105,7 @@ static void set_salt(void *salt)
 
 static void set_key(char *key, int index)
 {
-	int len;
-
-	len = strlen(key);
-	EncKeyLen[index] = len;
-	memcpy(((char*)EncKey[index]), key, len + 1);
+	EncKeyLen[index] = strnzcpyn((char*)EncKey[index], key, sizeof(*EncKey));
 }
 
 static char *get_key(int index)
@@ -123,7 +117,7 @@ static int cmp_all(void *binary, int count)
 {
 	int index;
 
-	for(index = 0; index < count; index++)
+	for (index = 0; index < count; index++)
 		if (!memcmp(binary, crypt_key[index], ARCH_SIZE))
 			return 1;
 	return 0;
@@ -141,13 +135,43 @@ static int cmp_exact(char *source, int index)
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
-	int index = 0;
+	const int count = *pcount;
+	int index;
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index+=MAX_KEYS_PER_CRYPT) {
+#ifdef SIMD_COEF_64
+		unsigned char _IBuf[128*MAX_KEYS_PER_CRYPT+MEM_ALIGN_CACHE], *keys;
+		uint64_t *keys64;
+		unsigned i, j, len, Lcount = loopCnt;
+
+		keys = (unsigned char*)mem_align(_IBuf, MEM_ALIGN_CACHE);
+		keys64 = (uint64_t*)keys;
+		memset(keys, 0, 128*MAX_KEYS_PER_CRYPT);
+		for (i = 0; i < MAX_KEYS_PER_CRYPT; ++i) {
+			len = EncKeyLen[index+i];
+			for (j = 0; j < 8; ++j)
+				keys[GETPOS(j, i)] = cursalt[j];
+			for (j = 0; j < len; ++j)
+				keys[GETPOS(j+8, i)] = EncKey[index+i][j];
+			keys[GETPOS(j+8, i)] = 0x80;
+			keys64[15*SIMD_COEF_64+(i&(SIMD_COEF_64-1))+i/SIMD_COEF_64*SHA_BUF_SIZ*SIMD_COEF_64] = (len+8) << 3;
+		}
+		SIMDSHA512body(keys, keys64, NULL, SSEi_MIXED_IN|SSEi_OUTPUT_AS_INP_FMT);
+		for (i = 0; i < MAX_KEYS_PER_CRYPT; ++i) {
+			len = EncKeyLen[index+i];
+			for (j = 0; j < len; ++j)
+				keys[GETPOS(j+64, i)] = EncKey[index+i][j];
+			keys[GETPOS(j+64, i)] = 0x80;
+			keys64[15*SIMD_COEF_64+(i&(SIMD_COEF_64-1))+i/SIMD_COEF_64*SHA_BUF_SIZ*SIMD_COEF_64] = (len+64) << 3;
+		}
+		while (--Lcount)
+			SIMDSHA512body(keys, keys64, NULL, SSEi_MIXED_IN|SSEi_OUTPUT_AS_INP_FMT);
+
+		// Last one with FLAT_OUT
+		SIMDSHA512body(keys, (uint64_t*)crypt_key[index], NULL, SSEi_MIXED_IN|SSEi_OUTPUT_AS_INP_FMT|SSEi_FLAT_OUT);
+#else
 		SHA512_CTX ctx;
 		unsigned char tmp[DIGEST_SIZE + PLAINTEXT_LENGTH];
 		int len = EncKeyLen[index];
@@ -158,7 +182,6 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		SHA512_Update( &ctx, EncKey[index], len );
 		memcpy(&tmp[DIGEST_SIZE], (char *)EncKey[index], len);
 		SHA512_Final( tmp, &ctx);
-
 		len += DIGEST_SIZE;
 
 		do {
@@ -169,79 +192,14 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		SHA512_Init( &ctx );
 		SHA512_Update( &ctx, tmp, len);
 		SHA512_Final( (unsigned char *) crypt_key[index], &ctx);
+#endif
 	}
 	return count;
 }
 
-static void * binary(char *ciphertext)
-{
-	int i;
-	unsigned sixbits;
-	static union {
-		unsigned char u8[BINARY_SIZE + 1];
-		ARCH_WORD_32 u32;
-	} out;
-	int bidx=0;
-	char *pos;
+#define COMMON_GET_HASH_VAR crypt_key
+#include "common-get-hash.h"
 
-	pos = &ciphertext[3 + 1 + 8];
-	for (i = 0; i < 10; ++i) {
-		sixbits = atoi64[ARCH_INDEX(*pos++)];
-		out.u8[bidx] = sixbits;
-		sixbits = atoi64[ARCH_INDEX(*pos++)];
-		out.u8[bidx++] |= (sixbits<<6);
-		sixbits >>= 2;
-		out.u8[bidx] = sixbits;
-		sixbits = atoi64[ARCH_INDEX(*pos++)];
-		out.u8[bidx++] |= (sixbits<<4);
-		sixbits >>= 4;
-		out.u8[bidx] = sixbits;
-		sixbits = atoi64[ARCH_INDEX(*pos++)];
-		out.u8[bidx++] |= (sixbits<<2);
-	}
-	sixbits = atoi64[ARCH_INDEX(*pos++)];
-	out.u8[bidx] = sixbits;
-	sixbits = atoi64[ARCH_INDEX(*pos++)];
-	out.u8[bidx++] |= (sixbits<<6);
-	sixbits >>= 2;
-	out.u8[bidx] = sixbits;
-	sixbits = atoi64[ARCH_INDEX(*pos++)];
-	out.u8[bidx++] |= (sixbits<<4);
-	return out.u8;
-}
-
-static void * salt(char *ciphertext)
-{
-	static union {
-		unsigned char u8[SALT_SIZE + 1];
-		ARCH_WORD_32 u32;
-	} salt;
-	// store off the 'real' 8 bytes of salt
-	memcpy(salt.u8, &ciphertext[4], 8);
-	// append the 1 byte of loop count information.
-	salt.u8[8] = ciphertext[3];
-	return salt.u8;
-}
-
-static int get_hash_0(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & 0xf; }
-static int get_hash_1(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & 0xff; }
-static int get_hash_2(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & 0xfff; }
-static int get_hash_3(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & 0xffff; }
-static int get_hash_4(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & 0xfffff; }
-static int get_hash_5(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & 0xffffff; }
-static int get_hash_6(int index) { return *((ARCH_WORD_32 *)&crypt_key[index]) & 0x7ffffff; }
-
-static int salt_hash(void *salt)
-{
-	return *((ARCH_WORD_32 *)salt) & 0x3FF;
-}
-
-#if FMT_MAIN_VERSION > 11
-static unsigned int iteration_count(void *salt)
-{
-	return (unsigned int) 1 << (atoi64[ARCH_INDEX(((char*)salt)[8])]);
-}
-#endif
 struct fmt_main fmt_drupal7 = {
 	{
 		FORMAT_LABEL,
@@ -249,6 +207,7 @@ struct fmt_main fmt_drupal7 = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
 		BINARY_ALIGN,
@@ -258,26 +217,23 @@ struct fmt_main fmt_drupal7 = {
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
 		{
 			"iteration count",
 		},
-#endif
+		{ FORMAT_TAG },
 		tests
 	}, {
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		fmt_default_prepare,
 		valid,
 		fmt_default_split,
-		binary,
-		salt,
-#if FMT_MAIN_VERSION > 11
+		get_binary,
+		get_salt,
 		{
 			iteration_count,
 		},
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash_0,
@@ -289,22 +245,20 @@ struct fmt_main fmt_drupal7 = {
 			fmt_default_binary_hash_6
 		},
 		salt_hash,
+		NULL,
 		set_salt,
 		set_key,
 		get_key,
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

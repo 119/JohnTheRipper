@@ -50,7 +50,17 @@
  *     - the HMAC-SHA1 implementation of the PolarSSL open source cryptographic library (http://polarssl.org/)
  */
 
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_mscash2;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_mscash2);
+#else
+
 #include <string.h>
+
+#if defined (_OPENMP)
+#include <omp.h>
+#endif
 
 #include "arch.h"
 #include "misc.h"
@@ -59,87 +69,48 @@
 #include "formats.h"
 #include "unicode.h"
 #include "options.h"
-#include "unicode.h"
-#include <openssl/sha.h>
+#include "sha.h"
 #include "md4.h"
-#include "sse-intrinsics.h"
+#include "simd-intrinsics.h"
 #include "loader.h"
-
-#if (!defined(SHA1_SSE_PARA) && defined(MMX_COEF))
-#undef _OPENMP
-#undef FMT_OMP
-#define FMT_OMP				0
-#elif defined (_OPENMP)
-#include <omp.h>
-#define OMP_LOOPS			1
-#endif
-
+#include "mscash_common.h"
 #include "memdbg.h"
+
+#ifndef OMP_SCALE
+#define OMP_SCALE			2 // Tuned on core i7 w/ MKPC
+#endif
 
 #define ITERATIONS			10240
 static unsigned iteration_cnt =	(ITERATIONS); /* this will get changed at runtime, salt loading */
 
-/* Note: some tests will be replaced in init() if running UTF-8 */
-static struct fmt_tests tests[] = {
-	{"$DCC2$10240#test1#607bbe89611e37446e736f7856515bf8", "test1" },
-	{"$DCC2$10240#Joe#e09b38f84ab0be586b730baf61781e30", "qerwt" },
-	{"$DCC2$10240#Joe#6432f517a900b3fc34ffe57f0f346e16", "12345" },
-	{"c0cbe0313a861062e29f92ede58f9b36", "", {"bin"} },           // nullstring password
-	{"87136ae0a18b2dafe4a41d555425b2ed", "w00t", {"nineteen_characters"} }, // max salt length
-	{"fc5df74eca97afd7cd5abb0032496223", "w00t", {"eighteencharacters"} },
-	{"cfc6a1e33eb36c3d4f84e4c2606623d2", "longpassword", {"twentyXXX_characters"} },
-	{"99ff74cea552799da8769d30b2684bee", "longpassword", {"twentyoneX_characters"} },
-	{"0a721bdc92f27d7fb23b87a445ec562f", "longpassword", {"twentytwoXX_characters"} },
-	{"$DCC2$10240#TEST2#c6758e5be7fc943d00b97972a8a97620", "test2" },    // salt is lowercased before hashing
-	{"$DCC2$10240#test3#360e51304a2d383ea33467ab0b639cc4", "test3" },
-	{"$DCC2$10240#test4#6f79ee93518306f071c47185998566ae", "test4" },
-
-	// max length user name 128 bytes, and max length password, 125 bytes
-	{"$DCC2$10240#12345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678#5ba26de44bd3a369f43a1c72fba76d45", "12345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345"},
-	// Critical length salt
-	{"$DCC2$twentytwoXX_characters#c22936e38aac84474d9a4821b196ef5c", "password"},
-	// Non-standard iterations count
-	{"$DCC2$10000#Twelve_chars#54236c670e185043c8016006c001e982", "magnum"},
-	{NULL}
-};
-
 #define FORMAT_LABEL			"mscash2"
 #define FORMAT_NAME			"MS Cache Hash 2 (DCC2)"
 
-#define BENCHMARK_COMMENT		""
-#define BENCHMARK_LENGTH		-1
+#define MAX_SALT_LEN            128
+#define PLAINTEXT_LENGTH        125
 
-#define PLAINTEXT_LENGTH		125
-#define MAX_CIPHERTEXT_LENGTH		(6 + 5 + 128*3 + 2 + 32) // x3 because salt may be UTF-8 in input  // changed to $DCC2$num#salt#hash  WARNING, only handles num of 5 digits!!
-
-#define BINARY_SIZE			16
-#define BINARY_ALIGN			4
-#define SALT_SIZE			(64*4+4)
-#define SALT_ALIGN			2
+#define SALT_SIZE			(MAX_SALT_LEN*2+4)
 
 #define ALGORITHM_NAME			"PBKDF2-SHA1 " SHA1_ALGORITHM_NAME
 
-#ifdef MMX_COEF
-# ifdef SHA1_SSE_PARA
-#  define MS_NUM_KEYS			(MMX_COEF*SHA1_SSE_PARA)
-# else
-#  define MS_NUM_KEYS			MMX_COEF
-# endif
-// Ok, now we have our MMX/SSE2/intr buffer.
-// this version works properly for MMX, SSE2 (.S) and SSE2 intrinsic.
-#define GETPOS(i, index)	( (index&(MMX_COEF-1))*4 + ((i)&(0xffffffff-3) )*MMX_COEF + (3-((i)&3)) + (index>>(MMX_COEF>>1))*SHA_BUF_SIZ*MMX_COEF*4 ) //for endianity conversion
+#ifdef SIMD_COEF_32
+#define MS_NUM_KEYS			(SIMD_COEF_32*SIMD_PARA_SHA1)
+#if ARCH_LITTLE_ENDIAN==1
+#define GETPOS(i, index)	( (index&(SIMD_COEF_32-1))*4 + ((i)&(0xffffffff-3) )*SIMD_COEF_32 + (3-((i)&3)) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32*4 )
+#else
+#define GETPOS(i, index)	( (index&(SIMD_COEF_32-1))*4 + ((i)&(0xffffffff-3) )*SIMD_COEF_32 + ((i)&3) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32*4 )
+#endif
 static unsigned char (*sse_hash1);
 static unsigned char (*sse_crypt1);
 static unsigned char (*sse_crypt2);
 
 #else
-# define MS_NUM_KEYS			1
+ #define MS_NUM_KEYS			1
 #endif
 
-#define MIN_KEYS_PER_CRYPT		1
-#define MAX_KEYS_PER_CRYPT		MS_NUM_KEYS
+#define MIN_KEYS_PER_CRYPT		MS_NUM_KEYS
+#define MAX_KEYS_PER_CRYPT		(MS_NUM_KEYS * 2)
 
-#define U16_KEY_LEN			(2*PLAINTEXT_LENGTH)
 #define HASH_LEN			(16+48)
 
 static unsigned char *salt_buffer;
@@ -148,161 +119,58 @@ static unsigned char(*key);
 static unsigned int   new_key = 1;
 static unsigned char(*md4hash); // allows the md4 of user, and salt to be appended to it.  the md4 is ntlm, with the salt is DCC1
 static unsigned int (*crypt_out);
-static int omp_t = 1;
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	omp_t = OMP_LOOPS * omp_get_max_threads();
-	if (omp_t < 1)
-		omp_t = 1;
-	self->params.max_keys_per_crypt = omp_t * MS_NUM_KEYS;
-#endif
 
-	key = mem_calloc_tiny(sizeof(*key)*(PLAINTEXT_LENGTH + 1)*self->params.max_keys_per_crypt, MEM_ALIGN_NONE);
-	md4hash = mem_calloc_tiny(sizeof(*md4hash)*HASH_LEN*self->params.max_keys_per_crypt, MEM_ALIGN_NONE);
-	crypt_out = mem_calloc_tiny(sizeof(*crypt_out)*4*self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-#if defined (MMX_COEF)
-	sse_hash1 = mem_calloc_tiny(sizeof(*sse_hash1)*SHA_BUF_SIZ*4*self->params.max_keys_per_crypt, MEM_ALIGN_SIMD);
-	sse_crypt1 = mem_calloc_tiny(sizeof(*sse_crypt1)*20*self->params.max_keys_per_crypt, MEM_ALIGN_SIMD);
-	sse_crypt2 = mem_calloc_tiny(sizeof(*sse_crypt2)*20*self->params.max_keys_per_crypt, MEM_ALIGN_SIMD);
+	omp_autotune(self, OMP_SCALE);
+
+	key = mem_calloc(self->params.max_keys_per_crypt,
+	                 (PLAINTEXT_LENGTH + 1));
+	md4hash = mem_calloc(self->params.max_keys_per_crypt,
+	                     HASH_LEN);
+	crypt_out = mem_calloc(self->params.max_keys_per_crypt,
+	                       BINARY_SIZE);
+#if defined (SIMD_COEF_32)
+	sse_hash1 = mem_calloc_align(self->params.max_keys_per_crypt,
+	                             sizeof(*sse_hash1)*SHA_BUF_SIZ*4,
+	                             MEM_ALIGN_SIMD);
+	sse_crypt1 = mem_calloc_align(self->params.max_keys_per_crypt,
+	                              sizeof(*sse_crypt1) * 20, MEM_ALIGN_SIMD);
+	sse_crypt2 = mem_calloc_align(self->params.max_keys_per_crypt,
+	                              sizeof(*sse_crypt2) * 20, MEM_ALIGN_SIMD);
 	{
 		int index;
 		for (index = 0; index < self->params.max_keys_per_crypt; ++index) {
 			// set the length of all hash1 SSE buffer to 64+20 * 8 bits
 			// The 64 is for the ipad/opad, the 20 is for the length of the SHA1 buffer that also gets into each crypt
 			// this works for SSEi
-			((unsigned int *)sse_hash1)[15*MMX_COEF + (index&(MMX_COEF-1)) + (index>>(MMX_COEF>>1))*SHA_BUF_SIZ*MMX_COEF] = (84<<3); // all encrypts are 64+20 bytes.
+			((unsigned int *)sse_hash1)[15*SIMD_COEF_32 + (index&(SIMD_COEF_32-1)) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32] = (84<<3); // all encrypts are 64+20 bytes.
 			sse_hash1[GETPOS(20,index)] = 0x80;
 		}
 	}
-	// From this point on, we ONLY touch the first 20 bytes (* MMX_COEF) of each buffer 'block'.  If !SHA_PARA', then only the first
+	// From this point on, we ONLY touch the first 20 bytes (* SIMD_COEF_32) of each buffer 'block'.  If !SHA_PARA', then only the first
 	// block is written to after this, if there are more that one SHA_PARA, then the start of each para block will be updated inside the inner loop.
 #endif
 
-	if (pers_opts.target_enc == UTF_8) {
-		// UTF8 may be up to three bytes per character
-		// but core max. is 125 anyway
-		//self->params.plaintext_length = MIN(125, 3*PLAINTEXT_LENGTH);
-		tests[1].plaintext = "\xc3\xbc";         // German u-umlaut in UTF-8
-		tests[1].ciphertext = "$DCC2$10240#joe#bdb80f2c4656a8b8591bd27d39064a54";
-		tests[2].plaintext = "\xe2\x82\xac\xe2\x82\xac"; // 2 x Euro signs
-		tests[2].ciphertext = "$DCC2$10240#joe#1e1e20f482ff748038e47d801d0d1bda";
-	}
-	else if (pers_opts.target_enc == ISO_8859_1) {
-		tests[1].plaintext = "\xfc";
-		tests[1].ciphertext = "$DCC2$10240#joe#bdb80f2c4656a8b8591bd27d39064a54";
-		tests[2].plaintext = "\xfc\xfc";
-		tests[2].ciphertext = "$DCC2$10240#admin#0839e4a07c00f18a8c65cf5b985b9e73";
-	}
+	mscash2_adjust_tests(options.target_enc, PLAINTEXT_LENGTH, MAX_SALT_LEN);
 }
 
-char * mscash2_split(char *ciphertext, int index, struct fmt_main *self)
+static void done(void)
 {
-	static char out[MAX_CIPHERTEXT_LENGTH + 1];
-	int i = 0;
-
-	for(; ciphertext[i] && i < MAX_CIPHERTEXT_LENGTH; i++)
-		out[i] = ciphertext[i];
-
-	out[i] = 0;
-
-	// lowercase salt as well as hash, encoding-aware
-	enc_strlwr(&out[6]);
-
-	return out;
-}
-
-int mscash2_valid(char *ciphertext, int max_salt_length, struct fmt_main *self)
-{
-	unsigned int i;
-	unsigned int l;
-	char insalt[3*128+1];
-	UTF16 realsalt[129];
-	int saltlen;
-
-	if (strncmp(ciphertext, "$DCC2$", 6))
-		return 0;
-
-	/* We demand an iteration count (after prepare()) */
-	if (strchr(ciphertext, '#') == strrchr(ciphertext, '#'))
-		return 0;
-
-	l = strlen(ciphertext);
-	if (l <= 32 || l > MAX_CIPHERTEXT_LENGTH)
-		return 0;
-
-	l -= 32;
-	if(ciphertext[l-1]!='#')
-		return 0;
-
-	for (i = l; i < l + 32; i++)
-		if (atoi16[ARCH_INDEX(ciphertext[i])] == 0x7F)
-			return 0;
-
-	// This is tricky: Max supported salt length is 128 characters of Unicode
-	i = 6;
-	while (ciphertext[i] && ciphertext[i] != '#') ++i;
-	++i;
-	saltlen = enc_to_utf16(realsalt, max_salt_length, (UTF8*)strnzcpy(insalt, &ciphertext[i], l-i), l-(i+1));
-	if (saltlen < 0 || saltlen > max_salt_length) {
-		static int warned = 0;
-
-		if (!ldr_in_pot)
-		if (!warned++)
-			fprintf(stderr, "%s: One or more hashes rejected due to salt length limitation\n", self->params.label);
-
-		return 0;
-	}
-
-	// iteration count must currently be less than 2^16. It must fit in a UTF16 (salt[1]);
-	sscanf(&ciphertext[6], "%d", &i);
-	if (i >= 1<<16)
-		return 0;
-
-	return 1;
+#ifdef SIMD_COEF_32
+	MEM_FREE(sse_crypt2);
+	MEM_FREE(sse_crypt1);
+	MEM_FREE(sse_hash1);
+#endif
+	MEM_FREE(crypt_out);
+	MEM_FREE(md4hash);
+	MEM_FREE(key);
 }
 
 static int valid(char *ciphertext, struct fmt_main *self)
 {
-	return mscash2_valid(ciphertext, 128, self);
-}
-
-char *mscash2_prepare(char *split_fields[10], struct fmt_main *self)
-{
-	char *cp;
-	int i;
-
-	if (!strncmp(split_fields[1], "$DCC2$", 6) &&
-	    strchr(split_fields[1], '#') == strrchr(split_fields[1], '#')) {
-		if (valid(split_fields[1], self))
-			return split_fields[1];
-		// see if this is a form $DCC2$salt#hash.  If so, make it $DCC2$10240#salt#hash and retest (insert 10240# into the line).
-		cp = mem_alloc(strlen(split_fields[1]) + 7);
-		sprintf(cp, "$DCC2$10240#%s", &(split_fields[1][6]));
-		if (valid(cp, self)) {
-			char *cipher = str_alloc_copy(cp);
-			MEM_FREE(cp);
-			return cipher;
-		}
-		return split_fields[1];
-	}
-	if (!split_fields[0])
-		return split_fields[1];
-	// ONLY check, if this string split_fields[1], is ONLY a 32 byte hex string.
-	for (i = 0; i < 32; i++)
-		if (atoi16[ARCH_INDEX(split_fields[1][i])] == 0x7F)
-			return split_fields[1];
-	cp = mem_alloc(strlen(split_fields[0]) + strlen(split_fields[1]) + 14);
-	sprintf (cp, "$DCC2$10240#%s#%s", split_fields[0], split_fields[1]);
-	if (valid(cp, self))
-	{
-		char *cipher = str_alloc_copy(cp);
-		MEM_FREE(cp);
-		return cipher;
-	}
-	MEM_FREE(cp);
-	return split_fields[1];
+	return mscash2_common_valid(ciphertext, MAX_SALT_LEN, self);
 }
 
 static void set_salt(void *salt) {
@@ -312,71 +180,63 @@ static void set_salt(void *salt) {
 	salt_buffer = (unsigned char*)p;
 }
 
-static void *get_salt(char *_ciphertext)
+static void *get_salt(char *ciphertext)
 {
-	unsigned char *ciphertext = (unsigned char *)_ciphertext;
 	static UTF16 out[130+1];
-	unsigned char input[128*3+1];
-	int iterations, utf16len, md4_size;
+	unsigned char input[MAX_SALT_LEN*3+1];
+	int i, iterations, utf16len;
+	char *lasth = strrchr(ciphertext, '#');
 
 	memset(out, 0, sizeof(out));
 
-	ciphertext += 6;
+	sscanf(&ciphertext[6], "%d", &iterations);
+	ciphertext = strchr(ciphertext, '#') + 1;
 
-	while (*ciphertext && *ciphertext != '#') ++ciphertext;
-	++ciphertext;
-	for (md4_size=0;md4_size<sizeof(input)-1;md4_size++) {
-		if (ciphertext[md4_size] == '#')
-			break;
-		input[md4_size] = ciphertext[md4_size];
-	}
-	input[md4_size] = 0;
+	for (i = 0; &ciphertext[i] < lasth; i++)
+		input[i] = (unsigned char)ciphertext[i];
+	input[i] = 0;
 
-	utf16len = enc_to_utf16(&out[2], 128, input, md4_size);
+	utf16len = enc_to_utf16(&out[2], MAX_SALT_LEN, input, i);
 	if (utf16len < 0)
 		utf16len = strlen16(&out[2]);
 	out[0] = utf16len << 1;
-	sscanf(&_ciphertext[6], "%d", &iterations);
 	out[1] = iterations;
 	return out;
 }
 
-
 static void *get_binary(char *ciphertext)
 {
 	static unsigned int out[BINARY_SIZE / sizeof(unsigned int)];
-	unsigned int i = 0;
+	unsigned int i;
 	unsigned int temp;
 
-	for (; ciphertext[0] != '#'; ciphertext++);
-	ciphertext++;
-	for (; ciphertext[0] != '#'; ciphertext++);
-	ciphertext++;
+	/* We need to allow salt containing '#' so we search backwards */
+	ciphertext = strrchr(ciphertext, '#') + 1;
 
-	for (; i < 4 ;i++)
+	for (i = 0; i < 4 ;i++)
 	{
 #if ARCH_LITTLE_ENDIAN
-		temp  = (atoi16[ARCH_INDEX(ciphertext[i * 8 + 0])]) << 4;
-		temp |= (atoi16[ARCH_INDEX(ciphertext[i * 8 + 1])]);
-		temp |= (atoi16[ARCH_INDEX(ciphertext[i * 8 + 2])]) << 12;
-		temp |= (atoi16[ARCH_INDEX(ciphertext[i * 8 + 3])]) << 8;
-		temp |= (atoi16[ARCH_INDEX(ciphertext[i * 8 + 4])]) << 20;
-		temp |= (atoi16[ARCH_INDEX(ciphertext[i * 8 + 5])]) << 16;
-		temp |= (atoi16[ARCH_INDEX(ciphertext[i * 8 + 6])]) << 28;
-		temp |= (atoi16[ARCH_INDEX(ciphertext[i * 8 + 7])]) << 24;
+		temp  = ((unsigned int)(atoi16[ARCH_INDEX(ciphertext[i * 8 + 0])])) << 4;
+		temp |= ((unsigned int)(atoi16[ARCH_INDEX(ciphertext[i * 8 + 1])]));
+		temp |= ((unsigned int)(atoi16[ARCH_INDEX(ciphertext[i * 8 + 2])])) << 12;
+		temp |= ((unsigned int)(atoi16[ARCH_INDEX(ciphertext[i * 8 + 3])])) << 8;
+		temp |= ((unsigned int)(atoi16[ARCH_INDEX(ciphertext[i * 8 + 4])])) << 20;
+		temp |= ((unsigned int)(atoi16[ARCH_INDEX(ciphertext[i * 8 + 5])])) << 16;
+		temp |= ((unsigned int)(atoi16[ARCH_INDEX(ciphertext[i * 8 + 6])])) << 28;
+		temp |= ((unsigned int)(atoi16[ARCH_INDEX(ciphertext[i * 8 + 7])])) << 24;
 #else
-		temp  = (atoi16[ARCH_INDEX(ciphertext[i * 8 + 6])]) << 4;
-		temp |= (atoi16[ARCH_INDEX(ciphertext[i * 8 + 7])]);
-		temp |= (atoi16[ARCH_INDEX(ciphertext[i * 8 + 4])]) << 12;
-		temp |= (atoi16[ARCH_INDEX(ciphertext[i * 8 + 5])]) << 8;
-		temp |= (atoi16[ARCH_INDEX(ciphertext[i * 8 + 2])]) << 20;
-		temp |= (atoi16[ARCH_INDEX(ciphertext[i * 8 + 3])]) << 16;
-		temp |= (atoi16[ARCH_INDEX(ciphertext[i * 8 + 0])]) << 28;
-		temp |= (atoi16[ARCH_INDEX(ciphertext[i * 8 + 1])]) << 24;
+		temp  = ((unsigned int)(atoi16[ARCH_INDEX(ciphertext[i * 8 + 6])])) << 4;
+		temp |= ((unsigned int)(atoi16[ARCH_INDEX(ciphertext[i * 8 + 7])]));
+		temp |= ((unsigned int)(atoi16[ARCH_INDEX(ciphertext[i * 8 + 4])])) << 12;
+		temp |= ((unsigned int)(atoi16[ARCH_INDEX(ciphertext[i * 8 + 5])])) << 8;
+		temp |= ((unsigned int)(atoi16[ARCH_INDEX(ciphertext[i * 8 + 2])])) << 20;
+		temp |= ((unsigned int)(atoi16[ARCH_INDEX(ciphertext[i * 8 + 3])])) << 16;
+		temp |= ((unsigned int)(atoi16[ARCH_INDEX(ciphertext[i * 8 + 0])])) << 28;
+		temp |= ((unsigned int)(atoi16[ARCH_INDEX(ciphertext[i * 8 + 1])])) << 24;
 #endif
 		out[i] = temp;
 	}
-#ifdef MMX_COEF
+#if defined(SIMD_COEF_32) && ARCH_LITTLE_ENDIAN==1
 	alter_endianity(out, BINARY_SIZE);
 #endif
 	return out;
@@ -385,76 +245,76 @@ static void *get_binary(char *ciphertext)
 
 static int binary_hash_0(void *binary)
 {
-	return ((unsigned int*)binary)[3] & 0x0F;
+	return ((unsigned int*)binary)[3] & PH_MASK_0;
 }
 
 
 static int binary_hash_1(void *binary)
 {
-	return ((unsigned int*)binary)[3] & 0xFF;
+	return ((unsigned int*)binary)[3] & PH_MASK_1;
 }
 
 
 static int binary_hash_2(void *binary)
 {
-	return ((unsigned int*)binary)[3] & 0x0FFF;
+	return ((unsigned int*)binary)[3] & PH_MASK_2;
 }
 
 
 static int binary_hash_3(void *binary)
 {
-	return ((unsigned int*)binary)[3] & 0x0FFFF;
+	return ((unsigned int*)binary)[3] & PH_MASK_3;
 }
 
 
 static int binary_hash_4(void *binary)
 {
-	return ((unsigned int*)binary)[3] & 0x0FFFFF;
+	return ((unsigned int*)binary)[3] & PH_MASK_4;
 }
 
 static int binary_hash_5(void *binary)
 {
-	return ((unsigned int*)binary)[3] & 0x0FFFFFF;
+	return ((unsigned int*)binary)[3] & PH_MASK_5;
 }
 
 static int binary_hash_6(void *binary)
 {
-	return ((unsigned int*)binary)[3] & 0x07FFFFFF;
+	return ((unsigned int*)binary)[3] & PH_MASK_6;
 }
 
 static int get_hash_0(int index)
 {
-	return crypt_out[4 * index + 3] & 0x0F;
+	return crypt_out[4 * index + 3] & PH_MASK_0;
 }
 
 static int get_hash_1(int index)
 {
-	return crypt_out[4 * index + 3] & 0xFF;
+	return crypt_out[4 * index + 3] & PH_MASK_1;
 }
 
 static int get_hash_2(int index)
 {
-	return crypt_out[4 * index + 3] & 0x0FFF;
+	return crypt_out[4 * index + 3] & PH_MASK_2;
 }
 
 static int get_hash_3(int index)
 {
-	return crypt_out[4 * index + 3] & 0x0FFFF;
+	return crypt_out[4 * index + 3] & PH_MASK_3;
 }
 
 static int get_hash_4(int index)
 {
-	return crypt_out[4 * index + 3] & 0x0FFFFF;
+	return crypt_out[4 * index + 3] & PH_MASK_4;
 }
 
 static int get_hash_5(int index)
 {
-	return crypt_out[4 * index + 3] & 0x0FFFFFF;
+	return crypt_out[4 * index + 3] & PH_MASK_5;
 }
 
 static int get_hash_6(int index)
 {
-	return crypt_out[4 * index + 3] & 0x07FFFFFF;
+	return crypt_out[4 * index + 3] & PH_MASK_6;
 }
 
 static int cmp_all(void *binary, int count)
@@ -522,7 +382,7 @@ static int salt_hash(void *salt)
 }
 
 
-#ifdef MMX_COEF
+#ifdef SIMD_COEF_32
 // NOTE, in the end, this block will move above the pbkdf2() function, and the #else and #endif wrapping that function will be
 // uncommented. Thus, if built for SSE2 (mmx, or intrisic), we get this function. Otherwise we get the pbkdf2() function which
 // uses OpenSSL.  However to get the 'layout' right, The code here will walk through the array buffer, calling the pbkdf2
@@ -550,9 +410,9 @@ static void pbkdf2_sse2(int t)
 	i2 = (unsigned int*)t_sse_crypt2;
 	o1 = (unsigned int*)t_sse_hash1;
 
-	for(k = 0; k < MS_NUM_KEYS; ++k)
+	for (k = 0; k < MS_NUM_KEYS; ++k)
 	{
-		for(i = 0;i < 4;i++) {
+		for (i = 0;i < 4;i++) {
 			ipad[i] = t_crypt[k*4+i]^0x36363636;
 			opad[i] = t_crypt[k*4+i]^0x5C5C5C5C;
 		}
@@ -563,19 +423,19 @@ static void pbkdf2_sse2(int t)
 		SHA1_Update(&ctx1,ipad,SHA_CBLOCK);
 		SHA1_Update(&ctx2,opad,SHA_CBLOCK);
 
-		// we memcopy from flat into MMX_COEF output buffer's (our 'temp' ctx buffer).
+		// we memcopy from flat into SIMD_COEF_32 output buffer's (our 'temp' ctx buffer).
 		// This data will NOT need to be BE swapped (it already IS BE swapped).
-		i1[(k/MMX_COEF)*MMX_COEF*5+(k&(MMX_COEF-1))]               = ctx1.h0;
-		i1[(k/MMX_COEF)*MMX_COEF*5+(k&(MMX_COEF-1))+MMX_COEF]      = ctx1.h1;
-		i1[(k/MMX_COEF)*MMX_COEF*5+(k&(MMX_COEF-1))+(MMX_COEF<<1)] = ctx1.h2;
-		i1[(k/MMX_COEF)*MMX_COEF*5+(k&(MMX_COEF-1))+MMX_COEF*3]    = ctx1.h3;
-		i1[(k/MMX_COEF)*MMX_COEF*5+(k&(MMX_COEF-1))+(MMX_COEF<<2)] = ctx1.h4;
+		i1[(k/SIMD_COEF_32)*SIMD_COEF_32*5+(k&(SIMD_COEF_32-1))]               = ctx1.h0;
+		i1[(k/SIMD_COEF_32)*SIMD_COEF_32*5+(k&(SIMD_COEF_32-1))+SIMD_COEF_32]      = ctx1.h1;
+		i1[(k/SIMD_COEF_32)*SIMD_COEF_32*5+(k&(SIMD_COEF_32-1))+(SIMD_COEF_32<<1)] = ctx1.h2;
+		i1[(k/SIMD_COEF_32)*SIMD_COEF_32*5+(k&(SIMD_COEF_32-1))+SIMD_COEF_32*3]    = ctx1.h3;
+		i1[(k/SIMD_COEF_32)*SIMD_COEF_32*5+(k&(SIMD_COEF_32-1))+(SIMD_COEF_32<<2)] = ctx1.h4;
 
-		i2[(k/MMX_COEF)*MMX_COEF*5+(k&(MMX_COEF-1))]               = ctx2.h0;
-		i2[(k/MMX_COEF)*MMX_COEF*5+(k&(MMX_COEF-1))+MMX_COEF]      = ctx2.h1;
-		i2[(k/MMX_COEF)*MMX_COEF*5+(k&(MMX_COEF-1))+(MMX_COEF<<1)] = ctx2.h2;
-		i2[(k/MMX_COEF)*MMX_COEF*5+(k&(MMX_COEF-1))+MMX_COEF*3]    = ctx2.h3;
-		i2[(k/MMX_COEF)*MMX_COEF*5+(k&(MMX_COEF-1))+(MMX_COEF<<2)] = ctx2.h4;
+		i2[(k/SIMD_COEF_32)*SIMD_COEF_32*5+(k&(SIMD_COEF_32-1))]               = ctx2.h0;
+		i2[(k/SIMD_COEF_32)*SIMD_COEF_32*5+(k&(SIMD_COEF_32-1))+SIMD_COEF_32]      = ctx2.h1;
+		i2[(k/SIMD_COEF_32)*SIMD_COEF_32*5+(k&(SIMD_COEF_32-1))+(SIMD_COEF_32<<1)] = ctx2.h2;
+		i2[(k/SIMD_COEF_32)*SIMD_COEF_32*5+(k&(SIMD_COEF_32-1))+SIMD_COEF_32*3]    = ctx2.h3;
+		i2[(k/SIMD_COEF_32)*SIMD_COEF_32*5+(k&(SIMD_COEF_32-1))+(SIMD_COEF_32<<2)] = ctx2.h4;
 
 		SHA1_Update(&ctx1,salt_buffer,salt_len);
 		SHA1_Update(&ctx1,"\x0\x0\x0\x1",4);
@@ -584,36 +444,26 @@ static void pbkdf2_sse2(int t)
 		SHA1_Update(&ctx2,(unsigned char*)tmp_hash,SHA_DIGEST_LENGTH);
 		SHA1_Final((unsigned char*)tmp_hash,&ctx2);
 
-		// now convert this from flat into MMX_COEF buffers.
+		// now convert this from flat into SIMD_COEF_32 buffers.
 		// Also, perform the 'first' ^= into the crypt buffer.  NOTE, we are doing that in BE format
 		// so we will need to 'undo' that in the end.
-		o1[(k/MMX_COEF)*MMX_COEF*SHA_BUF_SIZ+(k&(MMX_COEF-1))]                = t_crypt[k*4+0] = ctx2.h0;
-		o1[(k/MMX_COEF)*MMX_COEF*SHA_BUF_SIZ+(k&(MMX_COEF-1))+MMX_COEF]       = t_crypt[k*4+1] = ctx2.h1;
-		o1[(k/MMX_COEF)*MMX_COEF*SHA_BUF_SIZ+(k&(MMX_COEF-1))+(MMX_COEF<<1)]  = t_crypt[k*4+2] = ctx2.h2;
-		o1[(k/MMX_COEF)*MMX_COEF*SHA_BUF_SIZ+(k&(MMX_COEF-1))+MMX_COEF*3]     = t_crypt[k*4+3] = ctx2.h3;
-		o1[(k/MMX_COEF)*MMX_COEF*SHA_BUF_SIZ+(k&(MMX_COEF-1))+(MMX_COEF<<2)]                   = ctx2.h4;
+		o1[(k/SIMD_COEF_32)*SIMD_COEF_32*SHA_BUF_SIZ+(k&(SIMD_COEF_32-1))]                = t_crypt[k*4+0] = ctx2.h0;
+		o1[(k/SIMD_COEF_32)*SIMD_COEF_32*SHA_BUF_SIZ+(k&(SIMD_COEF_32-1))+SIMD_COEF_32]       = t_crypt[k*4+1] = ctx2.h1;
+		o1[(k/SIMD_COEF_32)*SIMD_COEF_32*SHA_BUF_SIZ+(k&(SIMD_COEF_32-1))+(SIMD_COEF_32<<1)]  = t_crypt[k*4+2] = ctx2.h2;
+		o1[(k/SIMD_COEF_32)*SIMD_COEF_32*SHA_BUF_SIZ+(k&(SIMD_COEF_32-1))+SIMD_COEF_32*3]     = t_crypt[k*4+3] = ctx2.h3;
+		o1[(k/SIMD_COEF_32)*SIMD_COEF_32*SHA_BUF_SIZ+(k&(SIMD_COEF_32-1))+(SIMD_COEF_32<<2)]                   = ctx2.h4;
 	}
 
-	for(i = 1; i < iteration_cnt; i++)
+	for (i = 1; i < iteration_cnt; i++)
 	{
-#if SHA1_SSE_PARA
-		SSESHA1body((unsigned int*)t_sse_hash1, (unsigned int*)t_sse_hash1, (unsigned int*)t_sse_crypt1, SSEi_MIXED_IN|SSEi_RELOAD|SSEi_OUTPUT_AS_INP_FMT);
-		SSESHA1body((unsigned int*)t_sse_hash1, (unsigned int*)t_sse_hash1, (unsigned int*)t_sse_crypt2, SSEi_MIXED_IN|SSEi_RELOAD|SSEi_OUTPUT_AS_INP_FMT);
+		SIMDSHA1body((unsigned int*)t_sse_hash1, (unsigned int*)t_sse_hash1, (unsigned int*)t_sse_crypt1, SSEi_MIXED_IN|SSEi_RELOAD|SSEi_OUTPUT_AS_INP_FMT);
+		SIMDSHA1body((unsigned int*)t_sse_hash1, (unsigned int*)t_sse_hash1, (unsigned int*)t_sse_crypt2, SSEi_MIXED_IN|SSEi_RELOAD|SSEi_OUTPUT_AS_INP_FMT);
 		// only xor first 16 bytes, since that is ALL this format uses
 		for (k = 0; k < MS_NUM_KEYS; k++) {
-			unsigned *p = &((unsigned int*)t_sse_hash1)[(((k>>2)*SHA_BUF_SIZ)<<2) + (k&(MMX_COEF-1))];
-			for(j = 0; j < 4; j++)
-				t_crypt[(k<<2)+j] ^= p[(j<<(MMX_COEF>>1))];
+			unsigned *p = &((unsigned int*)t_sse_hash1)[k/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32 + (k&(SIMD_COEF_32-1))];
+			for (j = 0; j < 4; j++)
+				t_crypt[k*4+j] ^= p[(j*SIMD_COEF_32)];
 		}
-#else
-		shammx_reloadinit_nosizeupdate_nofinalbyteswap(t_sse_hash1, t_sse_hash1, t_sse_crypt1);
-		shammx_reloadinit_nosizeupdate_nofinalbyteswap(t_sse_hash1, t_sse_hash1, t_sse_crypt2);
-		// only xor first 16 bytes, since that is ALL this format uses
-		for (k = 0; k < MMX_COEF; k++) {
-			for(j = 0; j < 4; j++)
-				t_crypt[(k<<2)+j] ^= ((unsigned int*)t_sse_hash1)[(j<<(MMX_COEF>>1))+k];
-		}
-#endif
 	}
 }
 
@@ -631,7 +481,7 @@ static void pbkdf2(unsigned int _key[]) // key is also 'final' digest.
 	unsigned i, j;
 	unsigned char *key = (unsigned char*)_key;
 
-	for(i = 0; i < 16; i++) {
+	for (i = 0; i < 16; i++) {
 		ipad[i] = key[i]^0x36;
 		opad[i] = key[i]^0x5C;
 	}
@@ -660,7 +510,7 @@ static void pbkdf2(unsigned int _key[]) // key is also 'final' digest.
 	// only copy first 16 bytes, since that is ALL this format uses
 	memcpy(_key, tmp_hash, 16);
 
-	for(i = 1; i < iteration_cnt; i++)
+	for (i = 1; i < iteration_cnt; i++)
 	{
 		// we only need to copy the accumulator data from the CTX, since
 		// the original encryption was a full block of 64 bytes.
@@ -673,7 +523,7 @@ static void pbkdf2(unsigned int _key[]) // key is also 'final' digest.
 		SHA1_Final((unsigned char*)tmp_hash, &ctx2);
 
 		// only xor first 16 bytes, since that is ALL this format uses
-		for(j = 0; j < 4; j++)
+		for (j = 0; j < 4; j++)
 			_key[j] ^= tmp_hash[j];
 	}
 }
@@ -683,14 +533,14 @@ static void pbkdf2(unsigned int _key[]) // key is also 'final' digest.
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	int count = *pcount;
-	int i, t;
+	int i, t, t1;
 	// Note, for a format like DCC2, there is little reason to optimize anything other
 	// than the pbkdf2 inner loop.  The one exception to that, is the NTLM can be done
 	// and known when to be done, only when the
 
 	// now get NTLM of the password (MD4 of unicode)
 	if (new_key) {
-#if MS_NUM_KEYS > 1 && defined(_OPENMP)
+#if defined(_OPENMP)
 #pragma omp parallel for default(none) private(i) shared(count, key, md4hash)
 #endif
 		for (i = 0; i < count; ++i) {
@@ -711,10 +561,16 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	}
 
 #ifdef _OPENMP
-#pragma omp parallel for default(none) private(t, i) shared(omp_t, salt_buffer, salt_len, crypt_out, md4hash)
+#if defined(WITH_UBSAN)
+#pragma omp parallel for
+#else
+#pragma omp parallel for default(none) private(t) shared(count, salt_buffer, salt_len, crypt_out, md4hash)
 #endif
-	for (t = 0; t < omp_t; t++)	{
+#endif
+	for (t1 = 0; t1 < count; t1 += MS_NUM_KEYS)	{
 		MD4_CTX ctx;
+		int i;
+		t = t1 / MS_NUM_KEYS;
 		for (i = 0; i < MS_NUM_KEYS; ++i) {
 			// Get DCC1.  That is MD4( NTLM . unicode(lc username) )
 			MD4_Init(&ctx);
@@ -723,12 +579,12 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			MD4_Final((unsigned char*)&crypt_out[(t * MS_NUM_KEYS + i) * 4], &ctx);
 			// now we have DCC1 (mscash) which is MD4 (MD4(unicode(pass)) . unicode(lc username))
 
-#ifndef MMX_COEF
+#ifndef SIMD_COEF_32
 			// Non-SSE: Compute DCC2 one at a time
 			pbkdf2(&crypt_out[(t * MS_NUM_KEYS + i) * 4]);
 #endif
 		}
-#ifdef MMX_COEF
+#ifdef SIMD_COEF_32
 		// SSE: Compute DCC2 in parallel, once per thread
 		pbkdf2_sse2(t);
 #endif
@@ -743,6 +599,7 @@ struct fmt_main fmt_mscash2 = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
 		BINARY_ALIGN,
@@ -750,23 +607,20 @@ struct fmt_main fmt_mscash2 = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_OMP | FMT_UNICODE | FMT_UTF8,
-#if FMT_MAIN_VERSION > 11
+		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_OMP | FMT_UNICODE | FMT_ENC,
 		{ NULL },
-#endif
-		tests
+		{ FORMAT_TAG2 },
+		mscash2_common_tests
 	}, {
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
-		mscash2_prepare,
+		mscash2_common_prepare,
 		valid,
-		mscash2_split,
+		mscash2_common_split,
 		get_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			binary_hash_0,
@@ -778,6 +632,7 @@ struct fmt_main fmt_mscash2 = {
 			binary_hash_6
 		},
 		salt_hash,
+		NULL,
 		set_salt,
 		set_key,
 		get_key,
@@ -797,3 +652,5 @@ struct fmt_main fmt_mscash2 = {
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

@@ -20,7 +20,7 @@
  */
 
 #include "arch.h"
-#include <openssl/aes.h>
+#include "aes.h"
 
 #include "unrar.h"
 #include "unrarfilter.h"
@@ -34,7 +34,7 @@ void rar_filter_array_init(rar_filter_array_t *filter_a)
 
 void rar_filter_array_reset(rar_filter_array_t *filter_a)
 {
-	int i;
+	size_t i;
 
 	if (!filter_a) {
 		return;

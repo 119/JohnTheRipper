@@ -34,34 +34,73 @@
 #include "autoconfig.h"
 #else
 /* on a legacy build, we do not KNOW if pcap is installed.  We just run, and make will fail if it is not there */
+#define HAVE_SYS_SOCKET_H 1
+#define HAVE_ARPA_INET_H 1
+#define HAVE_SYS_TYPES_H 0
+#define HAVE_NET_IF_ARP_H 0
+#define HAVE_NET_IF_H 1
 #define HAVE_NETINET_IF_ETHER_H 1
+#define HAVE_NETINET_IN_H 1
 #define HAVE_NET_ETHERNET_H 1
+#define HAVE_NETINET_IN_SYSTM_H 0
+#define HAVE_NETINET_IP_H 1
 #define HAVE_PCAP_H 1
+#define HAVE_PCAP_PCAP_H 0
 #endif
 
-#define _BSD_SOURCE
-#define _GNU_SOURCE
+#define _BSD_SOURCE 1
+#define _DEFAULT_SOURCE 1
+#define _GNU_SOURCE 1
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if (!AC_BUILT || HAVE_UNISTD_H) && !_MSC_VER
 #include <unistd.h>
+#endif
+#if HAVE_SYS_SOCKET_H
+#include <sys/socket.h>
+#endif
+#if HAVE_ARPA_INET_H
 #include <arpa/inet.h>
+#endif
+#if HAVE_SYS_TYPES_H
+#include <sys/types.h>
+#endif
+#if HAVE_NET_IF_ARP_H
+#include <net/if_arp.h>
+#endif
+#if HAVE_NET_IF_H
 #include <net/if.h>
+#endif
+#if HAVE_NETINET_IF_ETHER_H
 #include <netinet/if_ether.h>
+#endif
+#if HAVE_NETINET_IN_H
 #include <netinet/in.h>
+#endif
 #if HAVE_NET_ETHERNET_H
 #include <net/ethernet.h>
 #elif HAVE_SYS_ETHERNET_H
 #include <sys/ethernet.h>
 #else
-#include <sys/types.h>
+#include "cygwin_ethernet.h"
 #endif
 
 #define __FAVOR_BSD
+#if HAVE_NETINET_IN_SYSTM_H
+#include <netinet/in_systm.h>
+#endif
+#if HAVE_NETINET_IP_H
 #include <netinet/ip.h>
+#endif
 #include "tcphdr.h"
+#if HAVE_PCAP_H
 #include <pcap.h>
+#elif HAVE_PCAP_PCAP_H
+#include <pcap/pcap.h>
+#endif
+
 #define u_char unsigned char
 
 #include "memdbg.h"
@@ -83,7 +122,7 @@ int Packet_Reader_init(struct Packet_Reader* self, const char* filename)
 }
 
 void Packet_Reader_get_error(struct Packet_Reader* self, char* out, size_t len) {
-	snprintf(out, len, "Could not read pcap file %s\n", self->pcap_errbuf);
+	snprintf(out, len, "Could not read pcap file, %s\n", self->pcap_errbuf);
 }
 
 void Packet_Reader_close(struct Packet_Reader* self)
@@ -115,7 +154,7 @@ _Bool Packet_Reader_kick(struct Packet_Reader* self)
 		size_t payload_len;
 		char buf[512];
 
-		if (header.len < sizeof(struct ether_header))
+		if (header.caplen < sizeof(struct ether_header))
 			continue;
 
 		eptr = (void*) packet;
@@ -123,7 +162,7 @@ _Bool Packet_Reader_kick(struct Packet_Reader* self)
 		if (ntohs(eptr->ether_type) != ETHERTYPE_IP)
 			continue;
 
-		if (header.len < sizeof(struct ether_header) + sizeof(struct ip))
+		if (header.caplen < sizeof(struct ether_header) + sizeof(struct ip))
 			continue;
 
 		ip_header = (void*)(packet + sizeof(struct ether_header));
@@ -132,7 +171,7 @@ _Bool Packet_Reader_kick(struct Packet_Reader* self)
 		if (size_ip < 20)
 			continue;	// bogus IP header
 
-		if (header.len < sizeof(struct ether_header) + size_ip + sizeof(struct tcp_hdr))
+		if (header.caplen < sizeof(struct ether_header) + size_ip + sizeof(struct tcp_hdr))
 			continue;
 
 		tcp = (void*) (packet + sizeof(struct ether_header) + size_ip);
@@ -145,9 +184,19 @@ _Bool Packet_Reader_kick(struct Packet_Reader* self)
 		payload_buf =
 		    packet + sizeof(struct ether_header) + size_ip + size_tcp;
 		payload_len =
-		    header.len - (sizeof(struct ether_header) + size_ip + size_tcp);
+		    header.caplen - (sizeof(struct ether_header) + size_ip + size_tcp);
+
+		// sanity check payload_len
+		if (payload_len > 655350) {
+			fprintf(stderr, "%s:%d: ignoring weird payload_len\n", __FUNCTION__, __LINE__);
+			return false;
+		}
 
 		self->payload_str = malloc(payload_len);
+		if (self->payload_str == NULL) {
+			fprintf(stderr, "%s:%d: malloc failed\n", __FUNCTION__, __LINE__);
+			exit(EXIT_FAILURE);
+		}
 		self->payload_len = payload_len;
 		memcpy(self->payload_str, payload_buf, payload_len);
 
@@ -157,7 +206,7 @@ _Bool Packet_Reader_kick(struct Packet_Reader* self)
 		snprintf(buf, sizeof buf, "%s-%d", inet_ntoa(ip_header->ip_dst), ntohs(tcp->th_dport));
 		self->dest_addr_str = strdup(buf);
 
-		return true;	// sucessfully got a TCP packet of some kind (yay)
+		return true;	// successfully got a TCP packet of some kind (yay)
 	}
 
 	return false;		// all out of bits
@@ -166,7 +215,7 @@ _Bool Packet_Reader_kick(struct Packet_Reader* self)
 char* obtain(char** src) {
 	char *new;
 
-	if(!*src) return 0;
+	if (!*src) return 0;
 	new = *src;
 	*src = 0;
 	return new;
@@ -174,16 +223,18 @@ char* obtain(char** src) {
 
 int contains(const char* haystack, size_t len, const char* needle) {
 	size_t l = strlen(needle), i = 0;
+
 	while(i + l <= len) {
-		if(!memcmp(haystack + i, needle, l)) return 1;
+		if (!memcmp(haystack + i, needle, l)) return 1;
 		i++;
 	}
 	return 0;
 }
+
 _Bool VNC_Auth_Reader_find_next(struct Packet_Reader* reader, char** id_out, char** challenge_out, char** response_out)
 {
 	while (Packet_Reader_kick(reader)) {
-		if(!reader->payload_len) continue;
+		if (!reader->payload_len) continue;
 		// This could be a lot smarter. It would be nice in particular
 		// to handle malformed streams and concurrent handshakes.
 		if (contains(reader->payload_str, reader->payload_len, "RFB")) {
@@ -236,7 +287,8 @@ void makehex(char* in16, char* out33) {
 	unsigned char* in = (void*)in16;
 	size_t i = 0, j = 0;
 	static const char *htab = "0123456789ABCDEF";
-	for(;i<16;i++,j+=2) {
+
+	for (;i<16;i++,j+=2) {
 		out33[j] = htab[in[i] >> 4];
 		out33[j+1] = htab[in[i] & 0xf];
 	}
@@ -246,6 +298,7 @@ void makehex(char* in16, char* out33) {
 void attempt_crack(struct Packet_Reader* reader)
 {
 	char *id, *challenge, *response;
+
 	while (VNC_Auth_Reader_find_next(reader, &id, &challenge, &response)) {
 		char hc[33],hr[33];
 		makehex(challenge, hc);
@@ -255,7 +308,43 @@ void attempt_crack(struct Packet_Reader* reader)
 	}
 }
 
+#ifdef HAVE_LIBFUZZER
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	int fd;
+	char name[] = "/tmp/libFuzzer-XXXXXX";
+	struct Packet_Reader reader;
+
+	fd = mkstemp(name);  // this approach is somehow faster than the fmemopen way
+	if (fd < 0) {
+		fprintf(stderr, "Problem detected while creating the input file, %s, aborting!\n", strerror(errno));
+		exit(-1);
+	}
+	write(fd, data, size);
+	close(fd);
+
+	memset(&reader, 0, sizeof(reader));
+	if (Packet_Reader_init(&reader, name))
+		attempt_crack(&reader);
+	else {
+		char buf[512];
+		Packet_Reader_get_error(&reader, buf, sizeof buf);
+		fprintf(stderr, "%s", buf);
+		Packet_Reader_close(&reader);
+	}
+	Packet_Reader_close(&reader);
+
+	remove(name);
+
+	return 0;
+}
+#endif
+
+#ifdef HAVE_LIBFUZZER
+int main_dummy(int argc, char **argv)
+#else
 int main(int argc, char *argv[])
+#endif
 {
 	int i = 1;
 
@@ -263,9 +352,9 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Usage: %s <pcapfiles>\n", argv[0]);
 		return 1;
 	}
-	for(; i < argc; i++) {
+	for (; i < argc; i++) {
 		struct Packet_Reader reader;
-		if(Packet_Reader_init(&reader, argv[i]))
+		if (Packet_Reader_init(&reader, argv[i]))
 			attempt_crack(&reader);
 		else {
 			char buf[512];

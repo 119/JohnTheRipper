@@ -19,11 +19,11 @@
 /* include a stripped down os.h, AFTER it includes autoconf.h */
 #include "os-autoconf.h"
 #else
-/* for non autoconf build (i.e. make -f Makefile.orig) we use the original os.h code. */
+/* for non autoconf build (i.e. make -f Makefile.legacy) we use the original os.h code. */
 
 #ifdef NEED_OS_TIMER
 
-#if defined(__CYGWIN32__) || defined(__BEOS__) || defined(__MINGW32__) || defined(_MSC_VER) /* || (defined(AMDAPPSDK) && defined(HAVE_OPENCL)) */
+#if defined(__CYGWIN__) || defined(__BEOS__) || defined(__MINGW32__) || defined(_MSC_VER)
 #define OS_TIMER			0
 #else
 #ifndef _XOPEN_SOURCE
@@ -48,6 +48,7 @@
 #if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
 #define _DARWIN_C_SOURCE /* for LOCK_EX */
 #endif
+#if PREFER_FLOCK
 #include <sys/file.h>
 #ifdef LOCK_EX
 #define OS_FLOCK			1
@@ -55,13 +56,17 @@
 #define OS_FLOCK			0
 #warning LOCK_EX is not available - will skip locking
 #endif
+#else
+#define OS_FLOCK			0
+#define FCNTL_LOCKS			1
+#endif
 #endif
 
 #endif
 
 #ifdef NEED_OS_FORK
 
-#if defined(__DJGPP__) || defined(__CYGWIN32__) || defined(_MSC_VER) || defined(__MINGW32__)
+#if defined(__DJGPP__) || defined(__CYGWIN__) || defined(_MSC_VER) || defined(__MINGW32__)
 #define OS_FORK				0
 #else
 #define OS_FORK				1

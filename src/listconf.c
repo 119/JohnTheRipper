@@ -11,34 +11,67 @@
 #include "autoconfig.h"
 #endif
 
+#define _GNU_SOURCE 1 /* Try to elicit RTLD_DEFAULT */
 
-#ifndef _MSC_VER
-#include <strings.h>
+#if HAVE_OPENCL
+#define _BSD_SOURCE 1
+#define _DEFAULT_SOURCE 1
 #endif
-#include <string.h>
+#define NEED_OS_FLOCK
+#include "os.h"
+
+#if !AC_BUILT
+ #include <string.h>
+ #ifndef _MSC_VER
+  #include <strings.h>
+ #endif
+#else
+ #if STRING_WITH_STRINGS
+  #include <string.h>
+  #include <strings.h>
+ #elif HAVE_STRING_H
+  #include <string.h>
+ #elif HAVE_STRINGS_H
+  #include <strings.h>
+ #endif
+#endif
+
+#include <openssl/opensslv.h>
 #include <openssl/crypto.h>
 
+#if HAVE_LIBDL
+#include <dlfcn.h>
+#elif HAVE_WINDOWS_H
+#define JTR_DLSYM_ONLY 1
+#include "Win32-dlfcn-port.h"
+#define HAVE_LIBDL 1
+#endif
+
 #include "arch.h"
+#include "simd-intrinsics.h"
+#include "jumbo.h"
 #include "params.h"
 #include "path.h"
 #include "formats.h"
 #include "options.h"
 #include "unicode.h"
 #include "dynamic.h"
+#include "dynamic_types.h"
 #include "config.h"
 
-#ifdef HAVE_NSS
-#include "nss.h"
-//#include "nssutil.h"
-#include "nspr.h"
-#endif
-#ifdef HAVE_LIBGMP
+#if HAVE_LIBGMP
 #if HAVE_GMP_GMP_H
-#include "gmp/gmp.h"
+#include <gmp/gmp.h>
 #else
-#include "gmp.h"
+#include <gmp.h>
 #endif
 #endif
+
+#if __GLIBC__
+#include <gnu/libc-version.h>
+#endif
+
+#include "regex.h"
 
 #ifdef NO_JOHN_BLD
 #define JOHN_BLD "unk-build-type"
@@ -46,27 +79,14 @@
 #include "john_build_rule.h"
 #endif
 
-#ifdef HAVE_CUDA
-extern char *get_cuda_header_version();
-extern void cuda_device_list();
-#endif
-#ifdef HAVE_OPENCL
-#include "common-opencl.h"
-#endif
+#include "opencl_common.h"
+#include "mask_ext.h"
+#include "version.h"
+#include "listconf.h" /* must be included after version.h */
 #include "memdbg.h"
 
-#ifdef HAVE_MPI
-#ifdef _OPENMP
-#define _MP_VERSION " MPI + OMP"
-#else
-#define _MP_VERSION " MPI"
-#endif
-#else
-#ifdef _OPENMP
-#define _MP_VERSION " OMP"
-#else
-#define _MP_VERSION ""
-#endif
+#if CPU_DETECT
+extern char CPU_req_name[];
 #endif
 
 /*
@@ -76,17 +96,14 @@ extern void cuda_device_list();
  */
 static void listconf_list_options()
 {
-	puts("help[:WHAT], subformats, inc-modes, rules, externals, ext-filters,");
-	puts("ext-filters-only, ext-modes, build-info, hidden-options, encodings,");
+	puts("help[:WHAT], subformats, inc-modes, rules, externals, ext-modes, ext-hybrids,");
+	puts("ext-filters, ext-filters-only, build-info, hidden-options, encodings,");
 	puts("formats, format-details, format-all-details, format-methods[:WHICH],");
-	// With "opencl-devices, cuda-devices, <conf section name>" added,
+	// With "opencl-devices, <conf section name>" added,
 	// the resulting line will get too long
 	puts("format-tests, sections, parameters:SECTION, list-data:SECTION,");
-#ifdef HAVE_OPENCL
+#if HAVE_OPENCL
 	printf("opencl-devices, ");
-#endif
-#ifdef HAVE_CUDA
-	printf("cuda-devices, ");
 #endif
 	/* NOTE: The following must end the list. Anything listed after
 	   <conf section name> will be ignored by current
@@ -105,72 +122,139 @@ static void listconf_list_help_options()
 
 static void listconf_list_method_names()
 {
-#if FMT_MAIN_VERSION > 11
 	puts("init, done, reset, prepare, valid, split, binary, salt, tunable_cost_value,");
-#else
-	puts("init, done, reset, prepare, valid, split, binary, salt,");
-#endif
-	puts("source, binary_hash, salt_hash, set_salt, set_key, get_key, clear_keys,");
-	puts("crypt_all, get_hash, cmp_all, cmp_one, cmp_exact");
+	puts("source, binary_hash, salt_hash, salt_compare, set_salt, set_key, get_key,");
+	puts("clear_keys, crypt_all, get_hash, cmp_all, cmp_one, cmp_exact");
 }
 
 static void listconf_list_build_info(void)
 {
+	char DebuggingOptions[512], *cpdbg=DebuggingOptions;
 #ifdef __GNU_MP_VERSION
 	int gmp_major, gmp_minor, gmp_patchlevel;
 #endif
-	puts("Version: " JOHN_VERSION);
-	puts("Build: " JOHN_BLD _MP_VERSION);
-	printf("Arch: %d-bit %s\n", ARCH_BITS,
-	       ARCH_LITTLE_ENDIAN ? "LE" : "BE");
+	puts("Version: " JTR_GIT_VERSION);
+	puts("Build: " JOHN_BLD _MP_VERSION DEBUG_STRING MEMDBG_STRING ASAN_STRING UBSAN_STRING);
+#ifdef SIMD_COEF_32
+	printf("SIMD: %s, interleaving: MD4:%d MD5:%d SHA1:%d SHA256:%d SHA512:%d\n",
+	       SIMD_TYPE,
+	       SIMD_PARA_MD4, SIMD_PARA_MD5, SIMD_PARA_SHA1,
+	       SIMD_PARA_SHA256, SIMD_PARA_SHA512);
+#endif
 #if JOHN_SYSTEMWIDE
 	puts("System-wide exec: " JOHN_SYSTEMWIDE_EXEC);
 	puts("System-wide home: " JOHN_SYSTEMWIDE_HOME);
 	puts("Private home: " JOHN_PRIVATE_HOME);
 #endif
+#if CPU_REQ
+	printf("CPU tests: %s\n", CPU_req_name);
+#endif
+#if CPU_FALLBACK
+	puts("CPU fallback binary: " CPU_FALLBACK_BINARY);
+#endif
+#if OMP_FALLBACK
+	puts("OMP fallback binary: " OMP_FALLBACK_BINARY);
+#endif
 	printf("$JOHN is %s\n", path_expand("$JOHN/"));
 	printf("Format interface version: %d\n", FMT_MAIN_VERSION);
-#if FMT_MAIN_VERSION > 11
 	printf("Max. number of reported tunable costs: %d\n", FMT_TUNABLE_COSTS);
-#endif
 	puts("Rec file version: " RECOVERY_V);
 	puts("Charset file version: " CHARSET_V);
 	printf("CHARSET_MIN: %d (0x%02x)\n", CHARSET_MIN, CHARSET_MIN);
 	printf("CHARSET_MAX: %d (0x%02x)\n", CHARSET_MAX, CHARSET_MAX);
 	printf("CHARSET_LENGTH: %d\n", CHARSET_LENGTH);
+	printf("SALT_HASH_SIZE: %u\n", SALT_HASH_SIZE);
 	printf("Max. Markov mode level: %d\n", MAX_MKV_LVL);
 	printf("Max. Markov mode password length: %d\n", MAX_MKV_LEN);
-#ifdef __VERSION__
-	printf("Compiler version: %s\n", __VERSION__);
-#endif
-#ifdef __GNUC__
+
+#if __ICC
+	printf("icc version: %d.%d.%d (gcc %d.%d.%d compatibility)\n",
+	       __ICC / 100, (__ICC % 100) / 10, __ICC % 10,
+	       __GNUC__, __GNUC_MINOR__, __GNUC_PATCHLEVEL__);
+#elif defined(__clang_version__)
+	printf("clang version: %s (gcc %d.%d.%d compatibility)\n",
+	       __clang_version__,
+	       __GNUC__, __GNUC_MINOR__, __GNUC_PATCHLEVEL__);
+#elif __GNUC__
 	printf("gcc version: %d.%d.%d\n", __GNUC__,
 	       __GNUC_MINOR__, __GNUC_PATCHLEVEL__);
+#elif _MSC_VER
+/*
+ * See https://msdn.microsoft.com/en-us/library/b0084kay.aspx
+ * Currently, _MSC_BUILD is not reported, but we could convert
+ * _MSC_FULL_VER 150020706 and _MSC_BUILD 1 into a string
+ * "15.00.20706.01".
+ */
+#ifdef _MSC_FULL_VER
+	printf("Microsoft compiler version: %d\n", _MSC_FULL_VER);
+#else
+	printf("Microsoft compiler version: %d\n", _MSC_VER);
 #endif
-#ifdef __ICC
-	printf("icc version: %d\n", __ICC);
+#ifdef __CLR_VER
+	puts("Common Language Runtime version: " __CLR_VER);
 #endif
-#ifdef __clang_version__
-	printf("clang version: %s\n", __clang_version__);
+#elif defined(__VERSION__)
+	printf("Compiler version: %s\n", __VERSION__);
 #endif
-#ifdef HAVE_CUDA
-	printf("CUDA library version: %s\n",get_cuda_header_version());
+
+#ifdef __GLIBC_MINOR__
+#ifdef __GLIBC__
+	printf("GNU libc version: %d.%d (loaded: %s)\n",
+	       __GLIBC__, __GLIBC_MINOR__, gnu_get_libc_version());
 #endif
-#ifdef HAVE_OPENCL
-	printf("OpenCL library version: %s\n",get_opencl_header_version());
 #endif
+
+#if HAVE_OPENCL
+	printf("OpenCL headers version: %s\n",get_opencl_header_version());
+#endif
+#if HAVE_LIBSSL
+	printf("Crypto library: OpenSSL\n");
+#endif
+#if HAVE_COMMONCRYPTO
+	printf("Crypto library: CommonCrypto\n");
+#endif
+
+#if HAVE_LIBDL && defined(RTLD_DEFAULT)
+
+#if defined SSLEAY_VERSION && !defined OPENSSL_VERSION
+#define OPENSSL_VERSION SSLEAY_VERSION
+#elif defined OPENSSL_VERSION && !defined SSLEAY_VERSION
+#define SSLEAY_VERSION OPENSSL_VERSION
+#endif
+
 #ifdef OPENSSL_VERSION_NUMBER
 	printf("OpenSSL library version: %09lx", (unsigned long)OPENSSL_VERSION_NUMBER);
-	if (OPENSSL_VERSION_NUMBER != SSLeay())
-		printf("\t(loaded: %09lx)", (unsigned long)SSLeay());
+	if (dlsym(RTLD_DEFAULT, "OpenSSL_version_num")) {
+		unsigned long (*OpenSSL_version_num)(void) =
+			dlsym(RTLD_DEFAULT, "OpenSSL_version_num");
+
+		if (OPENSSL_VERSION_NUMBER != OpenSSL_version_num())
+			printf("\t(loaded: %09lx)", OpenSSL_version_num());
+	} else if (dlsym(RTLD_DEFAULT, "SSLeay")) {
+		unsigned long (*SSLeay)(void) = dlsym(RTLD_DEFAULT, "SSLeay");
+
+		if (OPENSSL_VERSION_NUMBER != SSLeay())
+			printf("\t(loaded: %09lx)", SSLeay());
+	}
 	printf("\n");
 #endif
 #ifdef OPENSSL_VERSION_TEXT
 	printf("%s", OPENSSL_VERSION_TEXT);
-	if (strcmp(OPENSSL_VERSION_TEXT, SSLeay_version(SSLEAY_VERSION)))
-		printf("\t(loaded: %s)", SSLeay_version(SSLEAY_VERSION));
+	if (dlsym(RTLD_DEFAULT, "OpenSSL_version")) {
+		const char* (*OpenSSL_version)(int) =
+			dlsym(RTLD_DEFAULT, "OpenSSL_version");
+
+		if (strcmp(OPENSSL_VERSION_TEXT, OpenSSL_version(OPENSSL_VERSION)))
+			printf("\t(loaded: %s)", OpenSSL_version(OPENSSL_VERSION));
+	} else if (dlsym(RTLD_DEFAULT, "SSLeay_version")) {
+		const char* (*SSLeay_version)(int) = dlsym(RTLD_DEFAULT, "SSLeay_version");
+		if (strcmp(OPENSSL_VERSION_TEXT, SSLeay_version(SSLEAY_VERSION)))
+			printf("\t(loaded: %s)", SSLeay_version(SSLEAY_VERSION));
+	}
 	printf("\n");
 #endif
+#endif /* HAVE_LIBDL && defined(RTLD_DEFAULT) */
+
 #ifdef __GNU_MP_VERSION
 	printf("GMP library version: %d.%d.%d",
 	       __GNU_MP_VERSION, __GNU_MP_VERSION_MINOR, __GNU_MP_VERSION_PATCHLEVEL);
@@ -183,19 +267,55 @@ static void listconf_list_build_info(void)
 		       gmp_major, gmp_minor, gmp_patchlevel);
 	printf("\n");
 #endif
-#ifdef NSS_VERSION
-	// <major>.<minor>[.<patch_level>[.<build_number>]][ <ECC>][ <Beta>]
-	printf("NSS library version: %s\n", NSS_VERSION);
+
+#if HAVE_REXGEN
+	// JS_REGEX_BUILD_VERSION not reported here.
+	// It was defined as 122 in an earlier version, but is
+	// currently defined as DEV (yes, without quotes!)
+	printf("Regex library version: %d.%d\t(loaded: %s)\n",
+	       JS_REGEX_MAJOR_VERSION, JS_REGEX_MINOR_VERSION,
+	       rexgen_version());
 #endif
-// NSS_VERSION and NSSUTIL_VERSION always seem to match.
-// At least, I didn't find any differences on Fedora 16/17/18 systems.
-#ifdef PR_VERSION
-	printf("NSPR library version: %s\n", PR_VERSION);
+
+#if FCNTL_LOCKS
+	puts("File locking: fcntl()");
+#elif OS_FLOCK
+	puts("File locking: flock()");
+#else
+	puts("File locking: NOT supported by this build - do not run concurrent sessions!");
 #endif
-#ifdef HAVE_KRB5
-	// I have no idea how to get version info
-	printf("Kerberos version 5 support enabled\n");
+	printf("fseek(): " STR_MACRO(jtr_fseek64) "\n");
+	printf("ftell(): " STR_MACRO(jtr_ftell64) "\n");
+	printf("fopen(): " STR_MACRO(jtr_fopen) "\n");
+#if HAVE_MEMMEM
+#define memmem_func	"System's"
+#else
+#define memmem_func	"JtR internal"
 #endif
+	printf("memmem(): " memmem_func "\n");
+
+// OK, now append debugging options, BUT only output  something if
+// one or more of them is set. IF none set, be silent.
+#if defined (MEMDBG_ON)
+	cpdbg += sprintf(cpdbg, "\tmemdbg=");
+	#ifdef MEMDBG_EXTRA_CHECKS
+		cpdbg += sprintf(cpdbg, "extra_memory_checks\n");
+	#else
+		cpdbg += sprintf(cpdbg, "on\n");
+	#endif
+#endif
+#if defined (DEBUG)
+	cpdbg += sprintf(cpdbg, "\t'#define DEBUG' set\n");
+#endif
+#ifdef WITH_ASAN
+	cpdbg += sprintf(cpdbg, "\tASan (Address Sanitizer debugging)\n");
+#endif
+#ifdef WITH_UBSAN
+	cpdbg += sprintf(cpdbg, "\tUbSan (Undefined Behavior Sanitizer debugging)\n");
+#endif
+	if (DebuggingOptions != cpdbg) {
+		printf("Built with these debugging options\n%s\n", DebuggingOptions);
+	}
 }
 
 void listconf_parse_early(void)
@@ -209,19 +329,19 @@ void listconf_parse_early(void)
 	if ((!strcasecmp(options.listconf, "help") ||
 	                         !strcmp(options.listconf, "?"))) {
 		listconf_list_options();
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 
 	if ((!strcasecmp(options.listconf, "help:help") ||
 	                         !strcasecmp(options.listconf, "help:"))) {
 		listconf_list_help_options();
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 
 	if (!strcasecmp(options.listconf, "help:format-methods"))
 	{
 		listconf_list_method_names();
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 	if (!strncasecmp(options.listconf, "help:", 5))
 	{
@@ -232,43 +352,28 @@ void listconf_parse_early(void)
 			        "%s is not a --list option that supports additional values.\nSupported options:\n",
 			        options.listconf+5);
 			listconf_list_help_options();
-			exit(1);
+			exit(EXIT_FAILURE);
 		}
 	}
 	if (!strcasecmp(options.listconf, "hidden-options"))
 	{
 		opt_print_hidden_usage();
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 
 	if (!strcasecmp(options.listconf, "build-info"))
 	{
 		listconf_list_build_info();
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 
 	if (!strcasecmp(options.listconf, "encodings"))
 	{
-		listEncodings();
-		exit(0);
+		listEncodings(stdout);
+		exit(EXIT_SUCCESS);
 	}
-#ifdef HAVE_OPENCL
-	if (!strcasecmp(options.listconf, "opencl-devices"))
-	{
-		opencl_list_devices();
-		exit(0);
-	}
-#endif
-#ifdef HAVE_CUDA
-	if (!strcasecmp(options.listconf, "cuda-devices"))
-	{
-		cuda_device_list();
-		exit(0);
-	}
-#endif
 }
 
-#if FMT_MAIN_VERSION > 11
 /*
  * List names of tunable cost parameters
  * Separator differs for --list=format-all-details (", ")
@@ -279,75 +384,131 @@ void list_tunable_cost_names(struct fmt_main *format, char *separator)
 	int i;
 
 	for (i = 0; i < FMT_TUNABLE_COSTS; ++i) {
-		if(format->params.tunable_cost_name[i]) {
+		if (format->params.tunable_cost_name[i]) {
 			if (i)
 				printf("%s", separator);
 			printf("%s", format->params.tunable_cost_name[i]);
 		}
 	}
 }
+
+char *get_test(struct fmt_main *format, int ntests)
+{
+	int i, new_len = 0;
+
+	// See if any of the fields are filled in. If so, the we should return
+	// the ciphertext in passwd type format (user:pw:x:x:x...).
+	// Otherwise simply return param.ciphertext.
+	for (i = 0; i < 9; ++i) {
+		if (i == 1) {
+			if (!format->params.tests[ntests].fields[i])
+				format->params.tests[ntests].fields[i] = format->params.tests[ntests].ciphertext;
+		} else
+			if (format->params.tests[ntests].fields[i] && (format->params.tests[ntests].fields[i])[0] )
+				new_len += strlen(format->params.tests[ntests].fields[i]);
+	}
+	if (new_len) {
+		char *Buf, *cp;
+		int len = strlen(format->params.tests[ntests].fields[1])+12+new_len;
+		Buf = mem_alloc_tiny(len, 1);
+		cp = Buf;
+		for (i = 0; i < 9; ++i) {
+			if (format->params.tests[ntests].fields[i] && (format->params.tests[ntests].fields[i])[0] ) {
+				int x = strnzcpyn(cp, format->params.tests[ntests].fields[i], len);
+				cp += x;
+				len -= (x+1);
+			}
+			*cp++ = ':';
+		}
+		while (*--cp == ':')
+			*cp = 0; // nul terminate string and drop trailing ':'
+		return Buf;
+	} else
+		return format->params.tests[ntests].ciphertext;
+}
+
+#ifdef DYNAMIC_DISABLED
+#define dynamic_real_salt_length(format) 0
 #endif
 
 void listconf_parse_late(void)
 {
+#ifndef DYNAMIC_DISABLED
 	if ((options.subformat && !strcasecmp(options.subformat, "list")) ||
 	    (options.listconf && !strcasecmp(options.listconf, "subformats")))
 	{
 		dynamic_DISPLAY_ALL_FORMATS();
-		/* NOTE if we have other 'generics', like sha1, sha2, rc4, ...
-		 * then EACH of them should have a DISPLAY_ALL_FORMATS()
-		 * function and we can call them here. */
-		exit(0);
+/* NOTE if we have other 'generics', like sha1, sha2, rc4... then EACH of them
+   should have a DISPLAY_ALL_FORMATS() function and we can call them here. */
+		exit(EXIT_SUCCESS);
 	}
-
+#endif
+#if HAVE_OPENCL
+	if (!strcasecmp(options.listconf, "opencl-devices"))
+	{
+		opencl_list_devices();
+		exit(EXIT_SUCCESS);
+	}
+	/* For other --list options that happen in listconf_parse_late()
+	   we want to mute some GPU output */
+	if (options.listconf) {
+		options.flags |= FLG_VERBOSITY;
+		options.verbosity = 1;
+	}
+#endif
 	if (!strcasecmp(options.listconf, "inc-modes"))
 	{
 		cfg_print_subsections("Incremental", NULL, NULL, 0);
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 	if (!strcasecmp(options.listconf, "rules"))
 	{
 		cfg_print_subsections("List.Rules", NULL, NULL, 0);
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 	if (!strcasecmp(options.listconf, "externals"))
 	{
 		cfg_print_subsections("List.External", NULL, NULL, 0);
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 	if (!strcasecmp(options.listconf, "sections"))
 	{
 		cfg_print_section_names(0);
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 	if (!strncasecmp(options.listconf, "parameters", 10) &&
 	    (options.listconf[10] == '=' || options.listconf[10] == ':') &&
 	    options.listconf[11] != '\0')
 	{
 		cfg_print_section_params(&options.listconf[11], NULL);
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 	if (!strncasecmp(options.listconf, "list-data", 9) &&
 	    (options.listconf[9] == '=' || options.listconf[9] == ':') &&
 	    options.listconf[10] != '\0')
 	{
 		cfg_print_section_list_lines(&options.listconf[10], NULL);
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 	if (!strcasecmp(options.listconf, "ext-filters"))
 	{
 		cfg_print_subsections("List.External", "filter", NULL, 0);
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 	if (!strcasecmp(options.listconf, "ext-filters-only"))
 	{
 		cfg_print_subsections("List.External", "filter", "generate", 0);
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 	if (!strcasecmp(options.listconf, "ext-modes"))
 	{
 		cfg_print_subsections("List.External", "generate", NULL, 0);
-		exit(0);
+		exit(EXIT_SUCCESS);
+	}
+	if (!strcasecmp(options.listconf, "ext-hybrids"))
+	{
+		cfg_print_subsections("List.External", "new", NULL, 0);
+		exit(EXIT_SUCCESS);
 	}
 
 	if (!strcasecmp(options.listconf, "formats")) {
@@ -377,13 +538,33 @@ void listconf_parse_late(void)
 			}
 			printf("%s%s", label, format->next ? ", " : "\n");
 		} while ((format = format->next));
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 	if (!strcasecmp(options.listconf, "format-details")) {
 		struct fmt_main *format;
+
+#if HAVE_OPENCL
+/* This will make the majority of OpenCL formats also do "quick" run.
+   But if LWS or GWS was already set, we do not overwrite. */
+		setenv("LWS", "1", 0);
+		setenv("GWS", "1", 0);
+#endif
+
+#if 0
+		puts("label\tmaxlen\tmin/\tmaxkpc\tflags\tntests\talgorithm_name\tformat_name\tbench comment\tbench len\tbin size\tsalt size"
+		     "\tcosts"
+		     "\tminlen");
+#endif
+
 		format = fmt_list;
 		do {
 			int ntests = 0;
+			char buf[LINE_BUFFER_SIZE + 1];
+
+/* Some formats change max plaintext length when
+   encoding is used, or KPC when under OMP */
+			if (!strstr(format->params.label, "-ztex"))
+				fmt_init(format);
 
 			if (format->params.tests) {
 				while (format->params.tests[ntests++].ciphertext);
@@ -404,58 +585,131 @@ void listconf_parse_late(void)
 			       format->params.benchmark_length,
 			       format->params.binary_size,
 			       ((format->params.flags & FMT_DYNAMIC) && format->params.salt_size) ?
-			       // salts are handled internally within the format. We want to know the 'real' salt size
-			       // dynamic will alway set params.salt_size to 0 or sizeof a pointer.
+/* salts are handled internally within the format. We want to know the
+   'real' salt size. Dynamic will always set params.salt_size to 0 or sizeof
+   a pointer. */
 			       dynamic_real_salt_length(format) : format->params.salt_size);
-#if FMT_MAIN_VERSION > 11
 			printf("\t");
 			list_tunable_cost_names(format, ",");
-#endif
-			/*
-			 * Since the example ciphertext should be the last line in the
-			 * --list=format-all-details output, it should also be the last column
-			 * here.
-			 * Even if this means tools processing --list=format-details output
-			 * have to check the number of columns if they want to use the example
-			 * ciphertext.
-			 */
-			printf("\t%.256s\n",
-			       /*
-			        * ciphertext example will be silently truncated
-			        * to 256 characters here
-			        */
+			printf("\t%d\t%s\n",
+			       format->params.plaintext_min_length,
+/*
+ * Since the example ciphertext should be the last line in the
+ * --list=format-all-details output, it should also be the last column
+ * here.
+ * Even if this means tools processing --list=format-details output
+ * have to check the number of columns if they want to use the example
+ * ciphertext.
+ *
+ * ciphertext example will be silently $SOURCE_HASH$'ed if needed.
+ */
 			       ntests ?
-			       format->params.tests[0].ciphertext : "");
+			       ldr_pot_source(get_test(format, 0), buf) : "");
+
+			fmt_done(format);
+
 		} while ((format = format->next));
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 	if (!strcasecmp(options.listconf, "format-all-details")) {
 		struct fmt_main *format;
+
+#if HAVE_OPENCL
+/* This will make the majority of OpenCL formats also do "quick" run.
+   But if LWS or GWS was already set, we do not overwrite. */
+		setenv("LWS", "1", 0);
+		setenv("GWS", "1", 0);
+#endif
 		format = fmt_list;
 		do {
 			int ntests = 0;
+			int enc_len, utf8_len;
+
+/* Some formats change max plaintext length when encoding is used,
+   or KPC when under OMP */
+			if (!strstr(format->params.label, "-ztex"))
+				fmt_init(format);
+
+			utf8_len = enc_len = format->params.plaintext_length;
+			if (options.target_enc == UTF_8)
+				utf8_len /= 3;
 
 			if (format->params.tests) {
 				while (format->params.tests[ntests++].ciphertext);
 				ntests--;
 			}
-			/*
-			 * attributes should be printed in the same sequence
-			 * as with format-details, but human-readable
-			 */
+/*
+ * According to doc/OPTIONS, attributes should be printed in
+ * the same sequence as with format-details, but human-readable.
+ */
 			printf("Format label                         %s\n", format->params.label);
-			printf("Max. password length in bytes        %d\n", format->params.plaintext_length);
+/*
+ * Indented (similar to the flags), because this information is not printed
+ * for --list=format-details
+ */
+			printf(" Disabled in configuration file      %s\n",
+			       cfg_get_bool(SECTION_DISABLED,
+			                    SUBSECTION_FORMATS,
+			                    format->params.label, 0)
+			       ? "yes" : "no");
+			printf("Min. password length                 %d\n", format->params.plaintext_min_length);
+			if (!(format->params.flags & FMT_8_BIT) ||
+			    options.target_enc != UTF_8 ||
+			    !strncasecmp(format->params.label, "LM", 2) ||
+			    !strcasecmp(format->params.label, "netlm") ||
+			    !strcasecmp(format->params.label, "nethalflm") ||
+			    !strcasecmp(format->params.label, "sapb")) {
+				/* Not using UTF-8 so length is not ambiguous */
+				printf("Max. password length                 %d\n", enc_len);
+			} else if (!fmt_raw_len || fmt_raw_len == enc_len) {
+				/* Example: Office and thin dynamics */
+				printf("Max. password length                 %d [worst case UTF-8] to %d [ASCII]\n", utf8_len, enc_len);
+			} else if (enc_len == 3 * fmt_raw_len) {
+				/* Example: NT */
+				printf("Max. password length                 %d\n", utf8_len);
+			} else {
+				/* Example: SybaseASE */
+				printf("Max. password length                 %d [worst case UTF-8] to %d [ASCII]\n", utf8_len, fmt_raw_len);
+			}
 			printf("Min. keys per crypt                  %d\n", format->params.min_keys_per_crypt);
 			printf("Max. keys per crypt                  %d\n", format->params.max_keys_per_crypt);
 			printf("Flags\n");
 			printf(" Case sensitive                      %s\n", (format->params.flags & FMT_CASE) ? "yes" : "no");
+			printf(" Truncates at max. length            %s\n", (format->params.flags & FMT_TRUNC) ? "yes" : "no");
 			printf(" Supports 8-bit characters           %s\n", (format->params.flags & FMT_8_BIT) ? "yes" : "no");
-			printf(" Converts 8859-1 to UTF-16/UCS-2     %s\n", (format->params.flags & FMT_UNICODE) ? "yes" : "no");
-			printf(" Honours --encoding=NAME             %s\n", (format->params.flags & FMT_UTF8) ? "yes" : "no");
-			printf(" False positives possible            %s\n", (format->params.flags & FMT_NOT_EXACT) ? "yes" : "no");
+			printf(" Converts internally to UTF-16/UCS-2 %s\n", (format->params.flags & FMT_UNICODE) ? "yes" : "no");
+			printf(" Honours --encoding=NAME             %s\n",
+			       (format->params.flags & FMT_ENC) ? "yes" :
+			       (format->params.flags & FMT_UNICODE) ? "no" : "n/a");
+			printf(" Collisions possible (as in likely)  %s\n",
+			       (format->params.flags & FMT_NOT_EXACT) ? "yes" : "no");
 			printf(" Uses a bitslice implementation      %s\n", (format->params.flags & FMT_BS) ? "yes" : "no");
 			printf(" The split() method unifies case     %s\n", (format->params.flags & FMT_SPLIT_UNIFIES_CASE) ? "yes" : "no");
-			printf(" A $dynamic$ format                  %s\n", (format->params.flags & FMT_DYNAMIC) ? "yes" : "no");
+			printf(" Supports very long hashes           %s\n", (format->params.flags & FMT_HUGE_INPUT) ? "yes" : "no");
+			if (format->params.flags & FMT_MASK)
+				printf(" Internal mask generation            yes (device target: %dx)\n", mask_int_cand_target);
+			else
+				printf(" Internal mask generation            no\n");
+
+#ifndef DYNAMIC_DISABLED
+			if (format->params.flags & FMT_DYNAMIC) {
+#if SIMD_COEF_32
+				private_subformat_data *p = (private_subformat_data *)format->private.data;
+				if (p->pSetup->flags & MGF_FLAT_BUFFERS)
+					printf(" A $dynamic$ format                  yes (Flat buffer SIMD)\n");
+				else {
+					if (p->pSetup->flags & MGF_NOTSSE2Safe)
+					printf(" A $dynamic$ format                  yes (No SIMD)\n");
+					else
+					printf(" A $dynamic$ format                  yes (Interleaved SIMD)\n");
+				}
+#else
+				printf(" A $dynamic$ format                  yes\n");
+#endif
+			} else
+				printf(" A $dynamic$ format                  no\n");
+#endif
+			printf(" A dynamic sized salt                %s\n", (format->params.flags & FMT_DYNA_SALT) ? "yes" : "no");
 #ifdef _OPENMP
 			printf(" Parallelized with OpenMP            %s\n", (format->params.flags & FMT_OMP) ? "yes" : "no");
 			if (format->params.flags & FMT_OMP)
@@ -469,36 +723,45 @@ void listconf_parse_late(void)
 			printf("Binary size                          %d\n", format->params.binary_size);
 			printf("Salt size                            %d\n",
 			       ((format->params.flags & FMT_DYNAMIC) && format->params.salt_size) ?
-			       // salts are handled internally within the format. We want to know the 'real' salt size/
-			       // dynamic will alway set params.salt_size to 0 or sizeof a pointer.
+/* salts are handled internally within the format. We want to know the
+   'real' salt size dynamic will always set params.salt_size to 0 or
+   sizeof a pointer. */
 			       dynamic_real_salt_length(format) : format->params.salt_size);
-#if FMT_MAIN_VERSION > 11
 			printf("Tunable cost parameters              ");
 			list_tunable_cost_names(format, ", ");
 			printf("\n");
-#endif
 
-			/*
-			 * The below should probably stay as last line of
-			 * output if adding more information.
-			 *
-			 * ciphertext example will be truncated to 512
-			 * characters here, with a notice.
-			 */
-			if (ntests)
-			printf("Example ciphertext%s  %.512s\n",
-			       strlen(format->params.tests[0].ciphertext) > 512
-			       ? " (truncated here)" : "                 ",
-			       format->params.tests[0].ciphertext);
+/*
+ * The below should probably stay as last line of output if adding more
+ * information.
+ *
+ * ciphertext example will be $SOURCE_HASH$'ed if needed, with a notice.
+ */
+			if (ntests) {
+				char *ciphertext = get_test(format, 0);
+				char buf[LINE_BUFFER_SIZE + 1];
+
+				printf("Example ciphertext%s  %s\n",
+				       strlen(ciphertext) > MAX_CIPHERTEXT_SIZE ?
+				       " (truncated here)" :
+				       "                 ", ldr_pot_source(ciphertext, buf));
+			}
 			printf("\n");
+
+			fmt_done(format);
+
 		} while ((format = format->next));
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 	if (!strncasecmp(options.listconf, "format-methods", 14)) {
 		struct fmt_main *format;
 		format = fmt_list;
 		do {
 			int ShowIt = 1, i;
+
+			if (!strstr(format->params.label, "-ztex"))
+				fmt_init(format);
+
 			if (options.listconf[14] == '=' || options.listconf[14] == ':') {
 				ShowIt = 0;
 				if (!strcasecmp(&options.listconf[15], "valid")     ||
@@ -517,14 +780,12 @@ void listconf_parse_late(void)
 				         strcasecmp(&options.listconf[15], "binary") &&
 				         strcasecmp(&options.listconf[15], "clear_keys") &&
 				         strcasecmp(&options.listconf[15], "salt") &&
-#if FMT_MAIN_VERSION > 11
 				         strcasecmp(&options.listconf[15], "tunable_cost_value") &&
 				         strcasecmp(&options.listconf[15], "tunable_cost_value[0]") &&
 #if FMT_TUNABLE_COSTS > 1
 				         strcasecmp(&options.listconf[15], "tunable_cost_value[1]") &&
 #if FMT_TUNABLE_COSTS > 2
 				         strcasecmp(&options.listconf[15], "tunable_cost_value[2]") &&
-#endif
 #endif
 #endif
 					 strcasecmp(&options.listconf[15], "source") &&
@@ -545,12 +806,13 @@ void listconf_parse_late(void)
 				         strcasecmp(&options.listconf[15], "binary_hash[4]") &&
 				         strcasecmp(&options.listconf[15], "binary_hash[5]") &&
 					 strcasecmp(&options.listconf[15], "binary_hash[6]") &&
-				         strcasecmp(&options.listconf[15], "salt_hash"))
+				         strcasecmp(&options.listconf[15], "salt_hash") &&
+				         strcasecmp(&options.listconf[15], "salt_compare"))
 				{
 					fprintf(stderr, "Error, invalid option (invalid method name) %s\n", options.listconf);
 					fprintf(stderr, "Valid method names are:\n");
 					listconf_list_method_names();
-					exit(1);
+					exit(EXIT_FAILURE);
 				}
 				if (format->methods.init != fmt_default_init && !strcasecmp(&options.listconf[15], "init"))
 					ShowIt = 1;
@@ -569,23 +831,21 @@ void listconf_parse_late(void)
 				if (format->methods.salt != fmt_default_salt && !strcasecmp(&options.listconf[15], "salt"))
 					ShowIt = 1;
 
-#if FMT_MAIN_VERSION > 11
 				for (i = 0; i < FMT_TUNABLE_COSTS; ++i) {
-					char Buf[30];
+					char Buf[32];
 					sprintf(Buf, "tunable_cost_value[%d]", i);
 					if (format->methods.tunable_cost_value[i] && !strcasecmp(&options.listconf[15], Buf))
 						ShowIt = 1;
 				}
 				if (format->methods.tunable_cost_value[0] && !strcasecmp(&options.listconf[15], "tunable_cost_value"))
 					ShowIt = 1;
-#endif
 
 				if (format->methods.source != fmt_default_source && !strcasecmp(&options.listconf[15], "source"))
 					ShowIt = 1;
 				if (format->methods.clear_keys != fmt_default_clear_keys && !strcasecmp(&options.listconf[15], "clear_keys"))
 					ShowIt = 1;
 				for (i = 0; i < PASSWORD_HASH_SIZES; ++i) {
-					char Buf[20];
+					char Buf[25];
 					sprintf(Buf, "get_hash[%d]", i);
 					if (format->methods.get_hash[i] && format->methods.get_hash[i] != fmt_default_get_hash && !strcasecmp(&options.listconf[15], Buf))
 						ShowIt = 1;
@@ -594,7 +854,7 @@ void listconf_parse_late(void)
 					ShowIt = 1;
 
 				for (i = 0; i < PASSWORD_HASH_SIZES; ++i) {
-					char Buf[20];
+					char Buf[25];
 					sprintf(Buf, "binary_hash[%d]", i);
 					if (format->methods.binary_hash[i] && format->methods.binary_hash[i] != fmt_default_binary_hash && !strcasecmp(&options.listconf[15], Buf))
 						ShowIt = 1;
@@ -602,6 +862,8 @@ void listconf_parse_late(void)
 				if (format->methods.binary_hash[0] && format->methods.binary_hash[0] != fmt_default_binary_hash && !strcasecmp(&options.listconf[15], "binary_hash"))
 					ShowIt = 1;
 				if (format->methods.salt_hash != fmt_default_salt_hash && !strcasecmp(&options.listconf[15], "salt_hash"))
+					ShowIt = 1;
+				if (format->methods.salt_compare != NULL && !strcasecmp(&options.listconf[15], "salt_compare"))
 					ShowIt = 1;
 				if (format->methods.set_salt != fmt_default_set_salt && !strcasecmp(&options.listconf[15], "set_salt"))
 					ShowIt = 1;
@@ -611,6 +873,10 @@ void listconf_parse_late(void)
 				printf("Methods overridden for:   %s [%s] %s\n", format->params.label, format->params.algorithm_name, format->params.format_name);
 				if (format->methods.init != fmt_default_init)
 					printf("\tinit()\n");
+				if (format->methods.done != fmt_default_done)
+					printf("\tdone()\n");
+				if (format->methods.reset != fmt_default_reset)
+					printf("\treset()\n");
 				if (format->methods.prepare != fmt_default_prepare)
 					printf("\tprepare()\n");
 				printf("\tvalid()\n");
@@ -620,114 +886,115 @@ void listconf_parse_late(void)
 					printf("\tbinary()\n");
 				if (format->methods.salt != fmt_default_salt)
 					printf("\tsalt()\n");
-#if FMT_MAIN_VERSION > 11
 				for (i = 0; i < FMT_TUNABLE_COSTS; ++i)
-					/*
-					 * Here, a NULL value serves as default,
-					 * so any existing function should be printed
-					 */
+/*
+ * Here, a NULL value serves as default,
+ * so any existing function should be printed
+ */
 					if (format->methods.tunable_cost_value[i])
 						printf("\t\ttunable_cost_value[%d]()\n", i);
-#endif
+				if (format->methods.source != fmt_default_source)
+					printf("\tsource()\n");
 				for (i = 0; i < PASSWORD_HASH_SIZES; ++i)
 					if (format->methods.binary_hash[i] != fmt_default_binary_hash) {
 						if (format->methods.binary_hash[i])
 							printf("\t\tbinary_hash[%d]()\n", i);
-						else
-							printf("\t\tbinary_hash[%d]()  (NULL pointer)\n", i);
 					}
 				if (format->methods.salt_hash != fmt_default_salt_hash)
 					printf("\tsalt_hash()\n");
+/* salt_compare is always NULL for default */
+				if (format->methods.salt_compare != NULL)
+					printf("\tsalt_compare()\n");
 				if (format->methods.set_salt != fmt_default_set_salt)
 					printf("\tset_salt()\n");
-				// there is no default for set_key() it must be defined.
+// there is no default for set_key() it must be defined.
 				printf("\tset_key()\n");
-				// there is no default for get_key() it must be defined.
+// there is no default for get_key() it must be defined.
 				printf("\tget_key()\n");
 				if (format->methods.clear_keys != fmt_default_clear_keys)
 					printf("\tclear_keys()\n");
+// there is no default for crypt_all() it must be defined.
+				printf("\tcrypt_all()\n");
 				for (i = 0; i < PASSWORD_HASH_SIZES; ++i)
 					if (format->methods.get_hash[i] != fmt_default_get_hash) {
 						if (format->methods.get_hash[i])
 							printf("\t\tget_hash[%d]()\n", i);
-						else
-							printf("\t\tget_hash[%d]()  (NULL pointer)\n", i);
 					}
-				// there is no default for crypt_all() it must be defined.
-				printf("\tcrypt_all()\n");
-				// there is no default for cmp_all() it must be defined.
+// there is no default for cmp_all() it must be defined.
 				printf("\tcmp_all()\n");
-				// there is no default for cmp_one() it must be defined.
+// there is no default for cmp_one() it must be defined.
 				printf("\tcmp_one()\n");
-				// there is no default for cmp_exact() it must be defined.
+// there is no default for cmp_exact() it must be defined.
 				printf("\tcmp_exact()\n");
 				printf("\n\n");
 			}
+			fmt_done(format);
 		} while ((format = format->next));
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 	if (!strncasecmp(options.listconf, "format-tests", 12)) {
 		struct fmt_main *format;
 		format = fmt_list;
+
+#if HAVE_OPENCL
+		/* This will make the majority of OpenCL formats
+		   also do "quick" run. But if LWS or
+		   GWS was already set, we do not overwrite. */
+		setenv("LWS", "1", 0);
+		setenv("GWS", "1", 0);
+#endif
 		do {
 			int ntests = 0;
 
 			/*
-			 * fmt_init() and fmt_done() required for --encoding=
+			 * fmt_init() and fmt_done() required for encoding
 			 * support, because some formats (like Raw-MD5u)
 			 * change their tests[] depending on the encoding.
 			 */
-			fmt_init(format);
+			if (!strstr(format->params.label, "-ztex"))
+				fmt_init(format);
 
 			if (format->params.tests) {
 				while (format->params.tests[ntests].ciphertext) {
-					int i;
 					int skip = 0;
-					/*
-					 * defining a config variable ot allowing --field-separator-char=
-					 * with a fallback to either ':' or '\t' is probably overkill
-					 */
+/*
+ * defining a config variable to allowing --field-separator-char=
+ * with a fallback to either ':' or '\t' is probably overkill
+ */
 					const char separator = '\t';
-					char *ciphertext;
-
-					ciphertext = format->params.tests[ntests].ciphertext;
-					if (ciphertext[ 0] == '\0')
-						ciphertext = format->methods.prepare(format->params.tests[ntests].fields,
-						                                     format);
-					/*
-					 * one of the scrypt tests has tabs and new lines in ciphertext
-					 * and password.
-					 */
-					for (i = 0; format->params.tests[ntests].plaintext[i]; i++)
-						if (format->params.tests[ntests].plaintext[i] == '\x0a') {
-							skip = 1;
-							fprintf(stderr,
-							        "Test %s %d: plaintext contains line feed\n",
-							        format->params.label, ntests);
-							break;
-						}
-					for (i = 0; ciphertext[i]; i++) {
-						if (ciphertext[i] == '\x0a' ||
-						    ciphertext[i] == separator) {
-							skip = 2;
-							fprintf(stderr,
-							        "Test %s %d: ciphertext contains line feed or separator character '%c'\n",
-							        format->params.label, ntests, separator);
-							break;
-						}
+					char *ciphertext = get_test(format, ntests);
+/*
+ * one of the scrypt tests has tabs and new lines in ciphertext
+ * and password.
+ */
+					if (strchr(format->params.tests[ntests].plaintext, '\x0a')) {
+						skip = 1;
+						fprintf(stderr,
+						        "Test %s %d: plaintext contains line feed\n",
+						        format->params.label, ntests);
 					}
-					printf("%s%c%d",
-					       format->params.label, separator, ntests);
-					if (skip < 2) {
-						printf("%c%s",
-						       separator,
-						       ciphertext);
-						if (!skip)
+					if (strchr(ciphertext, '\x0a') ||
+					    strchr(ciphertext, separator)) {
+						skip |= 2;
+						fprintf(stderr,
+						        "Test %s %d: ciphertext contains line feed or separator character '%c'\n",
+						        format->params.label, ntests, separator);
+					}
+/* if they are both missing, simply do not output a line at all */
+					if (skip != 3) {
+						printf("%s%c%d",
+							   format->params.label, separator, ntests);
+						if (skip < 2) {
 							printf("%c%s",
-							       separator,
-							       format->params.tests[ntests].plaintext);
+								   separator,
+								   ciphertext);
+							if (!skip)
+								printf("%c%s",
+									   separator,
+									   format->params.tests[ntests].plaintext);
+						}
+						printf("\n");
 					}
-					printf("\n");
 					ntests++;
 				}
 			}
@@ -738,7 +1005,7 @@ void listconf_parse_late(void)
 			fmt_done(format);
 
 		} while ((format = format->next));
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 	/*
 	 * Other --list=help:WHAT are processed in listconf_parse_early(), but
@@ -747,26 +1014,26 @@ void listconf_parse_late(void)
 	if (!strcasecmp(options.listconf, "help:parameters"))
 	{
 		cfg_print_section_names(1);
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 	if (!strcasecmp(options.listconf, "help:list-data"))
 	{
 		cfg_print_section_names(2);
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 
 	/* --list last resort: list subsections of any john.conf section name */
 
 	//printf("Subsections of [%s]:\n", options.listconf);
 	if (cfg_print_subsections(options.listconf, NULL, NULL, 1))
-		exit(0);
+		exit(EXIT_SUCCESS);
 	else {
 		fprintf(stderr, "Section [%s] not found.\n", options.listconf);
 		/* Just in case the user specified an invalid value
 		 * like help or list...
-		 * print the same list as with --list=?, but exit(1)
+		 * print the same list as with --list=?, but exit(EXIT_FAILURE)
 		 */
 		listconf_list_options();
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 }

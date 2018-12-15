@@ -10,123 +10,71 @@
 #define _JOHN_DES_BS_H
 
 #include "arch.h"
-#include "common-opencl.h"
-#include "opencl_DES_WGS.h"
+#include "opencl_common.h"
+#include "opencl_DES_hst_dev_shared.h"
 #include "loader.h"
 
-#define DES_BS_OPENCL_ALGORITHM_NAME		"DES OpenCL"
+#if (!AC_BUILT || HAVE_FCNTL_H)
+#include <fcntl.h>		// For file locks.
+#endif
+
+#define DES_BS_OPENCL_ALGORITHM_NAME	"DES OpenCL"
+
+#define FORMAT_LABEL			"descrypt-opencl"
 
 #define DES_BS_DEPTH			32
-#define DES_BS_LOG2			5
+#define DES_LOG_DEPTH			5
 
 #define WORD                      	int
 
 #define DES_bs_vector			WORD
 
-#define MULTIPLIER                      (WORK_GROUP_SIZE*256)
+#define PLAINTEXT_LENGTH		8
 
-
-#define MIN_KEYS_PER_CRYPT		(DES_BS_DEPTH*MULTIPLIER)
-#define MAX_KEYS_PER_CRYPT		(DES_BS_DEPTH*MULTIPLIER)
+#define MIN_KEYS_PER_CRYPT		DES_BS_DEPTH
+#define MAX_KEYS_PER_CRYPT		DES_BS_DEPTH
 
 #define GWS_CONFIG		        "des_GWS"
 
-unsigned int CC_CACHE_ALIGN index768[0x300];
-unsigned int CC_CACHE_ALIGN index96[96];
+/* Common hash checking variables. */
+extern DES_hash_check_params *hash_chk_params;
+#define num_uncracked_hashes(k) hash_chk_params[k].num_uncracked_hashes
 
+extern void build_tables(struct db_main *);
+extern void release_tables();
+extern void update_buffer(struct db_salt *);
+extern int extract_info(size_t, size_t *, WORD);
+extern size_t create_checking_kernel_set_args();
+extern void set_common_kernel_args_kpc(cl_mem, cl_mem);
+extern void init_checking();
+extern void finish_checking();
 
-#define	MAX_DEVICES_PER_PLATFORM	10
-#define DES_BS_EXPAND                   1
-/*
- * All bitslice DES parameters combined into one struct for more efficient
- * cache usage. Don't re-order unless you know what you're doing, as there
- * is an optimization that would produce undefined results if you did.
- *
- * This must match the definition in x86-mmx.S.
- */
-typedef struct {
+extern void create_keys_buffer(size_t, size_t);
+extern void create_int_keys_buffer(void);
+extern void release_keys_buffer();
+extern void release_int_keys_buffer(void);
+extern void process_keys(size_t, size_t *);
+extern size_t create_keys_kernel_set_args(int);
 
-	unsigned char *pxkeys[DES_BS_DEPTH]; /* Pointers into xkeys.c */
-	unsigned int salt;	/* Salt value corresponding to E[] contents */
-	DES_bs_vector *Ens[48];	/* Pointers into B[] for non-salted E */
+extern char *get_device_name(int);
+extern void save_lws_config(const char *, int, size_t, unsigned int);
+extern int restore_lws_config(const char *, int, size_t *, size_t, unsigned int *);
 
+typedef unsigned WORD vtype;
 
-} opencl_DES_bs_combined;
-
-typedef struct{
-
-
-	union {
-		unsigned char c[8][8][sizeof(DES_bs_vector)];
-		DES_bs_vector v[8][8];
-	} xkeys;
-
-	int keys_changed;
-
-} opencl_DES_bs_transfer ;
-
-/*
- * Various DES tables exported for use by other implementations.
- */
+unsigned int CC_CACHE_ALIGN opencl_DES_bs_index768[0x300];
 
 struct fmt_main;
 
-#define DES_bs_cpt			1
-extern opencl_DES_bs_combined *opencl_DES_bs_all;
-extern opencl_DES_bs_transfer *opencl_DES_bs_data;
-extern DES_bs_vector *B;
-#define for_each_t(n)
-#define init_t()
+extern struct fmt_main fmt_opencl_DES;
+extern unsigned char opencl_DES_E[48];
 
-/*
- * Initializes the internal structures.
- */
-extern void opencl_DES_bs_init(int LM, int cpt,int block);
-extern void opencl_DES_bs_init_global_variables(void);
+extern void opencl_DES_bs_b_register_functions(struct fmt_main *);
+extern void opencl_DES_bs_h_register_functions(struct fmt_main *);
+extern void opencl_DES_bs_f_register_functions(struct fmt_main *);
 
-/*
- * Sets a salt for DES_bs_crypt().
- */
-extern void opencl_DES_bs_set_salt(WORD salt);
+extern void (*opencl_DES_bs_init_global_variables)(void);
 
-
-/*
- * Set a key for DES_bs_crypt() or DES_bs_crypt_LM(), respectively.
- */
-extern void opencl_DES_bs_set_key(char *key, int index);
-extern void opencl_DES_bs_set_key_LM(char *key, int index);
-
-/*
- * Almost generic implementation: 24-bit salts, variable iteration count.
- */
-/*
-extern void opencl_DES_bs_crypt(int count, int keys_count);
-*/
-/*
- * A simplified special-case implementation: 12-bit salts, 25 iterations.
- */
-extern int opencl_DES_bs_crypt_25(int *pcount, struct db_salt *salt);
-
-/*
- * Another special-case version: a non-zero IV, no salts, no iterations.
- */
-/*
-extern void opencl_DES_bs_crypt_LM(int keys_count);
-*/
-/*
- * Converts an ASCII ciphertext to binary to be used with one of the
- * comparison functions.
- */
-extern WORD *opencl_DES_bs_get_binary(char *ciphertext);
-
-/*
- * Similarly, for LM hashes.
- */
-extern WORD *opencl_DES_bs_get_binary_LM(char *ciphertext);
-
-/*
- * Calculate a hash for a DES_bs_crypt() output.
- */
 extern int opencl_DES_bs_get_hash_0(int index);
 extern int opencl_DES_bs_get_hash_1(int index);
 extern int opencl_DES_bs_get_hash_2(int index);
@@ -134,45 +82,11 @@ extern int opencl_DES_bs_get_hash_3(int index);
 extern int opencl_DES_bs_get_hash_4(int index);
 extern int opencl_DES_bs_get_hash_5(int index);
 extern int opencl_DES_bs_get_hash_6(int index);
-
-/*
- * Compares 32 bits of a given ciphertext against at least the first count of
- * the DES_bs_crypt*() outputs and returns zero if no matches detected.
- */
-extern int opencl_DES_bs_cmp_all(WORD *binary, int count);
-
-/*
- * Compares count bits of a given ciphertext against one of the outputs.
- */
-extern int opencl_DES_bs_cmp_one_b(WORD *binary, int count, int index);
 extern int opencl_DES_bs_cmp_one(void *binary, int index);
-
-/*
- * Returns the salt.
- */
-extern WORD opencl_DES_raw_get_salt(char *ciphertext);
-
-/*
- * Returns the iteration count for DES_std_crypt().
- */
-extern WORD opencl_DES_raw_get_count(char *ciphertext);
-
-/*
- * Does the Initial Permutation; to be used at startup only (doesn't
- * require that DES_std_init() has been called, is not as fast as it
- * could be).
- */
-extern WORD *opencl_DES_do_IP(WORD in[2]);
-
-/*
- * Converts an ASCII ciphertext to binary.
- */
-extern WORD *opencl_DES_raw_get_binary(char *ciphertext);
-
-extern void DES_bs_select_device(struct fmt_main*);
-
-extern void DES_opencl_clean_all_buffer(void);
-
-extern void opencl_DES_reset(struct db_main *);
+extern int opencl_DES_bs_cmp_exact(char *source, int index);
+extern void opencl_DES_bs_set_key(char *key, int index);
+extern char *opencl_DES_bs_get_key(int index);
+extern void opencl_DES_bs_init_index(void);
+extern void opencl_DES_bs_clear_keys(void);
 
 #endif

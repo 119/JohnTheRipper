@@ -10,7 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "os.h"
-#if HAVE_UNISTD_H
+#if (!AC_BUILT || HAVE_UNISTD_H) && !_MSC_VER
 #include <unistd.h>
 #endif
 
@@ -48,6 +48,7 @@ int undrop(int argc, char *argv[]) {
 
     if (strncmp(t_line, USERFILE_HEADER, strlen(USERFILE_HEADER)) != 0) {
 	fprintf(stderr, "usefile format is wrong\n");
+	fclose(userfile);
 	return 1;
     } else {
 	printf("# userfile format OK\n\n");
@@ -67,8 +68,8 @@ int undrop(int argc, char *argv[]) {
 	}
 
 	if (strncmp(t_line, "--PASS +", 8) == 0) {
-	    sscanf(t_line, "--PASS %12s", password);
-	    printf("%s:%s:::%s:\n", username, password, flags);
+	    sscanf(t_line, "--PASS +%12s", password);
+	    printf("%s:+%s:::%s:\n", username, password, flags);
 	}
 	fflush(stdout);
     }

@@ -12,26 +12,48 @@
  *    Redistribution and use in source and binary forms, with or without
  *    modifications, are permitted. */
 
+#if !AC_BUILT
+#if __GNUC__ && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define ARCH_LITTLE_ENDIAN 1
+#endif
+#endif
+#if FMT_EXTERNS_H
+#if ARCH_LITTLE_ENDIAN
+extern struct fmt_main fmt_VMS;
+#endif
+#elif FMT_REGISTERS_H
+#if ARCH_LITTLE_ENDIAN
+john_register_one(&fmt_VMS);
+#endif
+#else
+
 #include <stdio.h>
 #include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
 #include "misc.h"
 #include "vms_std.h"
 #include "common.h"
 #include "formats.h"
-#ifdef _OPENMP
-static int omp_t = 1;
-#include <omp.h>
-#define OMP_SCALE               64
+#ifdef VMS
+#include <ssdef.h>
+#define UAIsM_PWDMIX UAI$M_PWDMIX
+#else
+/*
+ * Emulate symbols defined for VMS services.
+ */
+#define UAIsM_PWDMIX 0x2000000
 #endif
 #include "memdbg.h"
-#ifndef UAI$M_PWDMIX
-#define UAI$M_PWDMIX 0x2000000
-#endif
 
 #define FORMAT_LABEL			"OpenVMS"
 #define FORMAT_NAME			"Purdy"
-#define FORMAT_NAME_NOPWDMIX		"Purdy (nopwdmix)"
+#define FORMAT_TAG           "$V$"
+#define FORMAT_TAG_LEN       (sizeof(FORMAT_TAG)-1)
 
 #define BENCHMARK_COMMENT		""
 #define BENCHMARK_LENGTH		-1
@@ -41,20 +63,31 @@ static int omp_t = 1;
 #define BINARY_SIZE			8
 #define BINARY_ALIGN		4
 #define SALT_SIZE			sizeof(struct uaf_hash_info)
-#define SALT_ALIGN			4
+#define SALT_ALIGN			sizeof(uaf_qword)
 
 #define MIN_KEYS_PER_CRYPT		1
-#define MAX_KEYS_PER_CRYPT		1
+#define MAX_KEYS_PER_CRYPT		8
+
+#ifndef OMP_SCALE
+#define OMP_SCALE               32 // Tuned w/ MKPC for core i7
+#endif
 
 static struct fmt_tests tests[] = {
-	{"$V$9AYXUd5LfDy-aj48Vj54P-----", "USER"},
+/*
+ * The following two test vectors: "USER" and "service" are case-insensitive
+ */
 	{"$V$9AYXUd5LfDy-aj48Vj54P-----", "USER"},
 	{"$V$p1UQjRZKulr-Z25g5lJ-------", "service"},
+/*
+ * The following one test vector: "President#44" is case-sensitive
+ */
+	{"$V$S44zI913bBx-UJrcFSC------D", "President#44"},
 	{NULL}
 };
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
 static uaf_qword (*crypt_out)[BINARY_SIZE / sizeof(uaf_qword)];
+static int initialized;
 
 /*
  * See if signature of ciphertext (from passwd file) matches the hack
@@ -64,14 +97,21 @@ static int valid(char *ciphertext, struct fmt_main *self )
 {
 	struct uaf_hash_info pwd;
 
-	if (strncmp(ciphertext, "$V$", 3)) return 0;	/* no match */
+	if (!initialized) {
+		uaf_init();
+		initialized = 1;
+	}
+
+	if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN))
+		return 0;	/* no match */
+
 	if ( strlen ( ciphertext ) < (UAF_ENCODE_SIZE-1) )
 		return 0;
 
 	if (!uaf_hash_decode(ciphertext, &pwd))
 		return 0;
 
-#ifdef DEBUG
+#ifdef VMS_DEBUG
 	fprintf(stderr, "/VMS_STD/ get_salt decoded '%s' to %x/%x-%x-%x-%x-%x"
 		"  %ld\n", ciphertext, pwd.salt, pwd.alg, pwd.username.r40[0],
 		pwd.username.r40[1], pwd.username.r40[2], pwd.username.r40[3],
@@ -85,27 +125,25 @@ static int valid(char *ciphertext, struct fmt_main *self )
 
 static void fmt_vms_init ( struct fmt_main *self )
 {
-#ifdef _OPENMP
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
+	omp_autotune(self, OMP_SCALE);
+
 	/* Init bin 2 hex table for faster conversions later */
-	saved_key = mem_calloc_tiny(sizeof(*saved_key) *
-			self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	crypt_out = mem_calloc_tiny(sizeof(*crypt_out) * self->params.max_keys_per_crypt, sizeof(uaf_qword));
-	uaf_init ( );
+	saved_key = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*saved_key));
+	crypt_out = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*crypt_out));
+
+	if (!initialized) {
+		uaf_init();
+		initialized = 1;
+	}
 }
 
-/*
- * Prepare function.
- */
-char *prepare ( char *split_fields[10], struct fmt_main *pFmt )
+static void done(void)
 {
-	return split_fields[1];
+	MEM_FREE(crypt_out);
+	MEM_FREE(saved_key);
 }
-
 
 /*
  * Save a password (key) for testing.  VMS_std_set_key returns position value
@@ -114,7 +152,7 @@ char *prepare ( char *split_fields[10], struct fmt_main *pFmt )
  */
 static void set_key(char *key, int index)
 {
-	strcpy(saved_key[index], key);
+	strnzcpyn(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -124,11 +162,10 @@ static char *get_key(int index)
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#ifdef _OPENMP
-	for (; index < count; index++)
-#endif
-		if (!memcmp(binary, crypt_out[index], BINARY_SIZE))
+	int index;
+
+	for (index = 0; index < count; index++)
+		if (!memcmp(binary, crypt_out[index], ARCH_SIZE))
 			return 1;
 	return 0;
 }
@@ -143,30 +180,18 @@ static int cmp_exact(char *source, int index)
 	return 1;
 }
 
-static char *fmt_vms_split(char *ciphertext, int index, struct fmt_main *pFmt)
-{
-	return ciphertext;
-}
-
-
 /*
  * Save salt for producing ciphertext from it and saved keys at next crypt call.
  */
-
-struct uaf_hash_info *cur_salt;
+static struct uaf_hash_info *cur_salt;
 
 void VMS_std_set_salt ( void *salt )
 {
 	cur_salt = (struct uaf_hash_info*)salt;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & 0xf; }
-static int get_hash_1(int index) { return crypt_out[index][0] & 0xff; }
-static int get_hash_2(int index) { return crypt_out[index][0] & 0xfff; }
-static int get_hash_3(int index) { return crypt_out[index][0] & 0xffff; }
-static int get_hash_4(int index) { return crypt_out[index][0] & 0xfffff; }
-static int get_hash_5(int index) { return crypt_out[index][0] & 0xffffff; }
-static int get_hash_6(int index) { return crypt_out[index][0] & 0x7ffffff; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 /*
  * Hash the password and salt saved with VMS_std_set_key and VMS_std_set_salt,
@@ -175,14 +200,14 @@ static int get_hash_6(int index) { return crypt_out[index][0] & 0x7ffffff; }
 int VMS_std_crypt(int *pcount, struct db_salt *salt)
 {
 	int count = *pcount;
-	int index = 0;
+	int index;
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		uaf_test_password (cur_salt, saved_key[index], 0, crypt_out[index]);
 	}
+
 	return count;
 }
 
@@ -194,8 +219,9 @@ int VMS_std_crypt(int *pcount, struct db_salt *salt)
 char *VMS_std_get_salt(char *ciphertext)
 {
 	static struct uaf_hash_info pwd;
+	memset(&pwd, 0, sizeof(pwd));
 	uaf_hash_decode ( ciphertext, &pwd );
-#ifdef DEBUG
+#ifdef VMS_DEBUG
 	printf("/VMS_STD/ get_salt decoded '%s' to %x/%x-%x-%x-%x-%x  %ld\n",
 			ciphertext, pwd.salt, pwd.alg, pwd.username.r40[0], pwd.username.r40[1],
 			pwd.username.r40[2], pwd.username.r40[3], pwd.flags );
@@ -228,30 +254,32 @@ struct fmt_main fmt_VMS = {
 		VMS_ALGORITHM_NAME,		/* .algorithm_name */
 		BENCHMARK_COMMENT,		/* .benchmark_comment */
 		BENCHMARK_LENGTH,		/* .benchmark_length (pwd break len) */
-		PLAINTEXT_LENGTH,		/* .plaintext_lenght (max) */
+		0,
+		PLAINTEXT_LENGTH,		/* .plaintext_length (max) */
 		BINARY_SIZE,			/* .binary_size (quadword) */
 		BINARY_ALIGN,
 		SALT_SIZE,			/* .salt_size (word) */
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
+/*
+ * This format supports both case-sensitive and case-insensitive passwords,
+ * so this format should set FMT_CASE
+ */
 		FMT_CASE | FMT_8_BIT | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
+		{ FORMAT_TAG },
 		tests
 	}, {
 		fmt_vms_init,			/* changed for jumbo */
-		fmt_default_done,
+		done,
 		fmt_default_reset,
-		prepare,			/* Added for jumbo */
+		fmt_default_prepare,
 		valid,
-		fmt_vms_split,
+		fmt_default_split,
 		(void *(*)(char *))VMS_std_get_binary,
 		(void *(*)(char *))VMS_std_get_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash_0,
@@ -263,22 +291,20 @@ struct fmt_main fmt_VMS = {
 			fmt_default_binary_hash_6
 		},
 		fmt_default_salt_hash,
+		NULL,
 		(void (*)(void *))VMS_std_set_salt,
 		set_key,
 		get_key,
 		fmt_default_clear_keys,
 		VMS_std_crypt,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

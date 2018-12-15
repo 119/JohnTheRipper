@@ -1,19 +1,27 @@
-/* Password Safe and Password Gorilla cracker patch for JtR. Hacked together
+/*
+ * Password Safe and Password Gorilla cracker patch for JtR. Hacked together
  * during May of 2012 by Dhiru Kholia <dhiru.kholia at gmail.com>.
  *
  * Optimization patch during January of 2013 by Brian Wallace <brian.wallace9809 at gmail.com>.
  *
- * This software is Copyright (c) 2012-2013
- * Dhiru Kholia <dhiru.kholia at gmail.com> and Brian Wallace <brian.wallace9809 at gmail.com>
- * and it is hereby released to the general public under the following terms:
+ * This software is Copyright (c) 2012-2013, Dhiru Kholia <dhiru.kholia at gmail.com> and
+ * Brian Wallace <brian.wallace9809 at gmail.com> and it is hereby released to the general
+ * public under the following terms:
+ *
  * Redistribution and use in source and binary forms, with or without modification, are permitted.
  */
 
-
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_pwsafe;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_pwsafe);
+#else
 
 #include <string.h>
-#include <assert.h>
-#include <errno.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "arch.h"
 #include "sha2.h"
@@ -22,110 +30,58 @@
 #include "formats.h"
 #include "params.h"
 #include "options.h"
-#include "base64.h"
-#ifdef _OPENMP
-static int omp_t = 1;
-#include <omp.h>
-#define OMP_SCALE               1 // tuned on core i7
-#endif
+#include "johnswap.h"
+#include "pwsafe_common.h"
+#include "simd-intrinsics.h"
 #include "memdbg.h"
 
-#define FORMAT_LABEL		"pwsafe"
-#define FORMAT_NAME		"Password Safe"
-#define ALGORITHM_NAME		"SHA256 32/" ARCH_BITS_STR
-#define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	-1
-#define PLAINTEXT_LENGTH	125
-#define BINARY_SIZE		32
-#define SALT_SIZE		sizeof(struct custom_salt)
-#define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	1
+#define FORMAT_LABEL            "pwsafe"
+#define FORMAT_NAME             "Password Safe"
+#define FORMAT_TAG              "$pwsafe$*"
+#define FORMAT_TAG_LEN          (sizeof(FORMAT_TAG)-1)
+#define ALGORITHM_NAME          "SHA256 " SHA256_ALGORITHM_NAME
+#define BENCHMARK_COMMENT       ""
+#define BENCHMARK_LENGTH        -1
+#define PLAINTEXT_LENGTH        125
+#define BINARY_SIZE             32
+#define SALT_SIZE               sizeof(struct custom_salt)
+#define BINARY_ALIGN            sizeof(uint32_t)
+#define SALT_ALIGN              sizeof(int)
 
-static struct fmt_tests pwsafe_tests[] = {
-	{"$pwsafe$*3*fefc1172093344c9d5577b25f5b4b6e5d2942c94f9fc24c21733e28ae6527521*2048*88cbaf7d8668c1a98263f5dce7cb39c3304c49a3e0d76a7ea475dc02ab2f97a7", "12345678"},
-	{"$pwsafe$*3*581cd1135b9b993ccb0f6b01c1fcfacd799c69960496c96286f94fe1400c1b25*2048*4ab3c2d3af251e94eb2f753fdf30fb9da074bec6bac0fa9d9d152b95fc5795c6", "openwall"},
-	{"$pwsafe$*3*34ba0066d0fc594c126b60b9db98b6024e1cf585901b81b5b005ce386f173d4c*2048*cc86f1a5d930ff19b3602770a86586b5d9dea7bb657012aca875aa2a7dc71dc0", "12345678901234567890123"},
-	{"$pwsafe$*3*a42431191707895fb8d1121a3a6e255e33892d8eecb50fc616adab6185b5affb*2048*0f71d12df2b7c5394ae90771f6475a7ad0437007a8eeb5d9b58e35d8fd57c827", "123456789012345678901234567"},
-	{"$pwsafe$*3*c380dee0dbb536f5454f78603b020be76b33e294e9c2a0e047f43b9c61669fc8*2048*e88ed54a85e419d555be219d200563ae3ba864e24442826f412867fc0403917d", "this is an 87 character password to test the max bound of pwsafe-opencl................"},
-	{NULL}
-};
+#ifdef SIMD_COEF_32
+#if ARCH_LITTLE_ENDIAN==1
+#define GETPOS(i, index)        ( (index&(SIMD_COEF_32-1))*4 + ((i)&(0xffffffff-3))*SIMD_COEF_32 + (3-((i)&3)) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32*4 )
+#else
+#define GETPOS(i, index)        ( (index&(SIMD_COEF_32-1))*4 + ((i)&(0xffffffff-3))*SIMD_COEF_32 + ((i)&3) + (unsigned int)index/SIMD_COEF_32*SHA_BUF_SIZ*SIMD_COEF_32*4 )
+#endif
+#define MIN_KEYS_PER_CRYPT      (SIMD_COEF_32*SIMD_PARA_SHA256)
+#define MAX_KEYS_PER_CRYPT      (SIMD_COEF_32*SIMD_PARA_SHA256 * 4)
+#else
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      4
+#endif
 
-
+#ifndef OMP_SCALE
+#define OMP_SCALE               32 // Tuned w/ MKPC for core i7
+#endif
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE / sizeof(uint32_t)];
 
-static struct custom_salt {
-	int version;
-	unsigned int iterations;
-	char unsigned salt[32];
-} *cur_salt;
+static struct custom_salt *cur_salt;
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
-	saved_key = mem_calloc_tiny(sizeof(*saved_key) *
-			self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	crypt_out = mem_calloc_tiny(sizeof(*crypt_out) * self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
+	omp_autotune(self, OMP_SCALE);
+
+	saved_key = mem_calloc(sizeof(*saved_key), self->params.max_keys_per_crypt);
+	crypt_out = mem_calloc(sizeof(*crypt_out), self->params.max_keys_per_crypt);
 }
 
-static int valid(char *ciphertext, struct fmt_main *self)
+static void done(void)
 {
-	// format $pwsafe$version*salt*iterations*hash
-	char *p;
-	char *ctcopy;
-	char *keeptr;
-	if (strncmp(ciphertext, "$pwsafe$*", 9) != 0)
-		return 0;
-	ctcopy = strdup(ciphertext);
-	keeptr = ctcopy;
-	ctcopy += 9;		/* skip over "$pwsafe$*" */
-	if ((p = strtok(ctcopy, "*")) == NULL)	/* version */
-		goto err;
-	if (atoi(p) == 0)
-		goto err;
-	if ((p = strtok(NULL, "*")) == NULL)	/* salt */
-		goto err;
-	if (strlen(p) < 64)
-		goto err;
-	if ((p = strtok(NULL, "*")) == NULL)	/* iterations */
-		goto err;
-	if (atoi(p) == 0)
-		goto err;
-	if ((p = strtok(NULL, "*")) == NULL)	/* hash */
-		goto err;
-	if (strlen(p) != 64)
-		goto err;
-	MEM_FREE(keeptr);
-	return 1;
-err:
-	MEM_FREE(keeptr);
-	return 0;
-}
-
-static void *get_salt(char *ciphertext)
-{
-	char *ctcopy = strdup(ciphertext);
-	char *keeptr = ctcopy;
-	char *p;
-	int i;
-	static struct custom_salt cs;
-	ctcopy += 9;	/* skip over "$pwsafe$*" */
-	p = strtok(ctcopy, "*");
-	cs.version = atoi(p);
-	p = strtok(NULL, "*");
-	for (i = 0; i < 32; i++)
-		cs.salt[i] = atoi16[ARCH_INDEX(p[i * 2])] * 16
-			+ atoi16[ARCH_INDEX(p[i * 2 + 1])];
-	p = strtok(NULL, "*");
-	cs.iterations = (unsigned int)atoi(p);
-	MEM_FREE(keeptr);
-	return (void *)&cs;
+	MEM_FREE(crypt_out);
+	MEM_FREE(saved_key);
 }
 
 static void *get_binary(char *ciphertext)
@@ -137,6 +93,7 @@ static void *get_binary(char *ciphertext)
 	unsigned char *out = buf.c;
 	char *p;
 	int i;
+
 	p = strrchr(ciphertext, '*') + 1;
 	for (i = 0; i < BINARY_SIZE; i++) {
 		out[i] =
@@ -148,18 +105,38 @@ static void *get_binary(char *ciphertext)
 	return out;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & 0xf; }
-static int get_hash_1(int index) { return crypt_out[index][0] & 0xff; }
-static int get_hash_2(int index) { return crypt_out[index][0] & 0xfff; }
-static int get_hash_3(int index) { return crypt_out[index][0] & 0xffff; }
-static int get_hash_4(int index) { return crypt_out[index][0] & 0xfffff; }
-static int get_hash_5(int index) { return crypt_out[index][0] & 0xffffff; }
-static int get_hash_6(int index) { return crypt_out[index][0] & 0x7ffffff; }
+static void *get_salt(char *ciphertext)
+{
+	char *ctcopy = strdup(ciphertext);
+	char *keeptr = ctcopy;
+	char *p;
+	int i;
+	static struct custom_salt cs;
+
+	memset(&cs, 0, sizeof(struct custom_salt));
+	ctcopy += FORMAT_TAG_LEN;	/* skip over "$pwsafe$*" */
+	p = strtokm(ctcopy, "*");
+	cs.version = atoi(p);
+	p = strtokm(NULL, "*");
+	for (i = 0; i < 32; i++)
+		cs.salt[i] = atoi16[ARCH_INDEX(p[i * 2])] * 16
+			+ atoi16[ARCH_INDEX(p[i * 2 + 1])];
+	p = strtokm(NULL, "*");
+	cs.iterations = (unsigned int)atoi(p);
+	MEM_FREE(keeptr);
+
+	return (void *)&cs;
+}
+
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static void set_salt(void *salt)
 {
 	cur_salt = (struct custom_salt *)salt;
 }
+
+#ifndef SIMD_COEF_32
 
 #define rotl(x,y) ( x<<y | x>>(32-y) )
 #define rotr(x,y) ( x>>y | x<<(32-y) )
@@ -180,6 +157,7 @@ static void pwsafe_sha256_iterate(unsigned int * state, unsigned int iterations)
 	unsigned int word00,word01,word02,word03,word04,word05,word06,word07;
 	unsigned int word08,word09,word10,word11,word12,word13,word14,word15;
 	unsigned int temp0, temp1, temp2, temp3, temp4, temp5, temp6, temp7;
+
 	iterations++;
 	word00 = state[0];
 	word01 = state[1];
@@ -189,8 +167,7 @@ static void pwsafe_sha256_iterate(unsigned int * state, unsigned int iterations)
 	word05 = state[5];
 	word06 = state[6];
 	word07 = state[7];
-	while(iterations)
-	{
+	while (iterations) {
 		iterations--;
 		temp0 = 0x6a09e667UL;
 		temp1 = 0xbb67ae85UL;
@@ -483,23 +460,55 @@ static void pwsafe_sha256_iterate(unsigned int * state, unsigned int iterations)
 	state[6] = bytereverse(word06);
 	state[7] = bytereverse(word07);
 }
+#endif
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
-	int index = 0;
+	const int count = *pcount;
+	int index;
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index+=MIN_KEYS_PER_CRYPT) {
 		SHA256_CTX ctx;
+#ifdef SIMD_COEF_32
+		unsigned int i;
+		unsigned char _IBuf[64*MIN_KEYS_PER_CRYPT+MEM_ALIGN_CACHE], *keys, tmpBuf[32];
+		uint32_t *keys32, j;
 
+		keys = (unsigned char*)mem_align(_IBuf, MEM_ALIGN_CACHE);
+		keys32 = (uint32_t*)keys;
+		memset(keys, 0, 64*MIN_KEYS_PER_CRYPT);
+
+		for (i = 0; i < MIN_KEYS_PER_CRYPT; ++i) {
+			SHA256_Init(&ctx);
+			SHA256_Update(&ctx, saved_key[index+i], strlen(saved_key[index+i]));
+			SHA256_Update(&ctx, cur_salt->salt, 32);
+			SHA256_Final(tmpBuf, &ctx);
+			for (j = 0; j < 32; ++j)
+				keys[GETPOS(j, i)] = tmpBuf[j];
+			keys[GETPOS(j, i)] = 0x80;
+			// 32 bytes of crypt data (0x100 bits).
+			keys[GETPOS(62, i)] = 0x01;
+		}
+		for (i = 0; i < cur_salt->iterations; i++) {
+			SIMDSHA256body(keys, keys32, NULL, SSEi_MIXED_IN|SSEi_OUTPUT_AS_INP_FMT);
+		}
+		// Last one with FLAT_OUT
+		SIMDSHA256body(keys, crypt_out[index], NULL, SSEi_MIXED_IN|SSEi_OUTPUT_AS_INP_FMT|SSEi_FLAT_OUT);
+#else
 		SHA256_Init(&ctx);
 		SHA256_Update(&ctx, saved_key[index], strlen(saved_key[index]));
 		SHA256_Update(&ctx, cur_salt->salt, 32);
 		SHA256_Final((unsigned char*)crypt_out[index], &ctx);
+#if 1
+		// This complex crap only boosted speed on my quad-HT from 5016 to 5285.
+		// A ton of complex code for VERY little gain. The SIMD change gave us
+		// a 4x improvement with very little change. This pwsafe_sha256_iterate
+		// does get 5% gain, but 400% is so much better, lol. I put the other
+		// code in to be able to dump data out easier, getting dump_stuff()
+		// data in flat, to be able to help get the SIMD code working.
 #ifdef COMMON_DIGEST_FOR_OPENSSL
 		pwsafe_sha256_iterate(ctx.hash, cur_salt->iterations);
 		memcpy(crypt_out[index], ctx.hash, 32);
@@ -507,17 +516,26 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		pwsafe_sha256_iterate(ctx.h, cur_salt->iterations);
 		memcpy(crypt_out[index], ctx.h, 32);
 #endif
+#else
+		{ int i;
+		for (i = 0; i <= cur_salt->iterations; ++i) {
+			SHA256_Init(&ctx);
+			SHA256_Update(&ctx, (unsigned char*)crypt_out[index], 32);
+			SHA256_Final((unsigned char*)crypt_out[index], &ctx);
+		} }
+#endif
+#endif
 	}
+
 	return count;
 }
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#ifdef _OPENMP
-	for (; index < count; index++)
-#endif
-		if (!memcmp(binary, crypt_out[index], BINARY_SIZE))
+	int index;
+
+	for (index = 0; index < count; index++)
+		if (!memcmp(binary, crypt_out[index], ARCH_SIZE))
 			return 1;
 	return 0;
 }
@@ -534,16 +552,21 @@ static int cmp_exact(char *source, int index)
 
 static void pwsafe_set_key(char *key, int index)
 {
-	int saved_key_length = strlen(key);
-	if (saved_key_length > PLAINTEXT_LENGTH)
-		saved_key_length = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, saved_key_length);
-	saved_key[index][saved_key_length] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
 {
 	return saved_key[index];
+}
+
+static unsigned int iteration_count(void *salt)
+{
+	struct custom_salt *my_salt;
+
+	my_salt = salt;
+
+	return (unsigned int) my_salt->iterations;
 }
 
 struct fmt_main fmt_pwsafe = {
@@ -553,30 +576,32 @@ struct fmt_main fmt_pwsafe = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
-		DEFAULT_ALIGN,
+		BINARY_ALIGN,
 		SALT_SIZE,
-		DEFAULT_ALIGN,
+		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
-		{ NULL },
-#endif
+		{
+			"iteration count",
+		},
+		{ FORMAT_TAG },
 		pwsafe_tests
 	}, {
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		fmt_default_prepare,
-		valid,
+		pwsafe_valid,
 		fmt_default_split,
 		get_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
-		{ NULL },
-#endif
+		{
+			iteration_count,
+		},
 		fmt_default_source,
 		{
 			fmt_default_binary_hash_0,
@@ -588,22 +613,20 @@ struct fmt_main fmt_pwsafe = {
 			fmt_default_binary_hash_6
 		},
 		fmt_default_salt_hash,
+		NULL,
 		set_salt,
 		pwsafe_set_key,
 		get_key,
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

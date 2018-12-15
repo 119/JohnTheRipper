@@ -36,31 +36,36 @@
  * [3] http://ettercap.sourceforge.net/
  * [4] http://www.oxid.it/cain.html
  * [5] http://www.foofus.net/jmk/smbchallenge.html
- *
  */
 
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_NETLMv2;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_NETLMv2);
+#else
+
+#include <stdint.h>
 #include <string.h>
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
+#include "arch.h"
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
 #include "options.h"
 #include "unicode.h"
-
 #include "md5.h"
 #include "hmacmd5.h"
 #include "byteorder.h"
 #include "memdbg.h"
 
-#ifndef uchar
-#define uchar unsigned char
-#endif
-
 #define FORMAT_LABEL         "netlmv2"
 #define FORMAT_NAME          "LMv2 C/R"
+#define FORMAT_TAG           "$NETLMv2$"
+#define FORMAT_TAG_LEN       (sizeof(FORMAT_TAG)-1)
 #define ALGORITHM_NAME       "MD4 HMAC-MD5 32/" ARCH_BITS_STR
 #define BENCHMARK_COMMENT    ""
 #define BENCHMARK_LENGTH     0
@@ -75,122 +80,116 @@
 #define CIPHERTEXT_LENGTH    32
 #define TOTAL_LENGTH         12 + USERNAME_LENGTH + DOMAIN_LENGTH + CHALLENGE_LENGTH + CIPHERTEXT_LENGTH
 
-// these may be altered in init() if running OMP
-#define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	1
-#define OMP_SCALE		1536
+#define MIN_KEYS_PER_CRYPT   1
+#define MAX_KEYS_PER_CRYPT   32
+#ifndef OMP_SCALE
+#define OMP_SCALE            4 // Tuned w/ MKPC for core i7
+#endif
 
 static struct fmt_tests tests[] = {
+  {"", "1337adminPASS",         {"FOODOM\\Administrator", "", "",       "1122334455667788", "6F64C5C1E35F68DD80388C0F00F34406", "F0F3FF27037AA69F"} },
   {"$NETLMv2$ADMINISTRATORFOODOM$1122334455667788$6F64C5C1E35F68DD80388C0F00F34406$F0F3FF27037AA69F", "1337adminPASS"},
   {"$NETLMv2$USER1$1122334455667788$B1D163EA5881504F3963DC50FCDC26C1$EB4D9E8138149E20", "foobar"},
+  // repeat in exactly the same format that is used in john.pot (lower case hex)
+  {"$NETLMv2$USER1$1122334455667788$b1d163ea5881504f3963dc50fcdc26c1$eb4d9e8138149e20", "foobar"},
   {"$NETLMv2$ATEST$1122334455667788$83B59F1536D3321DBF1FAEC14ADB1675$A1E7281FE8C10E53", "SomeFancyP4$$w0rdHere"},
-  {"", "1337adminPASS",         {"FOODOM\\Administrator", "", "",       "1122334455667788", "6F64C5C1E35F68DD80388C0F00F34406", "F0F3FF27037AA69F"} },
   {"", "1337adminPASS",         {"administrator",         "", "FOODOM", "1122334455667788", "6F64C5C1E35F68DD80388C0F00F34406", "F0F3FF27037AA69F"} },
   {"", "foobar",                {"user1",                 "", "",       "1122334455667788", "B1D163EA5881504F3963DC50FCDC26C1", "EB4D9E8138149E20"} },
   {"", "SomeFancyP4$$w0rdHere", {"aTest",                 "", "",       "1122334455667788", "83B59F1536D3321DBF1FAEC14ADB1675", "A1E7281FE8C10E53"} },
   {NULL}
 };
 
-static uchar (*saved_plain)[PLAINTEXT_LENGTH + 1];
+static unsigned char (*saved_plain)[PLAINTEXT_LENGTH + 1];
 static int (*saved_len);
-static uchar (*output)[BINARY_SIZE];
+static unsigned char (*output)[BINARY_SIZE];
 static HMACMD5Context (*saved_ctx);
 static int keys_prepared;
 static unsigned char *challenge;
 
-#if !defined(uint16) && !defined(HAVE_UINT16_FROM_RPC_RPC_H)
-#if (SIZEOF_SHORT == 4)
-#define uint16 __ERROR___CANNOT_DETERMINE_TYPE_FOR_INT16;
-#else /* SIZEOF_SHORT != 4 */
-#define uint16 unsigned short
-#endif /* SIZEOF_SHORT != 4 */
-#endif
-
-#if !defined(int16) && !defined(HAVE_INT16_FROM_RPC_RPC_H)
-#if (SIZEOF_SHORT == 4)
-#define int16 __ERROR___CANNOT_DETERMINE_TYPE_FOR_INT16;
-#else /* SIZEOF_SHORT != 4 */
-#define int16 short
-#endif /* SIZEOF_SHORT != 4 */
-#endif
-
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	int omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
-	saved_plain = mem_calloc_tiny(sizeof(*saved_plain) * self->params.max_keys_per_crypt, MEM_ALIGN_NONE);
-	saved_len = mem_calloc_tiny(sizeof(*saved_len) * self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	output = mem_calloc_tiny(sizeof(*output) * self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	saved_ctx = mem_calloc_tiny(sizeof(*saved_ctx) * self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
+	omp_autotune(self, OMP_SCALE);
+
+	saved_plain = mem_calloc(self->params.max_keys_per_crypt,
+	                         sizeof(*saved_plain));
+	saved_len = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*saved_len));
+	output = mem_calloc(self->params.max_keys_per_crypt, sizeof(*output));
+	saved_ctx = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*saved_ctx));
+}
+
+static void done(void)
+{
+	MEM_FREE(saved_ctx);
+	MEM_FREE(output);
+	MEM_FREE(saved_len);
+	MEM_FREE(saved_plain);
 }
 
 static int valid(char *ciphertext, struct fmt_main *self)
 {
-  char *pos, *pos2;
+	char *pos, *pos2;
 
-  if (ciphertext == NULL) return 0;
-  else if (strncmp(ciphertext, "$NETLMv2$", 9)!=0) return 0;
+	if (ciphertext == NULL) return 0;
+	else if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN)!=0) return 0;
 
-  pos = &ciphertext[9];
+	pos = &ciphertext[FORMAT_TAG_LEN];
 
-  /* Validate Username and Domain Length */
-  for (pos2 = pos; *pos2 != '$'; pos2++)
-    if ((unsigned char)*pos2 < 0x20)
-      return 0;
+	/* Validate Username and Domain Length */
+	for (pos2 = pos; *pos2 != '$'; pos2++)
+		if ((unsigned char)*pos2 < 0x20)
+			return 0;
 
-  if ( !(*pos2 && (pos2 - pos <= USERNAME_LENGTH + DOMAIN_LENGTH)) )
-    return 0;
+	if ( !(*pos2 && (pos2 - pos <= USERNAME_LENGTH + DOMAIN_LENGTH)) )
+		return 0;
 
-  /* Validate Server Challenge Length */
-  pos2++; pos = pos2;
-  for (; *pos2 != '$'; pos2++)
-    if (atoi16[ARCH_INDEX(*pos2)] == 0x7F)
-      return 0;
+	/* Validate Server Challenge Length */
+	pos2++; pos = pos2;
+	for (; *pos2 != '$'; pos2++)
+		if (atoi16[ARCH_INDEX(*pos2)] == 0x7F)
+			return 0;
 
-  if ( !(*pos2 && (pos2 - pos == CHALLENGE_LENGTH / 2)) )
-    return 0;
+	if ( !(*pos2 && (pos2 - pos == CHALLENGE_LENGTH / 2)) )
+		return 0;
 
-  /* Validate LMv2 Response Length */
-  pos2++; pos = pos2;
-  for (; *pos2 != '$'; pos2++)
-    if (atoi16[ARCH_INDEX(*pos2)] == 0x7F)
-      return 0;
+	/* Validate LMv2 Response Length */
+	pos2++; pos = pos2;
+	for (; *pos2 != '$'; pos2++)
+		if (atoi16[ARCH_INDEX(*pos2)] == 0x7F)
+			return 0;
 
-  if ( !(*pos2 && (pos2 - pos == CIPHERTEXT_LENGTH)) )
-    return 0;
+	if ( !(*pos2 && (pos2 - pos == CIPHERTEXT_LENGTH)) )
+		return 0;
 
-  /* Validate Client Challenge Length */
-  pos2++; pos = pos2;
-  for (; atoi16[ARCH_INDEX(*pos2)] != 0x7F; pos2++);
-  if (pos2 - pos != CHALLENGE_LENGTH / 2)
-    return 0;
-  if (pos2[0] != '\0')
-    return 0;
+	/* Validate Client Challenge Length */
+	pos2++; pos = pos2;
+	for (; atoi16[ARCH_INDEX(*pos2)] != 0x7F; pos2++);
+	if (pos2 - pos != CHALLENGE_LENGTH / 2)
+		return 0;
+	if (pos2[0] != '\0')
+		return 0;
 
-  return 1;
+	return 1;
 }
 
 static char *prepare(char *split_fields[10], struct fmt_main *self)
 {
+	char *login         = split_fields[0];
+	char *uid           = split_fields[2];
 	char *srv_challenge = split_fields[3];
 	char *nethashv2     = split_fields[4];
 	char *cli_challenge = split_fields[5];
-	char *login = split_fields[0];
-	char *uid = split_fields[2];
 	char *identity = NULL, *tmp;
 
-	if (!strncmp(split_fields[1], "$NETLMv2$", 9))
+	if (!strncmp(split_fields[1], FORMAT_TAG, FORMAT_TAG_LEN))
 		return split_fields[1];
-	if (!split_fields[0]||!split_fields[2]||!split_fields[3]||!split_fields[4]||!split_fields[5])
+	if (!login || !uid || !srv_challenge || !nethashv2 || !cli_challenge)
 		return split_fields[1];
 
 	/* DOMAIN\USER: -or- USER::DOMAIN: */
 	if ((tmp = strstr(login, "\\")) != NULL) {
-		identity = (char *) mem_alloc(strlen(login));
+		identity = (char *) mem_alloc(strlen(login)*2 + 1);
 		strcpy(identity, tmp + 1);
 
 		/* Upper-Case Username - Not Domain */
@@ -199,7 +198,7 @@ static char *prepare(char *split_fields[10], struct fmt_main *self)
 		strncat(identity, login, tmp - login);
 	}
 	else {
-		identity = (char *) mem_alloc(strlen(login) + strlen(uid) + 1);
+		identity = (char *) mem_alloc(strlen(login)*2 + strlen(uid) + 1);
 		strcpy(identity, login);
 
 		enc_strupper(identity);
@@ -207,7 +206,7 @@ static char *prepare(char *split_fields[10], struct fmt_main *self)
 		strcat(identity, uid);
 	}
 	tmp = (char *) mem_alloc(9 + strlen(identity) + 1 + strlen(srv_challenge) + 1 + strlen(nethashv2) + 1 + strlen(cli_challenge) + 1);
-	sprintf(tmp, "$NETLMv2$%s$%s$%s$%s", identity, srv_challenge, nethashv2, cli_challenge);
+	sprintf(tmp, "%s%s$%s$%s$%s", FORMAT_TAG, identity, srv_challenge, nethashv2, cli_challenge);
 	MEM_FREE(identity);
 
 	if (valid(tmp, self)) {
@@ -216,46 +215,45 @@ static char *prepare(char *split_fields[10], struct fmt_main *self)
 		return cp;
 	}
 	MEM_FREE(tmp);
+
 	return split_fields[1];
 }
 
-
 static char *split(char *ciphertext, int index, struct fmt_main *self)
 {
-  static char out[TOTAL_LENGTH + 1];
-  char *pos = NULL;
-  int identity_length = 0;
+	static char out[TOTAL_LENGTH + 1];
+	char *pos = NULL;
+	int identity_length = 0;
 
-  /* Calculate identity length */
-  for (pos = ciphertext + 9; *pos != '$'; pos++);
-  identity_length = pos - (ciphertext + 9);
+	/* Calculate identity length */
+	for (pos = ciphertext + FORMAT_TAG_LEN; *pos != '$'; pos++);
+	identity_length = pos - (ciphertext + FORMAT_TAG_LEN);
 
-  memset(out, 0, TOTAL_LENGTH + 1);
-  memcpy(out, ciphertext, strlen(ciphertext));
-  strlwr(&out[10 + identity_length]); /* Exclude: $NETLMv2$USERDOMAIN$ */
+	memset(out, 0, TOTAL_LENGTH + 1);
+	memcpy(out, ciphertext, strlen(ciphertext));
+	strlwr(&out[FORMAT_TAG_LEN + identity_length + 1]); /* Exclude: $NETLMv2$USERDOMAIN$ */
 
-  return out;
+	return out;
 }
 
 static void *get_binary(char *ciphertext)
 {
-  static uchar *binary;
-  char *pos = NULL;
-  int i, identity_length;
+	static unsigned char *binary;
+	char *pos = NULL;
+	int i, identity_length;
 
-  if (!binary) binary = mem_alloc_tiny(BINARY_SIZE, MEM_ALIGN_WORD);
+	if (!binary) binary = mem_alloc_tiny(BINARY_SIZE, MEM_ALIGN_WORD);
 
-  for (pos = ciphertext + 9; *pos != '$'; pos++);
-  identity_length = pos - (ciphertext + 9);
+	for (pos = ciphertext + FORMAT_TAG_LEN; *pos != '$'; pos++);
+	identity_length = pos - (ciphertext + FORMAT_TAG_LEN);
 
-  ciphertext += 9 + identity_length + 1 + CHALLENGE_LENGTH / 2 + 1;
-  for (i=0; i<BINARY_SIZE; i++)
-  {
-    binary[i] = (atoi16[ARCH_INDEX(ciphertext[i*2])])<<4;
-    binary[i] |= (atoi16[ARCH_INDEX(ciphertext[i*2+1])]);
-  }
+	ciphertext += FORMAT_TAG_LEN + identity_length + 1 + CHALLENGE_LENGTH / 2 + 1;
+	for (i = 0; i < BINARY_SIZE; i++) {
+		binary[i] = (atoi16[ARCH_INDEX(ciphertext[i*2])])<<4;
+		binary[i] |= (atoi16[ARCH_INDEX(ciphertext[i*2+1])]);
+	}
 
-  return binary;
+	return binary;
 }
 
 /* Calculate the LMv2 response for the given challenge, using the
@@ -264,14 +262,13 @@ static void *get_binary(char *ciphertext)
 */
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
+	const int count = *pcount;
 	int i = 0;
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for(i = 0; i < count; i++)
 #endif
-	{
+	for (i = 0; i < count; i++) {
 		unsigned char ntlm_v2_hash[16];
 		HMACMD5Context ctx; // can't be moved above the OMP pragma
 
@@ -305,7 +302,8 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 static int cmp_all(void *binary, int count)
 {
 	int index;
-	for(index=0; index<count; index++)
+
+	for (index = 0; index < count; index++)
 		if (!memcmp(output[index], binary, BINARY_SIZE))
 			return 1;
 	return 0;
@@ -326,43 +324,44 @@ static int cmp_exact(char *source, int index)
 */
 static void *get_salt(char *ciphertext)
 {
-  static unsigned char *binary_salt;
-  unsigned char identity[USERNAME_LENGTH + DOMAIN_LENGTH + 1];
-  UTF16 identity_ucs2[USERNAME_LENGTH + DOMAIN_LENGTH + 1];
-  int i, identity_length;
-  int identity_ucs2_length;
-  char *pos = NULL;
+	static unsigned char *binary_salt;
+	unsigned char identity[USERNAME_LENGTH + DOMAIN_LENGTH + 1];
+	UTF16 identity_ucs2[USERNAME_LENGTH + DOMAIN_LENGTH + 1];
+	int i, identity_length;
+	int identity_ucs2_length;
+	char *pos = NULL;
 
-  if (!binary_salt) binary_salt = mem_alloc_tiny(SALT_SIZE, MEM_ALIGN_WORD);
+	if (!binary_salt) binary_salt = mem_alloc_tiny(SALT_SIZE, MEM_ALIGN_WORD);
 
-  /* Calculate identity length */
-  for (pos = ciphertext + 9; *pos != '$'; pos++);
-  identity_length = pos - (ciphertext + 9);
+	memset(binary_salt, 0, SALT_SIZE);
+	/* Calculate identity length */
+	for (pos = ciphertext + FORMAT_TAG_LEN; *pos != '$'; pos++);
+	identity_length = pos - (ciphertext + FORMAT_TAG_LEN);
 
-  /* Convert identity (username + domain) string to NT unicode */
-  strnzcpy((char *)identity, ciphertext + 9, sizeof(identity));
-  identity_ucs2_length = enc_to_utf16((UTF16 *)identity_ucs2, USERNAME_LENGTH + DOMAIN_LENGTH, (UTF8 *)identity, identity_length) * sizeof(int16);
+	/* Convert identity (username + domain) string to NT unicode */
+	strnzcpy((char *)identity, ciphertext + FORMAT_TAG_LEN, sizeof(identity));
+	identity_ucs2_length = enc_to_utf16((UTF16 *)identity_ucs2, USERNAME_LENGTH + DOMAIN_LENGTH, (UTF8 *)identity, identity_length) * sizeof(int16_t);
 
-  if (identity_ucs2_length < 0) // Truncated at Unicode conversion.
-	  identity_ucs2_length = strlen16((UTF16 *)identity_ucs2) * sizeof(int16);
+	if (identity_ucs2_length < 0) // Truncated at Unicode conversion.
+		identity_ucs2_length = strlen16((UTF16 *)identity_ucs2) * sizeof(int16_t);
 
-  binary_salt[16] = (unsigned char)identity_ucs2_length;
-  memcpy(&binary_salt[17], (char *)identity_ucs2, identity_ucs2_length);
+	binary_salt[16] = (unsigned char)identity_ucs2_length;
+	memcpy(&binary_salt[17], (char *)identity_ucs2, identity_ucs2_length);
 
-  /* Set server challenge */
-  ciphertext += 10 + identity_length;
+	/* Set server challenge */
+	ciphertext += FORMAT_TAG_LEN + identity_length + 1;
 
-  for (i = 0; i < 8; i++)
-    binary_salt[i] = (atoi16[ARCH_INDEX(ciphertext[i*2])] << 4) + atoi16[ARCH_INDEX(ciphertext[i*2+1])];
+	for (i = 0; i < 8; i++)
+		binary_salt[i] = (atoi16[ARCH_INDEX(ciphertext[i*2])] << 4) + atoi16[ARCH_INDEX(ciphertext[i*2+1])];
 
-  /* Set client challenge */
-  ciphertext += 2 + CHALLENGE_LENGTH / 2 + CIPHERTEXT_LENGTH;
+	/* Set client challenge */
+	ciphertext += 2 + CHALLENGE_LENGTH / 2 + CIPHERTEXT_LENGTH;
 
-  for (i = 0; i < 8; ++i)
-    binary_salt[i + 8] = (atoi16[ARCH_INDEX(ciphertext[i*2])] << 4) + atoi16[ARCH_INDEX(ciphertext[i*2+1])];
+	for (i = 0; i < 8; ++i)
+		binary_salt[i + 8] = (atoi16[ARCH_INDEX(ciphertext[i*2])] << 4) + atoi16[ARCH_INDEX(ciphertext[i*2+1])];
 
-  /* Return a concatenation of the server and client challenges and the identity value */
-  return (void*)binary_salt;
+	/* Return a concatenation of the server and client challenges and the identity value */
+	return (void*)binary_salt;
 }
 
 static void set_salt(void *salt)
@@ -372,56 +371,23 @@ static void set_salt(void *salt)
 
 static void set_key(char *key, int index)
 {
-	saved_len[index] = strlen(key);
-	memcpy((char *)saved_plain[index], key, saved_len[index] + 1);
+	saved_len[index] = strnzcpyn((char*)saved_plain[index], key, sizeof(*saved_plain));
 	keys_prepared = 0;
 }
 
 static char *get_key(int index)
 {
-  return (char *)saved_plain[index];
+	return (char *)saved_plain[index];
 }
 
 static int salt_hash(void *salt)
 {
 	// Hash the client challenge (in case server salt was spoofed)
-	return (*(ARCH_WORD_32 *)salt+8) & (SALT_HASH_SIZE - 1);
+	return (*(uint32_t *)salt+8) & (SALT_HASH_SIZE - 1);
 }
 
-static int get_hash_0(int index)
-{
-	return *(ARCH_WORD_32 *)output[index] & 0xF;
-}
-
-static int get_hash_1(int index)
-{
-	return *(ARCH_WORD_32 *)output[index] & 0xFF;
-}
-
-static int get_hash_2(int index)
-{
-	return *(ARCH_WORD_32 *)output[index] & 0xFFF;
-}
-
-static int get_hash_3(int index)
-{
-	return *(ARCH_WORD_32 *)output[index] & 0xFFFF;
-}
-
-static int get_hash_4(int index)
-{
-	return *(ARCH_WORD_32 *)output[index] & 0xFFFFF;
-}
-
-static int get_hash_5(int index)
-{
-	return *(ARCH_WORD_32 *)output[index] & 0xFFFFFF;
-}
-
-static int get_hash_6(int index)
-{
-	return *(ARCH_WORD_32 *)output[index] & 0x7FFFFFF;
-}
+#define COMMON_GET_HASH_VAR output
+#include "common-get-hash.h"
 
 struct fmt_main fmt_NETLMv2 = {
 	{
@@ -430,6 +396,7 @@ struct fmt_main fmt_NETLMv2 = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
 		BINARY_ALIGN,
@@ -437,23 +404,20 @@ struct fmt_main fmt_NETLMv2 = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_OMP | FMT_UNICODE | FMT_UTF8,
-#if FMT_MAIN_VERSION > 11
+		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_OMP | FMT_UNICODE | FMT_ENC,
 		{ NULL },
-#endif
+		{ FORMAT_TAG },
 		tests
 	}, {
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		prepare,
 		valid,
 		split,
 		get_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash_0,
@@ -465,22 +429,20 @@ struct fmt_main fmt_NETLMv2 = {
 			fmt_default_binary_hash_6
 		},
 		salt_hash,
+		NULL,
 		set_salt,
 		set_key,
 		get_key,
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

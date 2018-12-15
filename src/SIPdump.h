@@ -76,7 +76,7 @@ typedef struct {
 
 #include <stdio.h>
 
-void *Malloc(size_t);
+void *Calloc(size_t);
 void *Realloc(void *, size_t);
 char **stringtoarray(char *, char, int *);
 void get_string_input(char *, size_t, const char *, ...);
@@ -102,11 +102,16 @@ void extract_method(char *, const char *, size_t);
 #include <errno.h>
 
 /* malloc() wrapper */
-void *Malloc(size_t size)
+void *Calloc(size_t size)
 {
 	void *buffer;
 
 	buffer = calloc(size, 1);
+
+	if (buffer == NULL) {
+		fprintf(stderr, "%s:%d: malloc failed\n", __FUNCTION__, __LINE__);
+		exit(EXIT_FAILURE);
+	}
 
 	return (buffer);
 }
@@ -118,7 +123,7 @@ void *Realloc(void *buffer, size_t size)
 	buffer = realloc(buffer, size);
 
 	if (buffer == NULL) {
-		fprintf(stderr, "realloc() failed: %s\n", strerror(errno));
+		fprintf(stderr, "%s:%d: malloc failed\n", __FUNCTION__, __LINE__);
 		exit(EXIT_FAILURE);
 	}
 
@@ -143,7 +148,10 @@ char **stringtoarray(char *string, char delimiter, int *size)
 		*ptr++ = 0x00;
 		(*size)++;
 
-		array = realloc(array, (count + 1) * sizeof(char *));
+		if (!(array = realloc(array, (count + 1) * sizeof(char *)))) {
+			fprintf(stderr, "realloc failed\n");
+			exit(1);
+		}
 		array[count] = strdup(oldptr);
 	}
 	return array;
@@ -255,14 +263,14 @@ void write_login_data(login_t * data, const char *file)
 void update_login_data(login_t * data, const char *pw, const char *file)
 {
 	FILE *login_file, *temp_file;
-	char buffer[1024], orig_string[1024];
+	char buffer[2048], orig_string[2048];
 	char *tempfile;
 	size_t tempfile_len;
 
 	debug(("update_login_data(): %s", file));
 
 	tempfile_len = (strlen(file) + strlen(".tmp") + 1);
-	tempfile = (char *) Malloc(tempfile_len);
+	tempfile = (char *) Calloc(tempfile_len);
 
 	snprintf(tempfile, tempfile_len, "%s.tmp", file);
 
@@ -331,7 +339,7 @@ int find_value(const char *value, const char *buffer, char *outbuf,
 	ptr1 += strlen(value);
 
 	b = strlen(ptr1);
-	tempbuf = Malloc(b + 1);
+	tempbuf = Calloc(b + 1);
 
 	/* value is quoted */
 	if (ptr1[0] == '"') {
@@ -353,8 +361,8 @@ int find_value(const char *value, const char *buffer, char *outbuf,
 		}
 	}
 
-	strncpy(outbuf, tempbuf, outbuf_len);
-	outbuf[outbuf_len] = 0;
+	strncpy(outbuf, tempbuf, outbuf_len - 1);
+	outbuf[outbuf_len - 1] = 0;
 	free(tempbuf);
 
 	debug(("find_value: %s'%s'", value, outbuf));
@@ -367,7 +375,7 @@ void Toupper(char *buffer, size_t buffer_len)
 	int i;
 
 	for (i = 0; i < buffer_len; i++)
-		buffer[i] = toupper(buffer[i]);
+		buffer[i] = toupper(ARCH_INDEX(buffer[i]));
 
 	return;
 }

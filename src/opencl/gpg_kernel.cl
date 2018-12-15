@@ -1,434 +1,314 @@
 /*
- *  FIPS-180-1 compliant SHA-1 implementation
+ * Modified by Dhiru Kholia <dhiru at openwall.com> for GPG format.
  *
- *  Copyright (C) 2006-2010, Brainspark B.V.
+ * This software is Copyright (c) 2012 Lukas Odzioba <ukasz@openwall.net>
+ * and it is hereby released to the general public under the following terms:
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted.
  *
- *  This file is part of PolarSSL (http://www.polarssl.org)
- *  Lead Maintainer: Paul Bakker <polarssl_maintainer at polarssl.org>
+ * Converted to use 'common' code, Feb29-Mar1 2016, JimF.
  *
- *  All rights reserved.
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along
- *  with this program; if not, write to the Free Software Foundation, Inc.,
- *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
- */
-/*
- *  The SHA-1 standard was published by NIST in 1993.
- *
- *  http://www.itl.nist.gov/fipspubs/fip180-1.htm
+ * Added SHA-256 based S2K support, October 2017, Dhiru.
  */
 
 #include "opencl_device_info.h"
+#include "opencl_misc.h"
+#include "opencl_sha1_ctx.h"
+#include "opencl_sha2_ctx.h"
 
-#if gpu_amd(DEVICE_INFO)
-#define USE_BITSELECT
+#ifndef PLAINTEXT_LENGTH
+#error PLAINTEXT_LENGTH must be defined
+#endif
+#ifndef SALT_LENGTH
+#error SALT_LENGTH must be defined
 #endif
 
-#define  uint8_t		uchar
-#define uint16_t		ushort
-#define uint32_t		uint
-
-/*
- * 32-bit integer manipulation macros (big endian)
- */
-
-#ifndef GET_UINT_BE
-#define GET_UINT_BE(n,b,i)	  \
-	{ \
-		(n) = ( (uint32_t) (b)[(i)    ] << 24 ) \
-			| ( (uint32_t) (b)[(i) + 1] << 16 ) \
-			| ( (uint32_t) (b)[(i) + 2] <<  8 ) \
-			| ( (uint32_t) (b)[(i) + 3]       ); \
-	}
+#ifndef SHA_DIGEST_LENGTH
+#define SHA_DIGEST_LENGTH 20
 #endif
-
-#ifndef PUT_UINT_BE
-#define PUT_UINT_BE(n,b,i)	  \
-	{ \
-		(b)[(i)    ] = (uchar) ( (n) >> 24 ); \
-		(b)[(i) + 1] = (uchar) ( (n) >> 16 ); \
-		(b)[(i) + 2] = (uchar) ( (n) >>  8 ); \
-		(b)[(i) + 3] = (uchar) ( (n)       ); \
-	}
-#endif
-
-inline void* _memcpy(void* dest, __global const uchar *src, int count)
-{
-	char* dst8 = (char*)dest;
-	__global uchar* src8 = (__global uchar*)src;
-
-	while (count--) {
-		*dst8++ = *src8++;
-	}
-	return dest;
-}
-
-inline void* _memcpy_(void* dest, const uchar *src, int count)
-{
-	char* dst8 = (char*)dest;
-	uchar* src8 = (uchar*)src;
-
-	while (count--) {
-		*dst8++ = *src8++;
-	}
-	return dest;
-}
 
 typedef struct {
-        uint32_t length;
-        uint8_t v[PLAINTEXT_LENGTH];
+	uint length;
+	uchar v[PLAINTEXT_LENGTH];
 } gpg_password;
 
 typedef struct {
-	uint8_t v[16];
+	uchar v[32];
 } gpg_hash;
 
 typedef struct {
-        uint32_t length;
-	uint32_t count;
-        uint8_t salt[8];
+	uint length;
+	uint count;
+	uint key_len;
+	uchar salt[SALT_LENGTH];
 } gpg_salt;
 
-/*
- * SHA-1 context setup
- */
+// Slower on CPU
+// 40% faster on Intel HD4000
+// Bugs out on nvidia
+#if !__CPU__ && !gpu_nvidia(DEVICE_INFO)
+#define LEAN
+#endif
 
-typedef struct
+#ifndef __MESA__
+inline
+#endif
+void S2KItSaltedSHA1Generator(__global const uchar *password,
+                                     uint password_length,
+                                     __constant uchar *salt,
+                                     uint _count,
+                                     __global uchar *key,
+                                     uint key_len)
 {
-	uint32_t total;        /*!< number of bytes processed  */
-	uint32_t state[5];     /*!< intermediate digest state  */
-	uint8_t buffer[64];    /*!< data block being processed */
-}
-	sha1_context;
+	SHA_CTX ctx;
+	const uint tl = password_length + SALT_LENGTH;
+	uint i, j=0, n, count;
 
-inline void sha1_init( sha1_context *ctx )
-{
-	ctx->total = 0;
-
-	ctx->state[0] = 0x67452301;
-	ctx->state[1] = 0xEFCDAB89;
-	ctx->state[2] = 0x98BADCFE;
-	ctx->state[3] = 0x10325476;
-	ctx->state[4] = 0xC3D2E1F0;
-}
-
-inline void sha1_process( sha1_context *ctx, const uchar data[64] )
-{
-	uint32_t temp, W[16], A, B, C, D, E;
-
-	GET_UINT_BE( W[ 0], data,  0 );
-	GET_UINT_BE( W[ 1], data,  4 );
-	GET_UINT_BE( W[ 2], data,  8 );
-	GET_UINT_BE( W[ 3], data, 12 );
-	GET_UINT_BE( W[ 4], data, 16 );
-	GET_UINT_BE( W[ 5], data, 20 );
-	GET_UINT_BE( W[ 6], data, 24 );
-	GET_UINT_BE( W[ 7], data, 28 );
-	GET_UINT_BE( W[ 8], data, 32 );
-	GET_UINT_BE( W[ 9], data, 36 );
-	GET_UINT_BE( W[10], data, 40 );
-	GET_UINT_BE( W[11], data, 44 );
-	GET_UINT_BE( W[12], data, 48 );
-	GET_UINT_BE( W[13], data, 52 );
-	GET_UINT_BE( W[14], data, 56 );
-	GET_UINT_BE( W[15], data, 60 );
-
-#if gpu(DEVICE_INFO)
-#define S(x,n) (rotate(x, (uint)n))
+#ifdef LEAN
+	uchar keybuf[128 + 64+1 + PLAINTEXT_LENGTH + SALT_LENGTH];
 #else
-#define S(x,n) ((x << n) | ((x & 0xFFFFFFFF) >> (32 - n)))
+	uchar keybuf[64 * (PLAINTEXT_LENGTH + SALT_LENGTH)];
+	uint bs;
 #endif
 
-#define R(t)	  \
-	( \
-	 temp = W[(t -  3) & 0x0F] ^ W[(t - 8) & 0x0F] ^ \
-	 W[(t - 14) & 0x0F] ^ W[ t      & 0x0F], \
-	 ( W[t & 0x0F] = S(temp,1) ) \
-	                                                        )
+	for (i = 0; ; ++i) {
+		count = _count;
+		SHA1_Init(&ctx);
+#ifdef LEAN
+		for (j=0;j<i;++j)
+			keybuf[j] = 0;
+		n = j;
+		memcpy_cp(keybuf + j, salt, SALT_LENGTH);
+		memcpy_gp(keybuf + j + SALT_LENGTH, password, password_length);
+		j += tl;
 
-#define P(a,b,c,d,e,x)	  \
-	{ \
-		e += S(a,5) + F(b,c,d) + K + x; b = S(b,30); \
-	}
+		while (j < 128 + 64+1) {
+			memcpy_pp(keybuf + j, keybuf + n, tl);
+			j += tl;
+		}
 
-	A = ctx->state[0];
-	B = ctx->state[1];
-	C = ctx->state[2];
-	D = ctx->state[3];
-	E = ctx->state[4];
-
-#ifdef USE_BITSELECT
-#define F(x, y, z)	bitselect(z, y, x)
+		SHA1_Update(&ctx, keybuf, 64);
+		count -= (64-i);
+		j = 64;
+		while (count >= 64) {
+			SHA1_Update(&ctx, &keybuf[j], 64);
+			count -= 64;
+			j = j % tl + 64;
+		}
+		if (count) SHA1_Update(&ctx, &keybuf[j], count);
 #else
-#define F(x, y, z)	(z ^ (x & (y ^ z)))
-#endif
-#define K 0x5A827999
-
-	P( A, B, C, D, E, W[0]  );
-	P( E, A, B, C, D, W[1]  );
-	P( D, E, A, B, C, W[2]  );
-	P( C, D, E, A, B, W[3]  );
-	P( B, C, D, E, A, W[4]  );
-	P( A, B, C, D, E, W[5]  );
-	P( E, A, B, C, D, W[6]  );
-	P( D, E, A, B, C, W[7]  );
-	P( C, D, E, A, B, W[8]  );
-	P( B, C, D, E, A, W[9]  );
-	P( A, B, C, D, E, W[10] );
-	P( E, A, B, C, D, W[11] );
-	P( D, E, A, B, C, W[12] );
-	P( C, D, E, A, B, W[13] );
-	P( B, C, D, E, A, W[14] );
-	P( A, B, C, D, E, W[15] );
-	P( E, A, B, C, D, R(16) );
-	P( D, E, A, B, C, R(17) );
-	P( C, D, E, A, B, R(18) );
-	P( B, C, D, E, A, R(19) );
-
-#undef K
-#undef F
-
-#define F(x,y,z) (x ^ y ^ z)
-#define K 0x6ED9EBA1
-
-	P( A, B, C, D, E, R(20) );
-	P( E, A, B, C, D, R(21) );
-	P( D, E, A, B, C, R(22) );
-	P( C, D, E, A, B, R(23) );
-	P( B, C, D, E, A, R(24) );
-	P( A, B, C, D, E, R(25) );
-	P( E, A, B, C, D, R(26) );
-	P( D, E, A, B, C, R(27) );
-	P( C, D, E, A, B, R(28) );
-	P( B, C, D, E, A, R(29) );
-	P( A, B, C, D, E, R(30) );
-	P( E, A, B, C, D, R(31) );
-	P( D, E, A, B, C, R(32) );
-	P( C, D, E, A, B, R(33) );
-	P( B, C, D, E, A, R(34) );
-	P( A, B, C, D, E, R(35) );
-	P( E, A, B, C, D, R(36) );
-	P( D, E, A, B, C, R(37) );
-	P( C, D, E, A, B, R(38) );
-	P( B, C, D, E, A, R(39) );
-
-#undef K
-#undef F
-
-#ifdef USE_BITSELECT
-#define F(x, y, z)	(bitselect(x, y, z) ^ bitselect(x, 0U, y))
-#else
-#define F(x, y, z)	((x & y) | (z & (x | y)))
-#endif
-#define K 0x8F1BBCDC
-
-	P( A, B, C, D, E, R(40) );
-	P( E, A, B, C, D, R(41) );
-	P( D, E, A, B, C, R(42) );
-	P( C, D, E, A, B, R(43) );
-	P( B, C, D, E, A, R(44) );
-	P( A, B, C, D, E, R(45) );
-	P( E, A, B, C, D, R(46) );
-	P( D, E, A, B, C, R(47) );
-	P( C, D, E, A, B, R(48) );
-	P( B, C, D, E, A, R(49) );
-	P( A, B, C, D, E, R(50) );
-	P( E, A, B, C, D, R(51) );
-	P( D, E, A, B, C, R(52) );
-	P( C, D, E, A, B, R(53) );
-	P( B, C, D, E, A, R(54) );
-	P( A, B, C, D, E, R(55) );
-	P( E, A, B, C, D, R(56) );
-	P( D, E, A, B, C, R(57) );
-	P( C, D, E, A, B, R(58) );
-	P( B, C, D, E, A, R(59) );
-
-#undef K
-#undef F
-
-#define F(x,y,z) (x ^ y ^ z)
-#define K 0xCA62C1D6
-
-	P( A, B, C, D, E, R(60) );
-	P( E, A, B, C, D, R(61) );
-	P( D, E, A, B, C, R(62) );
-	P( C, D, E, A, B, R(63) );
-	P( B, C, D, E, A, R(64) );
-	P( A, B, C, D, E, R(65) );
-	P( E, A, B, C, D, R(66) );
-	P( D, E, A, B, C, R(67) );
-	P( C, D, E, A, B, R(68) );
-	P( B, C, D, E, A, R(69) );
-	P( A, B, C, D, E, R(70) );
-	P( E, A, B, C, D, R(71) );
-	P( D, E, A, B, C, R(72) );
-	P( C, D, E, A, B, R(73) );
-	P( B, C, D, E, A, R(74) );
-	P( A, B, C, D, E, R(75) );
-	P( E, A, B, C, D, R(76) );
-	P( D, E, A, B, C, R(77) );
-	P( C, D, E, A, B, R(78) );
-	P( B, C, D, E, A, R(79) );
-
-#undef K
-#undef F
-
-	ctx->state[0] += A;
-	ctx->state[1] += B;
-	ctx->state[2] += C;
-	ctx->state[3] += D;
-	ctx->state[4] += E;
-}
-
-/*
- * SHA-1 process buffer
- */
-inline void sha1_update( sha1_context *ctx, const uchar *input, int ilen )
-{
-	int fill;
-	uint32_t left;
-
-	if( ilen <= 0 )
-		return;
-
-	left = ctx->total & 0x3F;
-	fill = 64 - left;
-
-	ctx->total += (uint32_t) ilen;
-
-	if( left && ilen >= fill )
-	{
-		_memcpy_( (void *) (ctx->buffer + left),
-		          input, fill );
-		sha1_process( ctx, ctx->buffer );
-		input += fill;
-		ilen  -= fill;
-		left = 0;
-	}
-
-	while( ilen >= 64 )
-	{
-		sha1_process( ctx, input );
-		input += 64;
-		ilen  -= 64;
-	}
-
-	if( ilen > 0 )
-	{
-		_memcpy_( (void *) (ctx->buffer + left),
-		          input, ilen );
-	}
-}
-
-/*
- * SHA-1 final digest
- */
-inline void sha1_final( sha1_context *ctx, uchar output[20] )
-{
-	uint32_t last, padn;
-	uint32_t bits;
-	uchar msglen[8];
-	uchar sha1_padding[64] = {
-		0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-	};
-
-	bits  = ctx->total <<  3;
-
-	PUT_UINT_BE( 0, msglen, 0 );
-	PUT_UINT_BE( bits,  msglen, 4 );
-
-	last = ctx->total & 0x3F;
-	padn = ( last < 56 ) ? ( 56 - last ) : ( 120 - last );
-
-	sha1_update( ctx, sha1_padding, padn );
-	sha1_update( ctx, msglen, 8 );
-
-	PUT_UINT_BE( ctx->state[0], output,  0 );
-	PUT_UINT_BE( ctx->state[1], output,  4 );
-	PUT_UINT_BE( ctx->state[2], output,  8 );
-	PUT_UINT_BE( ctx->state[3], output, 12 );
-	PUT_UINT_BE( ctx->state[4], output, 16 );
-}
-
-#define KEYBUFFER_LENGTH (64 * (PLAINTEXT_LENGTH + 8))
-#define SHA_DIGEST_LENGTH 20
-
-inline void S2KItSaltedSHA1Generator(__global const uchar *password, int password_length, __global const uchar *salt, int count, __global uchar *key, int length)
-{
-	uchar keybuf[KEYBUFFER_LENGTH];
-	sha1_context ctx;
-	uchar *bptr;
-#if PLAINTEXT_LENGTH > 20
-	int i;
-	int numHashes = (length + SHA_DIGEST_LENGTH - 1) / SHA_DIGEST_LENGTH;
-	const uchar pad[(PLAINTEXT_LENGTH + SHA_DIGEST_LENGTH - 1) / SHA_DIGEST_LENGTH] = { 0 };
-#endif
-	uchar lkey[20];
-	int outlen = 0;
-
-	_memcpy(keybuf, salt, 8);
-	_memcpy(keybuf + 8, password, password_length);
-
-	// TODO: This is not very efficient with multiple hashes
-#if PLAINTEXT_LENGTH > 20
-	for (i = 0; i < numHashes; i++)
-#endif
-	{
-		int tl;
-		int mul;
-		int bs;
-		int n;
-
-		sha1_init(&ctx);
-
-#if PLAINTEXT_LENGTH > 20
-		if (i)
-			sha1_update(&ctx, pad, i);
-#endif
 		// Find multiplicator
-		tl = password_length + 8;
-		mul = 1;
-		while (mul < tl && ((64 * mul) % tl)) {
-			++mul;
+		n = 1;
+		while (n < tl && ((64 * n) % tl)) {
+			++n;
 		}
-		// Try to feed the hash function with 64-byte blocks
-		bs = mul * 64;
-		bptr = keybuf + tl;
-		n = bs / tl;
-		while (n-- > 1) {
-			_memcpy_(bptr, keybuf, tl);
-			bptr += tl;
+		// this is an optimization (surprisingly). I get about 10%
+		// better on oSSL, and I can run this on my tahiti with this
+		// optimization turned on, without crashing the video driver.
+		// it is still slower than the LEAN code on the tahiti, but
+		// only about 5% slower.  We might be able to find a sweet
+		// spot, AND possibly improve times on the LEAN code, since
+		// it is only processing 1 64 byte block per call.
+#define BIGGER_SMALL_BUFS 1
+#if BIGGER_SMALL_BUFS
+		if (n < 7) {
+			// evenly divisible multiples of each count. We simply want
+			// to cut down on the calls to SHA1_Update, I think.
+			const uint incs[] = {0,8,8,9,8,10,12};
+			n = incs[n];
 		}
-		n = count / bs;
-		while (n-- > 0) {
-			sha1_update(&ctx, keybuf, bs);
+#endif
+		bs = n * 64;
+		for (j = 0; j < i; j++) {
+			keybuf[j] = 0;
 		}
-		sha1_update(&ctx, keybuf, count % bs);
-		sha1_final(&ctx, lkey);
+		n = j;
 
-		for(n = 0; n < length && outlen < length; n++)
-			key[outlen++] = lkey[n];
+		memcpy_cp(keybuf + j, salt, SALT_LENGTH);
+		memcpy_gp(keybuf + j + SALT_LENGTH, password, password_length);
+		j += tl;
+		while (j+i <= bs+64) { // bs+64 since we need 1 'pre' block that may be dirty.
+			memcpy_pp(keybuf + j, keybuf + n, tl);
+			j += tl;
+		}
+		// first buffer 'may' have appended nulls.  So we may actually
+		// be processing LESS than 64 bytes of the count. Thus we have
+		// -i in the count expression.
+		SHA1_Update(&ctx, keybuf, 64);
+		count -= (64-i);
+		while (count > bs) {
+			SHA1_Update(&ctx, keybuf + 64, bs);
+			count -= bs;
+		}
+		if (count) SHA1_Update(&ctx, keybuf + 64, count);
+#endif
+		SHA1_Final(keybuf, &ctx);
+
+		j = i * SHA_DIGEST_LENGTH;
+		for (n = 0; j < key_len && n < SHA_DIGEST_LENGTH; ++j, ++n)
+			key[j] = keybuf[n];
+		if (j == key_len)
+			return;
 	}
 }
 
-__kernel void gpg(__global const gpg_password * inbuffer,
-                  __global gpg_hash * outbuffer, __global const gpg_salt * salt)
+__kernel void gpg(__global const gpg_password *inbuffer,
+                  __global gpg_hash *outbuffer,
+                  __constant gpg_salt *salt)
 {
-	uint32_t idx = get_global_id(0);
+	uint idx = get_global_id(0);
 
-	S2KItSaltedSHA1Generator(inbuffer[idx].v, inbuffer[idx].length,
-	                         salt->salt, salt->count, outbuffer[idx].v, 16);
+	S2KItSaltedSHA1Generator(inbuffer[idx].v,
+	                         inbuffer[idx].length,
+	                         salt->salt,
+	                         salt->count,
+	                         outbuffer[idx].v,
+	                         salt->key_len);
+}
+
+/* SHA-256 based S2K */
+
+#ifndef SHA256_DIGEST_LENGTH
+#define SHA256_DIGEST_LENGTH 32
+#endif
+
+#ifndef __MESA__
+inline
+#endif
+void S2KItSaltedSHA256Generator(__global const uchar *ipassword,
+                                     uint password_length,
+                                     __constant uchar *isalt,
+                                     uint count, // iterations
+                                     __global uchar *okey,
+                                     uint key_length)
+{
+	// This code is based on "openpgp_s2k" function from Libgcrypt.
+	const uint salt_length = 8; // fixed
+	const uint num = (key_length - 1) / SHA256_DIGEST_LENGTH + 1;
+	uchar password[PLAINTEXT_LENGTH];
+	const uint b[1] = { 0 };
+	uchar salt[8];
+	uint bytes;
+	uint i, j;
+
+	bytes = password_length + salt_length;
+	memcpy_cp(salt, isalt, 8);
+	memcpy_gp(password, ipassword, password_length);
+	if (count < bytes)
+		count = bytes;
+
+	for (i = 0; i < num; i++) { // runs only once when key_len <= 32
+		SHA256_CTX ctx;
+		uchar key[SHA256_DIGEST_LENGTH];
+
+		SHA256_Init(&ctx);
+		for (j = 0; j < i; j++) { // not really used
+			SHA256_Update(&ctx, (uchar*)b, 1);
+		}
+
+		while (count > bytes) {
+			SHA256_Update(&ctx, salt, salt_length);
+			SHA256_Update(&ctx, password, password_length);
+			count = count - bytes;
+		}
+
+		if (count < salt_length) {
+			SHA256_Update(&ctx, salt, count);
+		} else {
+			SHA256_Update(&ctx, salt, salt_length);
+			count = count - salt_length;
+			SHA256_Update(&ctx, password, count);
+		}
+		SHA256_Final(key, &ctx);
+		memcpy_pg(okey + (i * SHA256_DIGEST_LENGTH), key,
+				MIN(key_length, SHA256_DIGEST_LENGTH));
+	}
+}
+
+__kernel void gpg_sha256(__global const gpg_password *inbuffer,
+		__global gpg_hash *outbuffer,
+		__constant gpg_salt *salt)
+{
+	uint idx = get_global_id(0);
+
+	S2KItSaltedSHA256Generator(inbuffer[idx].v,
+			inbuffer[idx].length,
+			salt->salt,
+			salt->count,
+			outbuffer[idx].v,
+			salt->key_len);
+}
+
+/* SHA-512 based S2K */
+
+#ifndef SHA512_DIGEST_LENGTH
+#define SHA512_DIGEST_LENGTH 64
+#endif
+
+#ifndef __MESA__
+inline
+#endif
+void S2KItSaltedSHA512Generator(__global const uchar *ipassword,
+                                     uint password_length,
+                                     __constant uchar *isalt,
+                                     uint count, // iterations
+                                     __global uchar *okey,
+                                     uint key_length)
+{
+	// This code is based on "openpgp_s2k" function from Libgcrypt.
+	const uint salt_length = 8; // fixed
+	const uint num = (key_length - 1) / SHA512_DIGEST_LENGTH + 1;
+	uchar password[PLAINTEXT_LENGTH];
+	const uint b[1] = { 0 };
+	uchar salt[8];
+	uint bytes;
+	uint i, j;
+
+	bytes = password_length + salt_length;
+	memcpy_cp(salt, isalt, 8);
+	memcpy_gp(password, ipassword, password_length);
+	if (count < bytes)
+		count = bytes;
+
+	for (i = 0; i < num; i++) {
+		SHA512_CTX ctx;
+		uchar key[SHA512_DIGEST_LENGTH];
+
+		SHA512_Init(&ctx);
+		for (j = 0; j < i; j++) { // not really used
+			SHA512_Update(&ctx, (uchar*)b, 1);
+		}
+
+		while (count > bytes) {
+			SHA512_Update(&ctx, salt, salt_length);
+			SHA512_Update(&ctx, password, password_length);
+			count = count - bytes;
+		}
+
+		if (count < salt_length) {
+			SHA512_Update(&ctx, salt, count);
+		} else {
+			SHA512_Update(&ctx, salt, salt_length);
+			count = count - salt_length;
+			SHA512_Update(&ctx, password, count);
+		}
+		SHA512_Final(key, &ctx);
+
+		memcpy_pg(okey + (i * SHA512_DIGEST_LENGTH), key,
+				MIN(key_length, 32));  // 32 bytes is the maximum?
+	}
+}
+
+__kernel void gpg_sha512(__global const gpg_password *inbuffer,
+		__global gpg_hash *outbuffer,
+		__constant gpg_salt *salt)
+{
+	uint idx = get_global_id(0);
+
+	S2KItSaltedSHA512Generator(inbuffer[idx].v,
+			inbuffer[idx].length,
+			salt->salt,
+			salt->count,
+			outbuffer[idx].v,
+			salt->key_len);
 }

@@ -25,6 +25,9 @@
 #define ARCH_BITS_STR			"32"
 #define ARCH_LITTLE_ENDIAN		1
 #define ARCH_INT_GT_32			0
+#endif
+
+#if !defined(ARCH_ALLOWS_UNALIGNED)
 #define ARCH_ALLOWS_UNALIGNED		1
 #endif
 #define ARCH_INDEX(x)			((unsigned int)(unsigned char)(x))

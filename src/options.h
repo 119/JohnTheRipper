@@ -24,6 +24,7 @@
 #include "list.h"
 #include "loader.h"
 #include "getopt.h"
+#include "john_mpi.h"
 
 /*
  * Core Option flags bitmasks (low 32 bits):
@@ -46,7 +47,8 @@
 /* Wordlist mode enabled, options.wordlist is set to the file name, or
  * we get it from john.conf */
 #define FLG_WORDLIST_CHK		0x00000080
-#define FLG_WORDLIST_SET		(FLG_WORDLIST_CHK | FLG_CRACKING_SET)
+#define FLG_WORDLIST_SET \
+	(FLG_WORDLIST_CHK | FLG_CRACKING_SET | FLG_RULES_ALLOW)
 /* Wordlist mode enabled, reading from stdin */
 #define FLG_STDIN_CHK			0x00000100
 #define FLG_STDIN_SET			(FLG_STDIN_CHK | FLG_WORDLIST_SET)
@@ -58,9 +60,10 @@
 /* Incremental mode enabled */
 #define FLG_INC_CHK			0x00000800
 #define FLG_INC_SET			(FLG_INC_CHK | FLG_CRACKING_SET)
-/* Mask mode enabled */
+/* Mask mode enabled (might be hybrid) */
 #define FLG_MASK_CHK			0x00001000
-#define FLG_MASK_SET			(FLG_MASK_CHK | FLG_CRACKING_SET)
+#define FLG_MASK_SET \
+	(FLG_MASK_CHK | FLG_ACTION | FLG_CRACKING_SUP | FLG_PWD_SUP)
 /* External mode or word filter enabled */
 #define FLG_EXTERNAL_CHK		0x00002000
 #define FLG_EXTERNAL_SET \
@@ -90,6 +93,16 @@
 #define FLG_TEST_CHK			0x00400000
 #define FLG_TEST_SET \
 	(FLG_TEST_CHK | FLG_CRACKING_SUP | FLG_ACTION)
+#ifdef HAVE_FUZZ
+/* Perform a fuzzing */
+#define FLG_FUZZ_CHK			0x08000000
+#define FLG_FUZZ_SET \
+	(FLG_FUZZ_CHK | FLG_CRACKING_SUP | FLG_ACTION)
+/* Dump fuzzed hashes */
+#define FLG_FUZZ_DUMP_CHK		0x40000000
+#define FLG_FUZZ_DUMP_SET \
+	(FLG_FUZZ_DUMP_CHK | FLG_CRACKING_SUP | FLG_ACTION)
+#endif
 /* Passwords per salt requested */
 #define FLG_SALTS			0x01000000
 /* Ciphertext format forced */
@@ -108,7 +121,12 @@
  *
  * Tip: For your private patches, pick first free from MSB. When
  * sharing your patch, pick first free from LSB of high 32 bits.
+ *
+ * In Jumbo, the combination flg_set == FLG_ZERO and req_clr == OPT_REQ_PARAM
+ * gets dupe checking automatically, without a specific flag.
  */
+#define FLG_ZERO			0x0
+
 /* .pot file used as wordlist, options.wordlist is set to the file name, or
  * we use the active .pot file */
 #define FLG_LOOPBACK_CHK		0x0000000100000000ULL
@@ -139,32 +157,48 @@
 #define FLG_NOTESTS			0x0000080000000000ULL
 /* Regex cracking mode */
 #define FLG_REGEX_CHK			0x0000100000000000ULL
-#define FLG_REGEX_SET			(FLG_REGEX_CHK | FLG_CRACKING_SET)
-/* Encodings. You can only give one of --intermediate-enc or --target-enc */
+#define FLG_REGEX_SET	  \
+	(FLG_REGEX_CHK | FLG_ACTION | FLG_CRACKING_SUP | FLG_PWD_SUP)
+/* Encodings. You can only give one of --internal-enc or --target-enc */
 #define FLG_INPUT_ENC			0x0000200000000000ULL
 #define FLG_SECOND_ENC			0x0000400000000000ULL
-/* Old Jumbo options. They can do without the flags but options parsing
-   would not catch duplicate options, leading to undefined behavior. */
-#define FLG_POT				0x0000800000000000ULL
-#define FLG_SUBFORMAT			0x0001000000000000ULL
-#define FLG_MEM_FILE_SIZE		0x0002000000000000ULL
-#define FLG_FIELDSEP			0x0004000000000000ULL
-#define FLG_CONFIG			0x0008000000000000ULL
-#define FLG_MKPC			0x0010000000000000ULL
-#define FLG_MINLEN			0x0020000000000000ULL
-#define FLG_MAXLEN			0x0040000000000000ULL
-#define FLG_MAXRUN			0x0080000000000000ULL
-#define FLG_PROGRESS			0x0100000000000000ULL
-#define FLG_REGEN			0x0200000000000000ULL
-#define FLG_BARE			0x0400000000000000ULL
-#define FLG_VERBOSITY			0x0800000000000000ULL
-#define FLG_PLATFORM			0x1000000000000000ULL
-#define FLG_DEVICE			0x2000000000000000ULL
-/* Tunable cost ranges requested */
-#define FLG_COSTS			0x4000000000000000ULL
-/* Markov stats */
-#define FLG_MKV_STATS			0x8000000000000000ULL
-/* Gee we're out of flags again */
+/* --verbosity */
+#define FLG_VERBOSITY			0x0000800000000000ULL
+/* Sets FMT_NOT_EXACT, searching for cleartext collisions */
+#define FLG_KEEP_GUESSING		0x0001000000000000ULL
+/* Loops self-test forever */
+#define FLG_LOOPTEST			0x0002000000000000ULL
+/* Mask mode is stacked */
+#define FLG_MASK_STACKED		0x0004000000000000ULL
+/* Stacking modes */
+#define FLG_STACKING			(FLG_MASK_CHK | FLG_REGEX_CHK)
+/* Any stacking mode is active */
+#define FLG_STACKED			(FLG_MASK_STACKED | FLG_REGEX_STACKED)
+/* PRINCE mode enabled, options.wordlist is set to the file name, or
+ * we get it from john.conf */
+#define FLG_PRINCE_CHK			0x0008000000000000ULL
+#define FLG_PRINCE_SET \
+	(FLG_PRINCE_CHK | FLG_CRACKING_SET | FLG_RULES_ALLOW)
+#define FLG_PRINCE_DIST			0x0010000000000000ULL
+#define FLG_PRINCE_KEYSPACE		0x0020000000000000ULL
+#define FLG_PRINCE_CASE_PERMUTE		0x0040000000000000ULL
+#define FLG_PRINCE_LOOPBACK		0x0080000000000000ULL
+#define FLG_PRINCE_MMAP			0x0100000000000000ULL
+#define FLG_RULES_ALLOW			0x0200000000000000ULL
+#define FLG_REGEX_STACKED		0x0400000000000000ULL
+/* Subsets cracking mode */
+#define FLG_SUBSETS_CHK			0x0800000000000000ULL
+#define FLG_SUBSETS_SET \
+	(FLG_SUBSETS_CHK | FLG_CRACKING_SET)
+
+/*
+ * Macro for getting correct node number regardless of if MPI or not
+ */
+#if HAVE_MPI
+#define NODE (mpi_p > 1 ? mpi_id + 1 : options.node_min)
+#else
+#define NODE options.node_min
+#endif
 
 /*
  * Structure with option flags and all the parameters.
@@ -185,24 +219,14 @@ struct options_main {
 /* Ciphertext format name */
 	char *format;
 
-/* Ciphertext subformat name */
-	char *subformat;
-
 /* Wordlist file name */
 	char *wordlist;
 
 /* Incremental mode name or charset file name */
 	char *charset;
 
-/* Mask mode's mask */
-	char *mask;
-
 /* External mode or word filter name */
 	char *external;
-
-/* Markov stuff */
-	char *mkv_param;
-	char *mkv_stats;
 
 /* Maximum plaintext length for stdout mode */
 	int length;
@@ -211,8 +235,38 @@ struct options_main {
 	char *node_str;
 	unsigned int node_min, node_max, node_count, fork;
 
+/*
+ * ---- Jumbo options below this point ----
+ * Do NOT place any new Jumbo stuff above 'subformat'. It's used to
+ * calculate offset for a memset at resuming a session.
+ */
+
+/* Ciphertext subformat name */
+	char *subformat;
+
+/* Single mode seed word (--single-seed) */
+	char *seed_word;
+
+/* Single mode seed wordlist file name (--single-wordlist) */
+	char *seed_file;
+
 /* Configuration file name */
 	char *config;
+
+/* Markov stuff */
+	char *mkv_param;
+	char *mkv_stats;
+
+#ifdef HAVE_FUZZ
+/* Fuzz dictionary file name */
+	char *fuzz_dic;
+
+/* Fuzz dump hashes between from and to */
+	char *fuzz_dump;
+#endif
+
+/* Mask mode's mask */
+	char *mask;
 
 /* Can't use HAVE_WINDOWS_H here so the below need to be maintained */
 #if defined (_MSC_VER) || defined (__MINGW32__) || defined (__CYGWIN32__)
@@ -227,9 +281,56 @@ struct options_main {
 /* Maximum size of a wordlist file to be 'preloaded' into memory  */
 	size_t max_wordfile_memory;
 
-/* number of times fix_state_delay is called in wordfile.c before  any fseek()
+/* number of times fix_state_delay is called in wordlist.c before  any fseek()
    is done. */
 	unsigned int max_fix_state_delay;
+
+/* In general, an encoding of 0 (CP_UNDEF) means no conversion and we will
+   behave more or less like core John. */
+
+/* Currently initialized non-utf8 encoding */
+	int unicode_cp;
+
+/* Input encoding for word lists, and/or pot file clear-texts. */
+	int input_enc;
+
+/* Replacement character for "EmulateBrokenEncoding" feature. */
+	unsigned char replacement_character;
+
+/* True if encoding was set from john.conf as opposed to command line. */
+	int default_enc;
+	int default_target_enc;
+
+/* Output encoding. This must match what the hash origin used. An exception
+   is UTF-16 formats like NT, which can use any codepage (or UTF-8) if FMT_ENC
+   is set, or ISO-8859-1 only if FMT_ENC is false. */
+	int target_enc;
+
+/* If different from target_enc, this is an intermediate encoding only
+   used within rules/mask processing. This is only applicable for the case
+   "UTF-8 -> rules -> UTF-8" or "mask -> UTF-8". Since the rules engine can't
+   do proper case conversion etc. in UTF-8, we can pick this intermediate
+   encoding (use one that matches most input) but the double conversions may
+   come with a speed penalty. */
+	int internal_cp;
+
+/* Store UTF-8 in pot file. Default is no conversion. */
+	int store_utf8;
+
+/* Show/log/report UTF-8. Default is no conversion. */
+	int report_utf8;
+
+/* Pot file used (default is $JOHN/john.pot) */
+	char *activepot;
+
+/* the wordlist rules section (default if none entered is Wordlist) */
+	char *activewordlistrules;
+
+/* the 'single' rules section (default if none entered is Single) */
+	char *activesinglerules;
+
+/* Stacked rules applied within cracker.c for any mode */
+	char *rule_stack;
 
 /* This is a 'special' flag.  It causes john to add 'extra' code to search for
  * some salted types, when we have only the hashes.  The only type supported is
@@ -241,22 +342,26 @@ struct options_main {
  * --regen_lost_salts=#   */
 	int regen_lost_salts;
 
-#ifdef HAVE_LIBDL
-/* List of dll files to load for additional formats */
-	struct list_main *fmt_dlls;
-#endif
-
 /* Requested max_keys_per_crypt (for testing purposes) */
 	int force_maxkeys;
 
-/* Requested MinLen (min plaintext_length) */
-	int force_minlength;
+/* Requested min/max plaintext_length */
+	int req_minlength, req_maxlength;
 
-/* Requested MaxLen (max plaintext_length) */
+/* Effective min/max plaintext_length */
+	int eff_minlength, eff_maxlength;
+
+/* Forced MaxLen (if set, we will reject longer candidates unless FMT_TRUNC) */
 	int force_maxlength;
 
-/* Graceful exit after this many seconds of cracking */
+/*
+ * Graceful exit after this many seconds of cracking. If the number is
+ * negative, we exit after that many seconds of not cracking anything.
+ */
 	int max_run_time;
+
+/* Graceful exit after this many candidates tried. */
+	long long max_cands;
 
 /* Emit a status line every N seconds */
 	int status_interval;
@@ -278,73 +383,43 @@ struct options_main {
 	char dynamic_bare_hashes_always_valid;
 
 #ifdef HAVE_OPENCL
-	char *ocl_platform;
-
 /* Vector width of OpenCL kernel */
 	unsigned int v_width;
+
+/* GPU Worksizes */
+	size_t lws, gws;
 #endif
-#if defined(HAVE_OPENCL) || defined(HAVE_CUDA)
-	struct list_main *gpu_devices;
+#if defined(HAVE_OPENCL) || defined(HAVE_ZTEX)
+/* Allow to set and select OpenCL device(s) or ztex boards */
+	struct list_main *acc_devices;
 #endif
 /* -list=WHAT Get a config list (eg. a list of incremental modes available) */
 	char *listconf;
-/* Verbosity level, 1-5. Three is normal, lower is more quiet. */
+/* Verbosity level, 1-5. Three is normal for jumbo, four is "legacy". */
 	int verbosity;
 /* Secure mode. Do not output, log or store cracked passwords. */
 	int secure;
+/* Mode that appended the uid to the user name (on display) */
+	int show_uid_in_cracks;
 /* regular expression */
-  char *regex;
+	char *regex;
+/* Custom masks */
+	char *custom_mask[MAX_NUM_CUST_PLHDR];
+/* Tune options */
+	char *tune;
+/* Incremental CharCount override */
+	int charcount;
+/* Subsets full charset */
+	char *subset_full;
+/* Subsets, required first partition */
+	int subset_must;
+/* Subsets, min. diff */
+	int subset_min_diff;
+/* Subsets, max. diff */
+	int subset_max_diff;
 };
 
 extern struct options_main options;
-
-/* "Persistant" options. Unlike the options struct above, this one is not
-   reset by the children upon resuming a session. That behavior gave me
-   gray hairs. */
-
-/* In general, an encoding of 0 (CP_UNDEF) means no conversion and we will
-   behave more or less like core John. */
-struct pers_opts {
-/* Currently initialized non-utf8 encoding */
-	int unicode_cp;
-
-/* Input encoding for word lists, and/or pot file clear-texts. */
-	int input_enc;
-
-/* True if encoding was set from john.conf defaults. */
-	int default_enc;
-	int default_target_enc;
-
-/* Output encoding. This must match what the hash origin used. An exception
-   is UTF-16 formats like NT, which can use any codepage (or UTF-8) if FMT_UTF8
-   is set, or ISO-8859-1 only if FMT_UTF8 is false. */
-	int target_enc;
-
-/* If different from target_enc, this is an intermediate encoding only
-   used within rules processing. This is only applicable for the case
-   "UTF-8 -> rules -> UTF-8". Since the rules engine can't do proper case
-   conversion etc. in UTF-8, we can pick this intermediate encoding (use
-   one that matches most input) but the double conversions may come with
-   a speed penalty. */
-	int intermediate_enc;
-
-/* Store UTF-8 in pot file. Default is no conversion. */
-	int store_utf8;
-
-/* Show/log/report UTF-8. Default is no conversion. */
-	int report_utf8;
-
-/* Pot file used (default is $JOHN/john.pot) */
-	char *activepot;
-
-/* the wordlist rules section (default if none entered is Wordlist) */
-	char *activewordlistrules;
-
-/* the 'single' rules section (default if none entered is Single) */
-	char *activesinglerules;
-};
-
-extern struct pers_opts pers_opts;
 
 /*
  * Initializes the options structure.

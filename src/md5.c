@@ -36,7 +36,8 @@
  */
 #define F(x, y, z)			((z) ^ ((x) & ((y) ^ (z))))
 #define G(x, y, z)			((y) ^ ((z) & ((x) ^ (y))))
-#define H(x, y, z)			((x) ^ (y) ^ (z))
+#define H(x, y, z)			(((x) ^ (y)) ^ (z))
+#define H2(x, y, z)			((x) ^ ((y) ^ (z)))
 #define I(x, y, z)			((y) ^ ((x) | ~(z)))
 
 /*
@@ -75,18 +76,18 @@
  * This processes one or more 64-byte data blocks, but does NOT update
  * the bit counters.  There are no alignment requirements.
  */
-static void *body(MD5_CTX *ctx, void *data, unsigned long size)
+static const void *body(MD5_CTX *ctx, const void *data, unsigned long size)
 {
-	unsigned char *ptr;
+	unsigned const char *ptr;
 	MD5_u32plus a, b, c, d;
 	MD5_u32plus saved_a, saved_b, saved_c, saved_d;
 
 	ptr = data;
 
-	a = ctx->a;
-	b = ctx->b;
-	c = ctx->c;
-	d = ctx->d;
+	a = ctx->A;
+	b = ctx->B;
+	c = ctx->C;
+	d = ctx->D;
 
 	do {
 		saved_a = a;
@@ -132,21 +133,21 @@ static void *body(MD5_CTX *ctx, void *data, unsigned long size)
 
 /* Round 3 */
 		STEP(H, a, b, c, d, GET(5), 0xfffa3942, 4)
-		STEP(H, d, a, b, c, GET(8), 0x8771f681, 11)
+		STEP(H2, d, a, b, c, GET(8), 0x8771f681, 11)
 		STEP(H, c, d, a, b, GET(11), 0x6d9d6122, 16)
-		STEP(H, b, c, d, a, GET(14), 0xfde5380c, 23)
+		STEP(H2, b, c, d, a, GET(14), 0xfde5380c, 23)
 		STEP(H, a, b, c, d, GET(1), 0xa4beea44, 4)
-		STEP(H, d, a, b, c, GET(4), 0x4bdecfa9, 11)
+		STEP(H2, d, a, b, c, GET(4), 0x4bdecfa9, 11)
 		STEP(H, c, d, a, b, GET(7), 0xf6bb4b60, 16)
-		STEP(H, b, c, d, a, GET(10), 0xbebfbc70, 23)
+		STEP(H2, b, c, d, a, GET(10), 0xbebfbc70, 23)
 		STEP(H, a, b, c, d, GET(13), 0x289b7ec6, 4)
-		STEP(H, d, a, b, c, GET(0), 0xeaa127fa, 11)
+		STEP(H2, d, a, b, c, GET(0), 0xeaa127fa, 11)
 		STEP(H, c, d, a, b, GET(3), 0xd4ef3085, 16)
-		STEP(H, b, c, d, a, GET(6), 0x04881d05, 23)
+		STEP(H2, b, c, d, a, GET(6), 0x04881d05, 23)
 		STEP(H, a, b, c, d, GET(9), 0xd9d4d039, 4)
-		STEP(H, d, a, b, c, GET(12), 0xe6db99e5, 11)
+		STEP(H2, d, a, b, c, GET(12), 0xe6db99e5, 11)
 		STEP(H, c, d, a, b, GET(15), 0x1fa27cf8, 16)
-		STEP(H, b, c, d, a, GET(2), 0xc4ac5665, 23)
+		STEP(H2, b, c, d, a, GET(2), 0xc4ac5665, 23)
 
 /* Round 4 */
 		STEP(I, a, b, c, d, GET(0), 0xf4292244, 6)
@@ -174,26 +175,26 @@ static void *body(MD5_CTX *ctx, void *data, unsigned long size)
 		ptr += 64;
 	} while (size -= 64);
 
-	ctx->a = a;
-	ctx->b = b;
-	ctx->c = c;
-	ctx->d = d;
+	ctx->A = a;
+	ctx->B = b;
+	ctx->C = c;
+	ctx->D = d;
 
 	return ptr;
 }
 
 void MD5_Init(MD5_CTX *ctx)
 {
-	ctx->a = 0x67452301;
-	ctx->b = 0xefcdab89;
-	ctx->c = 0x98badcfe;
-	ctx->d = 0x10325476;
+	ctx->A = 0x67452301;
+	ctx->B = 0xefcdab89;
+	ctx->C = 0x98badcfe;
+	ctx->D = 0x10325476;
 
 	ctx->lo = 0;
 	ctx->hi = 0;
 }
 
-void MD5_Update(MD5_CTX *ctx, void *data, unsigned long size)
+void MD5_Update(MD5_CTX *ctx, const void *data, unsigned long size)
 {
 	MD5_u32plus saved_lo;
 	unsigned long used, free;
@@ -263,22 +264,22 @@ void MD5_Final(unsigned char *result, MD5_CTX *ctx)
 {
 	MD5_PreFinal(ctx);
 
-	result[0] = ctx->a;
-	result[1] = ctx->a >> 8;
-	result[2] = ctx->a >> 16;
-	result[3] = ctx->a >> 24;
-	result[4] = ctx->b;
-	result[5] = ctx->b >> 8;
-	result[6] = ctx->b >> 16;
-	result[7] = ctx->b >> 24;
-	result[8] = ctx->c;
-	result[9] = ctx->c >> 8;
-	result[10] = ctx->c >> 16;
-	result[11] = ctx->c >> 24;
-	result[12] = ctx->d;
-	result[13] = ctx->d >> 8;
-	result[14] = ctx->d >> 16;
-	result[15] = ctx->d >> 24;
+	result[0] = ctx->A;
+	result[1] = ctx->A >> 8;
+	result[2] = ctx->A >> 16;
+	result[3] = ctx->A >> 24;
+	result[4] = ctx->B;
+	result[5] = ctx->B >> 8;
+	result[6] = ctx->B >> 16;
+	result[7] = ctx->B >> 24;
+	result[8] = ctx->C;
+	result[9] = ctx->C >> 8;
+	result[10] = ctx->C >> 16;
+	result[11] = ctx->C >> 24;
+	result[12] = ctx->D;
+	result[13] = ctx->D >> 8;
+	result[14] = ctx->D >> 16;
+	result[15] = ctx->D >> 24;
 
 #if 0
 	memset(ctx, 0, sizeof(*ctx));

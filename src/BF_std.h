@@ -15,25 +15,12 @@
 #ifndef _JOHN_BF_STD_H
 #define _JOHN_BF_STD_H
 
+#include <stdint.h>
+
 #include "arch.h"
 #include "common.h"
 #include "formats.h"
-
-typedef ARCH_WORD_32 BF_word;
-
-/*
- * Binary salt type, also keeps the number of rounds and hash sub-type.
- */
-typedef struct {
-	BF_word salt[4];
-	unsigned char rounds;
-	char subtype;
-} BF_salt;
-
-/*
- * Binary ciphertext type.
- */
-typedef BF_word BF_binary[6];
+#include "BF_common.h"
 
 #if BF_X2 == 3
 #define BF_Nmin				3
@@ -56,11 +43,6 @@ typedef BF_word BF_binary[6];
  * BF_std_crypt() output buffer.
  */
 extern BF_binary BF_out[BF_N];
-
-/*
- * ASCII to binary conversion table, for use in BF_fmt.valid().
- */
-extern unsigned char BF_atoi64[0x80];
 
 #if BF_X2 == 3
 #define BF_ALGORITHM_NAME		"Blowfish 32/" ARCH_BITS_STR " X3"
@@ -87,23 +69,5 @@ extern void BF_std_crypt(BF_salt *salt, int n);
  */
 extern void BF_std_crypt_exact(int index);
 #endif
-
-/*
- * Returns the salt for BF_std_crypt().
- */
-extern void *BF_std_get_salt(char *ciphertext);
-
-#if FMT_MAIN_VERSION > 11
-/*
- * Returns the number of iterations for a given salt,
- * this is BF's tunable cost parameter
- */
-extern unsigned int BF_iteration_count(void *salt);
-#endif
-
-/*
- * Converts an ASCII ciphertext to binary.
- */
-extern void *BF_std_get_binary(char *ciphertext);
 
 #endif

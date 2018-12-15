@@ -1,6 +1,6 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 1996-2001,2005,2010-2013 by Solar Designer
+ * Copyright (c) 1996-2001,2005,2010-2013,2015 by Solar Designer
  *
  * ...with a change in the jumbo patch, by JimF
  */
@@ -19,8 +19,9 @@
  * For now, you can just revert FMT_MAIN_VERSION to 11
  * in case of any problem with the new additions
  * (tunable cost parameters)
+ * (format signatures, #14)
  */
-#define FMT_MAIN_VERSION 12	/* change if structure fmt_main changes */
+#define FMT_MAIN_VERSION 14	/* change if structure fmt_main changes */
 
 /*
  * fmt_main is declared for real further down this file, but we refer to it in
@@ -29,17 +30,16 @@
 struct fmt_main;
 
 /*
- * Default alignment (used unless known)
+ * Maximum number of different tunable cost parameters
+ * that can be reported for a single format
  */
-#define DEFAULT_ALIGN MEM_ALIGN_WORD
+#define FMT_TUNABLE_COSTS	4
 
-#if FMT_MAIN_VERSION > 11
 /*
- * Just in case some formats use an even higher number of different
- * tunable cost parameters
+ * Maximum number of different signatures
+ * that can be reported for a single format
  */
-#define FMT_TUNABLE_COSTS	2
-#endif
+#define FMT_SIGNATURES	4
 
 /*
  * Some format methods accept pointers to these, yet we can't just include
@@ -61,7 +61,7 @@ struct db_salt;
  * with formats not fully Unicode-aware is when a format like this is hard-coded
  * to convert from ISO-8859-1 (ie. by just inserting 0x00, effectively just
  * casting every char to a short). Such formats MUST set FMT_UNICODE and MUST
- * NOT set FMT_UTF8, or users will get false negatives when using UTF-8 or
+ * NOT set FMT_ENC, or users will get false negatives when using UTF-8 or
  * codepages.
  */
 #define FMT_UNICODE			0x00000004
@@ -69,18 +69,46 @@ struct db_salt;
  * Honors the --encoding=NAME option. This means it can handle codepages (like
  * cp1251) as well as UTF-8.
  */
-#define FMT_UTF8			0x00000008
+#define FMT_ENC				0x00000008
 /*
- * Format has false positive matches. Thus, do not remove hashes
- * when a likely PW is found
+ * This hash type is known to actually use UTF-8 encoding of password, so
+ * trying legacy encodings should be pointless.
+ */
+#define FMT_UTF8			0x00000010
+/*
+ * Mark password->binary = NULL immediately after a hash is cracked. Must be
+ * set for formats that read salt->list in crypt_all for the purpose of
+ * identification of uncracked hashes for this salt.
+ */
+#define FMT_REMOVE			0x00000020
+/*
+ * Format has false positive matches. Thus, do not remove hashes when
+ * a likely PW is found.  This should only be set for formats where a
+ * false positive will actually not work IRL (eg. 7z),  as opposed to
+ * ones that has actual collisions (eg. oldoffice).  The latter group
+ * of formats may instead be run with --keep-guessing if/when wanted.
  */
 #define FMT_NOT_EXACT			0x00000100
+/*
+ * This format uses a dynamic sized salt, and its salt structure
+ * 'derives' from the dyna_salt type defined in dyna_salt.h
+ */
+#define FMT_DYNA_SALT			0x00000200
+/*
+ * This format supports huge ciphertexts (larger than LINE_BUFFER_SIZE)
+ * and may/will consequently truncate its pot lines with $SOURCE_HASH$
+ */
+#define FMT_HUGE_INPUT			0x00000400
 /* Uses a bitslice implementation */
 #define FMT_BS				0x00010000
 /* The split() method unifies the case of characters in hash encodings */
 #define FMT_SPLIT_UNIFIES_CASE		0x00020000
-/* Is this format a dynamic_x format (or a 'thin' format using dynamic code)? */
-#define FMT_DYNAMIC				0x00100000
+/* A dynamic_x format (or a 'thin' format using dynamic code) */
+#define FMT_DYNAMIC			0x00100000
+/* This format originally truncates at our max. length (eg. descrypt) */
+#define FMT_TRUNC			0x00200000
+/* Format can do "internal mask" (eg. GPU-side mask)? */
+#define FMT_MASK			0x00400000
 #ifdef _OPENMP
 /* Parallelized with OpenMP */
 #define FMT_OMP				0x01000000
@@ -92,6 +120,9 @@ struct db_salt;
 #endif
 /* We've already warned the user about hashes of this type being present */
 #define FMT_WARNED			0x80000000
+
+/* Format's length before calling init() */
+extern int fmt_raw_len;
 
 /*
  * A password to test the methods for correct operation.
@@ -121,6 +152,9 @@ struct fmt_params {
 /* Benchmark for short/long passwords instead of for one/many salts */
 	int benchmark_length;
 
+/* Minimum length of a plaintext password */
+	int plaintext_min_length;
+
 /* Maximum length of a plaintext password */
 	int plaintext_length;
 
@@ -139,19 +173,29 @@ struct fmt_params {
 /* Properties of this format */
 	unsigned int flags;
 
-#if FMT_MAIN_VERSION > 11
 /*
  * Descriptions (names) of tunable cost parameters for this format
  *
  * These names shouldn't contain ',', because ", " is used
  * as a separator when listing tunable cost parameters
- * in --list=format-details and --list=format-all-details
+ * in --list=format-details and --list=format-all-details.
+ * The sequence of names should match the sequence of functions
+ * returning tunable cost values.
  */
 	char *tunable_cost_name[FMT_TUNABLE_COSTS];
-#endif
 
-/* Some passwords to test the methods for correct operation (or NULL for no
- * self test, and no benchmark), terminated with a NULL ciphertext. */
+/*
+ * format signatures (such as $NT$, etc).
+ *
+ * This is used in loader to see if a line read from a .pot file is a
+ * 'chopped' line, that was shortened before being written to .pot.
+ */
+	char *signature[FMT_SIGNATURES];
+
+/*
+ * Some passwords to test the methods for correct operation (or NULL for no
+ * self test, and no benchmark), terminated with a NULL ciphertext.
+ */
 	struct fmt_tests *tests;
 };
 
@@ -171,7 +215,8 @@ struct fmt_methods {
 
 /* Called whenever the set of password hashes being cracked changes, such as
  * after self-test, but before actual cracking starts.  When called before a
- * self-test or benchmark rather than before actual cracking, db may be NULL.
+ * self-test or benchmark rather than before actual cracking, db may be made
+ * out of test vectors.
  * Normally, this is a no-op since a format implementation shouldn't mess with
  * the database unnecessarily.  However, when there is a good reason to do so
  * this may e.g. transfer the salts and hashes onto a GPU card. */
@@ -203,22 +248,19 @@ struct fmt_methods {
 /* Converts an ASCII salt to its internal representation */
 	void *(*salt)(char *ciphertext);
 
-#if FMT_MAIN_VERSION > 11
 /*
  * These functions return the value of a tunable cost parameter
  * for a given salt.
- * The sequence of tunable costs parameters has to match the sequence
- * of their descriptions in tunable_cost_name[FMT_TUNABLE_COSTS].
+ * The sequence of of functions returning the vaules of tunable costs
+ * parameters has to match the sequence of their descriptions in
+ * tunable_cost_name[FMT_TUNABLE_COSTS].
  * The format implementation has to decide which tunable cost parameters
  * are most significant for CPU time and/or memory requirements.
  * If possible, the reported values should be linear to the real cost,
  * even if in the format the parameter is the dual logarithm of the real cost,
  * e.g., the real iteration count is 2^(t_cost) for parameter t_cost.
- *
- * If a function is NULL, john assumes a default cost value of 1
  */
 	unsigned int (*tunable_cost_value[FMT_TUNABLE_COSTS])(void *salt);
-#endif
 
 /* Reconstructs the ASCII ciphertext from its binary (saltless only).
  * Alternatively, in the simplest case simply returns "source" as-is. */
@@ -233,10 +275,16 @@ struct fmt_methods {
  * used by the password file loader. */
 	int (*salt_hash)(void *salt);
 
+/* Compare function used for sorting salts */
+	int (*salt_compare)(const void *x, const void *y);
+
 /* Sets a salt for the crypt_all() method */
 	void (*set_salt)(void *salt);
 
-/* Sets a plaintext, with index from 0 to fmt_params.max_keys_per_crypt - 1 */
+/* Sets a plaintext, with index from 0 to fmt_params.max_keys_per_crypt - 1.
+ * The string is NUL-terminated, but set_key() may over-read it until up to
+ * PLAINTEXT_BUFFER_SIZE total read (thus, the caller's buffer must be at least
+ * this large).  Empty string may be passed as fmt_null_key. */
 	void (*set_key)(char *key, int index);
 
 /* Returns a plaintext previously set with and potentially altered by
@@ -312,6 +360,21 @@ struct fmt_main {
 };
 
 /*
+ * Empty key that is safe to pass to the set_key() method, given that it may
+ * over-read the empty string for up to PLAINTEXT_BUFFER_SIZE.
+ */
+extern char fmt_null_key[PLAINTEXT_BUFFER_SIZE];
+
+/* Self-test is running */
+extern int self_test_running;
+
+/* Benchmark is running */
+extern int benchmark_running;
+
+/* Self-test or benchmark is running */
+#define bench_or_test_running	(self_test_running || benchmark_running)
+
+/*
  * Linked list of registered formats.
  */
 extern struct fmt_main *fmt_list;
@@ -332,10 +395,15 @@ extern void fmt_init(struct fmt_main *format);
 extern void fmt_done(struct fmt_main *format);
 
 /*
+ * De-initializes all initialized formats.
+ */
+extern void fmt_all_done(void);
+
+/*
  * Tests the format's methods for correct operation. Returns NULL on
  * success, method name on error.
  */
-extern char *fmt_self_test(struct fmt_main *format);
+extern char *fmt_self_test(struct fmt_main *format, struct db_main *db);
 
 /*
  * Default methods.
@@ -354,6 +422,8 @@ extern int fmt_default_salt_hash(void *salt);
 extern void fmt_default_set_salt(void *salt);
 extern void fmt_default_clear_keys(void);
 extern int fmt_default_get_hash(int index);
+/* this is a salt_hash default specifically for dyna_salt type formats */
+extern int fmt_default_dyna_salt_hash(void *salt);
 
 /*
  * Default binary_hash_N methods
@@ -370,5 +440,10 @@ extern int fmt_default_binary_hash_6(void * binary);
  * Dummy hash function to use for salts with no hash table.
  */
 #define fmt_dummy_hash fmt_default_get_hash
+
+/*
+ * This is for all formats that want to use omp_autotune()
+ */
+#include "omp_autotune.h"
 
 #endif

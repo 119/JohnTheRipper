@@ -1,4 +1,5 @@
-/* LastPass sniffed session cracker patch for JtR. Hacked together during
+/*
+ * LastPass sniffed session cracker patch for JtR. Hacked together during
  * November of 2012 by Dhiru Kholia <dhiru at openwall.com>.
  *
  * Burp Suite is awesome. Open-source it!
@@ -7,10 +8,26 @@
  * and it is hereby released to the general public under the following terms:
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted.
+ *
+ * Jan, 2015, JimF. Fixed salt-dupe problem. Now salt ONLY depends upon
+ * unencrypted user name, so we have real salt-dupe removal.
  */
 
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_sniffed_lastpass;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_sniffed_lastpass);
+#else
+
 #include <string.h>
-#include <errno.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#ifndef OMP_SCALE
+#define OMP_SCALE               64
+#endif
+#endif
+
 #include "arch.h"
 #include "johnswap.h"
 #include "misc.h"
@@ -18,39 +35,34 @@
 #include "formats.h"
 #include "params.h"
 #include "options.h"
-#include "base64.h"
-#include <openssl/aes.h>
-//#include <openssl/evp.h>
+#include "aes.h"
+#include "base64_convert.h"
 #include "pbkdf2_hmac_sha256.h"
-#ifdef _OPENMP
-#include <omp.h>
-#define OMP_SCALE               64
-#endif
 #include "memdbg.h"
 
-#define FORMAT_LABEL		"LastPass"
-#define FORMAT_NAME		"sniffed sessions"
-#ifdef MMX_COEF_SHA256
-#define ALGORITHM_NAME		"PBKDF2-SHA256 AES " SHA256_ALGORITHM_NAME
+#define FORMAT_LABEL            "LastPass"
+#define FORMAT_NAME             "sniffed sessions"
+#define FORMAT_TAG              "$lastpass$"
+#define FORMAT_TAG_LEN          (sizeof(FORMAT_TAG)-1)
+#ifdef SIMD_COEF_32
+#define ALGORITHM_NAME          "PBKDF2-SHA256 AES " SHA256_ALGORITHM_NAME
 #else
-#define ALGORITHM_NAME		"PBKDF2-SHA256 AES 32/" ARCH_BITS_STR
+#define ALGORITHM_NAME          "PBKDF2-SHA256 AES 32/" ARCH_BITS_STR
 #endif
-#define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	-1
-#define PLAINTEXT_LENGTH	15
-#define BINARY_SIZE		0
-#define SALT_SIZE		sizeof(struct custom_salt)
-#ifdef MMX_COEF_SHA256
-#define MIN_KEYS_PER_CRYPT	SSE_GROUP_SZ_SHA256
-#define MAX_KEYS_PER_CRYPT	SSE_GROUP_SZ_SHA256
+#define BENCHMARK_COMMENT       ""
+#define BENCHMARK_LENGTH        0
+#define PLAINTEXT_LENGTH        55
+#define BINARY_SIZE             16
+#define SALT_SIZE               sizeof(struct custom_salt)
+#define BINARY_ALIGN            4
+#define SALT_ALIGN              sizeof(int)
+#ifdef SIMD_COEF_32
+#define MIN_KEYS_PER_CRYPT      SSE_GROUP_SZ_SHA256
+#define MAX_KEYS_PER_CRYPT      SSE_GROUP_SZ_SHA256
 #else
-#define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	1
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      1
 #endif
-
-#define SALTLEN 8
-#define IVLEN 8
-#define CTLEN 1040
 
 /* sentms=1352643586902&xml=2&username=hackme%40mailinator.com&method=cr&hash=4c11d8717015d92db74c42bc1a2570abea3fa18ab17e58a51ce885ee217ccc3f&version=2.0.15&encrypted_username=i%2BhJCwPOj5eQN4tvHcMguoejx4VEmiqzOXOdWIsZKlk%3D&uuid=aHnPh8%40NdhSTWZ%40GJ2fEZe%24cF%40kdzdYh&lang=en-US&iterations=500&sessonly=0&otp=&sesameotp=&multifactorresponse=&lostpwotphash=07a286341be484fc3b96c176e611b10f4d74f230c516f944a008f960f4ec8870&requesthash=i%2BhJCwPOj5eQN4tvHcMguoejx4VEmiqzOXOdWIsZKlk%3D&requestsrc=cr&encuser=i%2BhJCwPOj5eQN4tvHcMguoejx4VEmiqzOXOdWIsZKlk%3D&hasplugin=2.0.15
  * decodeURIComponent("hackme%40mailinator.com")
@@ -61,54 +73,56 @@
 
 static struct fmt_tests lastpass_tests[] = {
 	{"$lastpass$hackme@mailinator.com$500$i+hJCwPOj5eQN4tvHcMguoejx4VEmiqzOXOdWIsZKlk=", "openwall"},
+	{"$lastpass$pass_gen@generated.com$500$vgC0g8BxOi4MerkKfZYFFSAJi8riD7k0ROLpBEA3VJk=", "password"},
+	// get one with salt under 16 bytes.
+	{"$lastpass$1@short.com$500$2W/GA8d2N+Z4HGvRYs2R7w==", "password"},
 	{NULL}
 };
 
-#if defined (_OPENMP)
-static int omp_t = 1;
-#endif
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static int *cracked;
+static uint32_t (*crypt_key)[4];
 
 static struct custom_salt {
 	unsigned int iterations;
+	unsigned int length;
 	char username[129];
-	unsigned char encrypted_username[40];
-	unsigned char length;
 } *cur_salt;
 
 static void init(struct fmt_main *self)
 {
-
-#if defined (_OPENMP)
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
+#ifdef _OPENMP
+	omp_autotune(self, OMP_SCALE);
 #endif
-	saved_key = mem_calloc_tiny(sizeof(*saved_key) *
-			self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	cracked = mem_calloc_tiny(sizeof(*cracked) *
-			self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
+	saved_key = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*saved_key));
+	crypt_key = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*crypt_key));
+}
+
+static void done(void)
+{
+	MEM_FREE(crypt_key);
+	MEM_FREE(saved_key);
 }
 
 static int valid(char *ciphertext, struct fmt_main *self)
 {
 	char *ctcopy, *keeptr, *p;
-	if (strncmp(ciphertext, "$lastpass$", 10) != 0)
+
+	if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN) != 0)
 		return 0;
 	ctcopy = strdup(ciphertext);
 	keeptr = ctcopy;
-	ctcopy += 10;
-	if ((p = strtok(ctcopy, "$")) == NULL)	/* username */
+	ctcopy += FORMAT_TAG_LEN;
+	if ((p = strtokm(ctcopy, "$")) == NULL)	/* username */
 		goto err;
-	if (strlen(p) > 129)
+	if (strlen(p) > 128)
 		goto err;
-	if ((p = strtok(NULL, "$")) == NULL)	/* iterations */
+	if ((p = strtokm(NULL, "$")) == NULL)	/* iterations */
 		goto err;
-	if (strlen(p) > 10)	// FIXME: overflows/undefined behavior in atoi() still possible
+	if (!isdec(p))
 		goto err;
-	if ((p = strtok(NULL, "$")) == NULL)	/* data */
+	if ((p = strtokm(NULL, "$")) == NULL)	/* data */
 		goto err;
 	if (strlen(p) > 50) /* not exact! */
 		goto err;
@@ -127,22 +141,34 @@ static void *get_salt(char *ciphertext)
 	int i;
 	char *p;
 	static struct custom_salt cs;
-	ctcopy += 10;	/* skip over "$lastpass$" */
-	p = strtok(ctcopy, "$");
+
+	memset(&cs, 0, sizeof(cs));
+	ctcopy += FORMAT_TAG_LEN; /* skip over "$lastpass$" */
+	p = strtokm(ctcopy, "$");
 	i = strlen(p);
 	if (i > 16)
 		i = 16;
 	cs.length = i; /* truncated length */
 	strncpy(cs.username, p, 128);
-	p = strtok(NULL, "$");
+	p = strtokm(NULL, "$");
 	cs.iterations = atoi(p);
-	p = strtok(NULL, "$");
-	base64_decode(p, strlen(p), (char*)cs.encrypted_username);
-
 	MEM_FREE(keeptr);
+
 	return (void *)&cs;
 }
 
+static void *get_binary(char *ciphertext)
+{
+	static unsigned int out[4];
+	char Tmp[48];
+	char *p;
+	ciphertext += FORMAT_TAG_LEN;
+	p = strchr(ciphertext, '$')+1;
+	p = strchr(p, '$')+1;
+	base64_convert(p, e_b64_mime, strlen(p), Tmp, e_b64_raw, sizeof(Tmp), 0, 0);
+	memcpy(out, Tmp, 16);
+	return out;
+}
 
 static void set_salt(void *salt)
 {
@@ -151,101 +177,82 @@ static void set_salt(void *salt)
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
-	int index = 0;
+	const int count = *pcount;
+	int index;
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index += MAX_KEYS_PER_CRYPT)
 #endif
-	{
-		unsigned char out[32];
-		unsigned char iv[16];
-		AES_KEY akey;
-#ifdef MMX_COEF_SHA256
-		int lens[MAX_KEYS_PER_CRYPT], i;
+	for (index = 0; index < count; index += MAX_KEYS_PER_CRYPT) {
+		uint32_t key[MAX_KEYS_PER_CRYPT][8];
+		unsigned i;
+#ifdef SIMD_COEF_32
+		int lens[MAX_KEYS_PER_CRYPT];
 		unsigned char *pin[MAX_KEYS_PER_CRYPT];
-		ARCH_WORD_32 key[MAX_KEYS_PER_CRYPT][8];
-		ARCH_WORD_32 *pout[MAX_KEYS_PER_CRYPT];
+		union {
+			uint32_t *pout[MAX_KEYS_PER_CRYPT];
+			unsigned char *poutc;
+		} x;
 		for (i = 0; i < MAX_KEYS_PER_CRYPT; ++i) {
 			lens[i] = strlen(saved_key[i+index]);
 			pin[i] = (unsigned char*)saved_key[i+index];
-			pout[i] = key[i];
+			x.pout[i] = key[i];
 		}
-		pbkdf2_sha256_sse((const unsigned char **)pin, lens, (unsigned char*)cur_salt->username, strlen((char*)cur_salt->username), cur_salt->iterations, (unsigned char **)pout, 32, 0);
-
+		pbkdf2_sha256_sse((const unsigned char **)pin, lens, (unsigned char*)cur_salt->username, strlen(cur_salt->username), cur_salt->iterations, &(x.poutc), 32, 0);
+#else
+		pbkdf2_sha256((unsigned char*)saved_key[index], strlen(saved_key[index]), (unsigned char*)cur_salt->username, strlen(cur_salt->username), cur_salt->iterations, (unsigned char*)(&key[0]),32,0);
+#endif
 		for (i = 0; i < MAX_KEYS_PER_CRYPT; ++i) {
 			unsigned char *Key = (unsigned char*)key[i];
+			AES_KEY akey;
+			unsigned char iv[16];
+			unsigned char out[32];
+			AES_set_encrypt_key(Key, 256, &akey);
 			memset(iv, 0, sizeof(iv));
-			if(AES_set_decrypt_key(Key, 256, &akey) < 0) {
-				fprintf(stderr, "AES_set_decrypt_key failed in crypt!\n");
-			}
-			AES_cbc_encrypt(cur_salt->encrypted_username, out, 32, &akey, iv, AES_DECRYPT);
-			if(strncmp((const char*)out, cur_salt->username, cur_salt->length) == 0)
-				cracked[i+index] = 1;
-			else
-				cracked[i+index] = 0;
+			AES_cbc_encrypt((const unsigned char*)cur_salt->username, out, 32, &akey, iv, AES_ENCRYPT);
+			memcpy(crypt_key[index+i], out, 16);
 		}
-#else
-		ARCH_WORD_32 key[8];
-		// PKCS5_PBKDF2_HMAC(saved_key[index], strlen(saved_key[index]), (unsigned char*)cur_salt->username, strlen((char*)cur_salt->username), cur_salt->iterations, EVP_sha256(), 32, key);
-		pbkdf2_sha256((unsigned char*)saved_key[index], strlen(saved_key[index]), (unsigned char*)cur_salt->username, strlen((char*)cur_salt->username), cur_salt->iterations, (unsigned char*)key,32,0);
-		//pbkdf2_sha256_x((unsigned char*)saved_key[index], strlen(saved_key[index]), (unsigned char*)cur_salt->username, strlen((char*)cur_salt->username), cur_salt->iterations, (unsigned char*)key);
-
-#if !ARCH_LITTLE_ENDIAN
-		{
-			int i;
-			for (i = 0; i < 8; ++i) {
-				key[i] = JOHNSWAP(key[i]);
-			}
-		}
-#endif
-
-		if(AES_set_decrypt_key((const unsigned char *)key, 256, &akey) < 0) {
-			fprintf(stderr, "AES_set_decrypt_key failed in crypt!\n");
-		}
-		memset(iv, 0, sizeof(iv));
-		AES_cbc_encrypt(cur_salt->encrypted_username, out, 32, &akey, iv, AES_DECRYPT);
-
-		if(strncmp((const char*)out, cur_salt->username, cur_salt->length) == 0)
-			cracked[index] = 1;
-		else
-			cracked[index] = 0;
-#endif
 	}
+
 	return count;
 }
 
-static int cmp_all(void *binary, int count)
-{
+#define COMMON_GET_HASH_VAR crypt_key
+#include "common-get-hash.h"
+
+static int cmp_all(void *binary, int count) {
 	int index;
+
 	for (index = 0; index < count; index++)
-		if (cracked[index])
+		if ( ((uint32_t*)binary)[0] == crypt_key[index][0] )
 			return 1;
 	return 0;
 }
 
 static int cmp_one(void *binary, int index)
 {
-	return cracked[index];
+	return !memcmp(binary, crypt_key[index], BINARY_SIZE);
 }
 
 static int cmp_exact(char *source, int index)
 {
-    return 1;
+	return 1;
 }
 
 static void lastpass_set_key(char *key, int index)
 {
-	int saved_key_length = strlen(key);
-	if (saved_key_length > PLAINTEXT_LENGTH)
-		saved_key_length = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, saved_key_length);
-	saved_key[index][saved_key_length] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
 {
 	return saved_key[index];
+}
+
+static unsigned int iteration_count(void *salt)
+{
+	struct custom_salt *my_salt = salt;
+
+	return (unsigned int) my_salt->iterations;
 }
 
 struct fmt_main fmt_sniffed_lastpass = {
@@ -255,45 +262,57 @@ struct fmt_main fmt_sniffed_lastpass = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
-		DEFAULT_ALIGN,
+		BINARY_ALIGN,
 		SALT_SIZE,
-		DEFAULT_ALIGN,
+		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
-		{ NULL },
-#endif
+		{
+			"iteration count",
+		},
+		{ FORMAT_TAG },
 		lastpass_tests
 	}, {
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		fmt_default_prepare,
 		valid,
 		fmt_default_split,
-		fmt_default_binary,
+		get_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
-		{ NULL },
-#endif
+		{
+			iteration_count,
+		},
 		fmt_default_source,
 		{
-			fmt_default_binary_hash
+			fmt_default_binary_hash_0,
+			fmt_default_binary_hash_1,
+			fmt_default_binary_hash_2,
+			fmt_default_binary_hash_3,
+			fmt_default_binary_hash_4,
+			fmt_default_binary_hash_5,
+			fmt_default_binary_hash_6
 		},
 		fmt_default_salt_hash,
+		NULL,
 		set_salt,
 		lastpass_set_key,
 		get_key,
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			fmt_default_get_hash
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

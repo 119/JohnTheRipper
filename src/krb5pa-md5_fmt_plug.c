@@ -8,11 +8,16 @@
  * 2. krbng2john.py ~/capture.pdml > krb5.in
  * 3. Run john on krb5.in
  *
- * Legacy input format:
- * user:$mskrb5$user$realm$checksum$timestamp
+ * PA_DATA_ENC_TIMESTAMP = Checksum[16 bytes] . Enc_Timestamp[36 bytes]
+ *                          -> encode as:
+ *                         HexChecksum[32 chars], HexTimestamp[72 chars]
  *
- * New input format from krbpa2john.py (the above is still supported)
- * user:$krb5pa$etype$user$realm$salt$timestamp+checksum
+ * Legacy input format:
+ *   user:$mskrb5$user$realm$HexChecksum$HexTimestamp
+ *
+ * New input format from krb2john.py (the above is still supported),
+ * note the lack of a separator between HexTimestamp and HexChecksum:
+ *   user:$krb5pa$etype$user$realm$salt$HexTimestampHexChecksum
  *
  * user, realm and salt are unused in this format.
  *
@@ -33,16 +38,17 @@
  * This software is Copyright (c) 2011-2012 magnum, and it is hereby released
  * to the general public under the following terms:  Redistribution and use in
  * source and binary forms, with or without modification, are permitted.
- *
  */
 
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <errno.h>
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_mskrb5;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_mskrb5);
+#else
+
 #include <string.h>
-#include <stdlib.h>
 #include <ctype.h>
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -53,7 +59,6 @@
 #include "options.h"
 #include "common.h"
 #include "unicode.h"
-
 #include "md5.h"
 #include "hmacmd5.h"
 #include "md4.h"
@@ -62,9 +67,13 @@
 
 #define FORMAT_LABEL       "krb5pa-md5"
 #define FORMAT_NAME        "Kerberos 5 AS-REQ Pre-Auth etype 23" /* md4 rc4-hmac-md5 */
+#define FORMAT_TAG         "$krb5pa$"
+#define FORMAT_TAG2        "$mskrb5$"
+#define FORMAT_TAG_LEN     (sizeof(FORMAT_TAG)-1)
+
 #define ALGORITHM_NAME     "32/" ARCH_BITS_STR
 #define BENCHMARK_COMMENT  ""
-#define BENCHMARK_LENGTH   -1000
+#define BENCHMARK_LENGTH   0
 #define PLAINTEXT_LENGTH   125
 #define MAX_REALMLEN       64
 #define MAX_USERLEN        64
@@ -78,15 +87,14 @@
 #define SALT_ALIGN         4
 #define TOTAL_LENGTH       (14 + 2 * (CHECKSUM_SIZE + TIMESTAMP_SIZE) + MAX_REALMLEN + MAX_USERLEN + MAX_SALTLEN)
 
-// these may be altered in init() if running OMP
 #define MIN_KEYS_PER_CRYPT 1
-#define MAX_KEYS_PER_CRYPT 1
+#define MAX_KEYS_PER_CRYPT 32
 
-#define OMP_SCALE          1024
+#ifndef OMP_SCALE
+#define OMP_SCALE          2 // Tuned w/ MKPC for core i7
+#endif
 
-#define HEXCHARS           "0123456789abcdefABCDEF"
-
-// Second and third plaintext will be replaced in init() under --encoding=utf8
+// Second and third plaintext will be replaced in init() under come encodings
 static struct fmt_tests tests[] = {
 	{"$krb5pa$23$user$realm$salt$afcbe07c32c3450b37d0f2516354570fe7d3e78f829e77cdc1718adf612156507181f7daeb03b6fbcfe91f8346f3c0ae7e8abfe5", "John"},
 	{"$mskrb5$john$JOHN.DOE.MS.COM$02E837D06B2AC76891F388D9CC36C67A$2A9785BF5036C45D3843490BF9C228E8C18653E10CE58D7F8EF119D2EF4F92B1803B1451", "fr2beesgr"},
@@ -94,41 +102,45 @@ static struct fmt_tests tests[] = {
 	{"$mskrb5$hackme$EXAMPLE.NET$e3cdf70485f81a85f7b59a4c1d6910a3$6e2f6705551a76f84ec2c92a9dd0fef7b2c1d4ca35bf1b02423359a3ecaa19bdf07ed0da", "openwall@123"},
 	{"$mskrb5$$$98cd00b6f222d1d34e08fe0823196e0b$5937503ec29e3ce4e94a051632d0fff7b6781f93e3decf7dca707340239300d602932154", ""},
 	{"$mskrb5$$$F4085BA458B733D8092E6B348E3E3990$034ACFC70AFBA542690B8BC912FCD7FED6A848493A3FF0D7AF641A263B71DCC72902995D", "frank"},
-	{"$mskrb5$$$eb03b6fbcfe91f8346f3c0ae7e8abfe5$afcbe07c32c3450b37d0f2516354570fe7d3e78f829e77cdc1718adf612156507181f7da", "John"},
+	{"$mskrb5$user$realm$eb03b6fbcfe91f8346f3c0ae7e8abfe5$afcbe07c32c3450b37d0f2516354570fe7d3e78f829e77cdc1718adf612156507181f7da", "John"},
 	{"$mskrb5$$$881c257ce5df7b11715a6a60436e075a$c80f4a5ec18e7c5f765fb9f00eda744a57483db500271369cf4752a67ca0e67f37c68402", "the"},
 	{"$mskrb5$$$ef012e13c8b32448241091f4e1fdc805$354931c919580d4939421075bcd50f2527d092d2abdbc0e739ea72929be087de644cef8a", "Ripper"},
 	{"$mskrb5$$$334ef74dad191b71c43efaa16aa79d88$34ebbad639b2b5a230b7ec1d821594ed6739303ae6798994e72bd13d5e0e32fdafb65413", "VeryveryveryloooooooongPassword"},
+	// repeat first hash in exactly the same form that is used in john.pot
+	{"$krb5pa$23$$$$afcbe07c32c3450b37d0f2516354570fe7d3e78f829e77cdc1718adf612156507181f7daeb03b6fbcfe91f8346f3c0ae7e8abfe5", "John"},
+	// http://www.exumbraops.com/layerone2016/party (sample.krb.pcap, hash extracted by krb2john.py)
+	{"$krb5pa$23$$$$4b8396107e9e4ec963c7c2c5827a4f978ad6ef943f87637614c0f31b2030ad1115d636e1081340c5d6612a3e093bd40ce8232431", "P@$$w0rd123"},
+	// ADSecurityOrg-MS14068-Exploit-KRBPackets.pcapng, https://adsecurity.org/?p=676
+	{"$krb5pa$23$$$$3d973b3833953655d019abff1a98ea124d98d94170fb77574f3cf6d0e6a7eded9f3e4bb37ec9fb64b55df7d9aceb6e19c1711983", "TheEmperor99!"},
 	{NULL}
 };
 
 static struct salt_t {
-	ARCH_WORD_32 checksum[CHECKSUM_SIZE / sizeof(ARCH_WORD_32)];
+	uint32_t checksum[CHECKSUM_SIZE / sizeof(uint32_t)];
 	unsigned char timestamp[TIMESTAMP_SIZE];
 } *cur_salt;
 
 static char (*saved_plain)[(PLAINTEXT_LENGTH+4)];
 static int (*saved_len);
-static ARCH_WORD_32 (*output)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*output)[BINARY_SIZE / sizeof(uint32_t)];
 static HMACMD5Context (*saved_ctx);
 
 static int keys_prepared;
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	int n = MIN_KEYS_PER_CRYPT * omp_get_max_threads();
-	if (n < MIN_KEYS_PER_CRYPT)
-		n = MIN_KEYS_PER_CRYPT;
-	self->params.min_keys_per_crypt = n;
-	n *= OMP_SCALE;
-	self->params.max_keys_per_crypt = n;
-#endif
-	saved_plain = mem_calloc_tiny(sizeof(*saved_plain) * self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	saved_len = mem_calloc_tiny(sizeof(*saved_len) * self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	output = mem_calloc_tiny(sizeof(*output) * self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	saved_ctx = mem_calloc_tiny(sizeof(*saved_ctx) * self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
+	omp_autotune(self, OMP_SCALE);
 
-	if (pers_opts.target_enc == UTF_8) {
+	saved_plain = mem_calloc(self->params.max_keys_per_crypt,
+	                         sizeof(*saved_plain));
+	saved_len   = mem_calloc(self->params.max_keys_per_crypt,
+	                         sizeof(*saved_len));
+	output      = mem_calloc(self->params.max_keys_per_crypt,
+	                         sizeof(*output));
+	saved_ctx   = mem_calloc(self->params.max_keys_per_crypt,
+	                         sizeof(*saved_ctx));
+
+	if (options.target_enc == UTF_8) {
 		tests[1].plaintext = "\xC3\xBC"; // German u-umlaut in UTF-8
 		tests[1].ciphertext = "$mskrb5$$$958db4ddb514a6cc8be1b1ccf82b0191$090408357a6f41852d17f3b4bb4634adfd388db1be64d3fe1a1d75ee4338d2a4aea387e5";
 		tests[2].plaintext = "\xC3\x9C\xC3\x9C"; // 2x uppercase of them
@@ -145,43 +157,32 @@ static void init(struct fmt_main *self)
 	}
 }
 
-static void *salt(char *ciphertext)
+static void done(void)
+{
+	MEM_FREE(saved_ctx);
+	MEM_FREE(output);
+	MEM_FREE(saved_len);
+	MEM_FREE(saved_plain);
+}
+
+static void *get_salt(char *ciphertext)
 {
 	static struct salt_t salt;
 	char *p;
 	int i;
 
 	p = strrchr(ciphertext, '$') + 1;
-	if (strlen(p) == 2 * (TIMESTAMP_SIZE + CHECKSUM_SIZE)) {
-		// New input format
-		for (i = 0; i < TIMESTAMP_SIZE; i++) {
-			salt.timestamp[i] =
-				(atoi16[ARCH_INDEX(*p)] << 4) |
-				atoi16[ARCH_INDEX(p[1])];
-			p += 2;
-		}
-		for (i = 0; i < CHECKSUM_SIZE; i++) {
-			((unsigned char*)salt.checksum)[i] =
-				(atoi16[ARCH_INDEX(*p)] << 4) |
-				atoi16[ARCH_INDEX(p[1])];
-			p += 2;
-		}
-	} else {
-		// Old input format
-		p -= (2 * CHECKSUM_SIZE + 1);
-		for (i = 0; i < CHECKSUM_SIZE; i++) {
-			((unsigned char*)salt.checksum)[i] =
-				(atoi16[ARCH_INDEX(*p)] << 4) |
-				atoi16[ARCH_INDEX(p[1])];
-			p += 2;
-		}
-		++p;
-		for (i = 0; i < TIMESTAMP_SIZE; i++) {
-			salt.timestamp[i] =
-				(atoi16[ARCH_INDEX(*p)] << 4) |
-				atoi16[ARCH_INDEX(p[1])];
-			p += 2;
-		}
+	for (i = 0; i < TIMESTAMP_SIZE; i++) {
+		salt.timestamp[i] =
+			(atoi16[ARCH_INDEX(*p)] << 4) |
+			atoi16[ARCH_INDEX(p[1])];
+		p += 2;
+	}
+	for (i = 0; i < CHECKSUM_SIZE; i++) {
+		((unsigned char*)salt.checksum)[i] =
+			(atoi16[ARCH_INDEX(*p)] << 4) |
+			atoi16[ARCH_INDEX(p[1])];
+		p += 2;
 	}
 	return (void*)&salt;
 }
@@ -196,14 +197,31 @@ static char *split(char *ciphertext, int index, struct fmt_main *self)
 	static char out[TOTAL_LENGTH + 1];
 	char *data;
 
-	strnzcpy(out, ciphertext, sizeof(out));
+	if (!strncmp(ciphertext, FORMAT_TAG2, FORMAT_TAG_LEN)) {
+		char in[TOTAL_LENGTH + 1];
+		char *c, *t;
+
+		strnzcpy(in, ciphertext, sizeof(in));
+
+		t = strrchr(in, '$'); *t++ = 0;
+		c = strrchr(in, '$'); *c++ = 0;
+
+		snprintf(out, sizeof(out), "%s23$$$$%s%s", FORMAT_TAG, t, c);
+	} else {
+		char *tc;
+
+		tc = strrchr(ciphertext, '$');
+
+		snprintf(out, sizeof(out), "%s23$$$$%s", FORMAT_TAG, ++tc);
+	}
+
 	data = out + strlen(out) - 2 * (CHECKSUM_SIZE + TIMESTAMP_SIZE) - 1;
 	strlwr(data);
 
 	return out;
 }
 
-static void *binary(char *ciphertext)
+static void *get_binary(char *ciphertext)
 {
 	static unsigned char *binary;
 	char *p;
@@ -212,12 +230,7 @@ static void *binary(char *ciphertext)
 	if (!binary) binary = mem_alloc_tiny(BINARY_SIZE, MEM_ALIGN_WORD);
 
 	p = strrchr(ciphertext, '$') + 1;
-	if (strlen(p) == 2 * (TIMESTAMP_SIZE + CHECKSUM_SIZE))
-		// New input format
-		p += 2 * TIMESTAMP_SIZE;
-	else
-		// Old input format
-		p -= (2 * CHECKSUM_SIZE + 1);
+	p += 2 * TIMESTAMP_SIZE;
 
 	for (i = 0; i < CHECKSUM_SIZE; i++) {
 		binary[i] =
@@ -232,8 +245,8 @@ static int valid(char *ciphertext, struct fmt_main *self)
 {
 	char *data = ciphertext, *p;
 
-	if (!strncmp(ciphertext, "$mskrb5$", 8)) {
-		data += 8;
+	if (!strncmp(ciphertext, FORMAT_TAG2, FORMAT_TAG_LEN)) {
+		data += FORMAT_TAG_LEN;
 
 		// user field
 		p = strchr(data, '$');
@@ -250,20 +263,21 @@ static int valid(char *ciphertext, struct fmt_main *self)
 		// checksum
 		p = strchr(data, '$');
 		if (!p || p - data != 2 * CHECKSUM_SIZE ||
-		    strspn(data, HEXCHARS) != p - data)
+		    strspn(data, HEXCHARS_all) != p - data)
 			return 0;
 		data = p + 1;
 
 		// encrypted timestamp
 		p += strlen(data) + 1;
 		if (*p || p - data != TIMESTAMP_SIZE * 2 ||
-		    strspn(data, HEXCHARS) != p - data)
+		    strspn(data, HEXCHARS_all) != p - data)
 			return 0;
 
 		return 1;
-	} else if (!strncmp(ciphertext, "$krb5pa$23$", 11)) {
-		data += 11;
-
+	} else if (!strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN)) {
+		data += FORMAT_TAG_LEN;
+		if (strncmp(data, "23$", 3)) return 0;
+		data += 3;
 		// user field
 		p = strchr(data, '$');
 		if (!p || p - data > MAX_USERLEN)
@@ -285,7 +299,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 		// timestamp+checksum
 		p += strlen(data) + 1;
 		if (*p || p - data != (TIMESTAMP_SIZE + CHECKSUM_SIZE) * 2 ||
-		    strspn(data, HEXCHARS) != p - data)
+		    strspn(data, HEXCHARS_all) != p - data)
 			return 0;
 
 		return 1;
@@ -295,8 +309,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 
 static void set_key(char *key, int index)
 {
-	saved_len[index] = strlen(key);
-	memcpy(saved_plain[index], key, saved_len[index] + 1);
+	saved_len[index] = strnzcpyn(saved_plain[index], key, sizeof(*saved_plain));
 	keys_prepared = 0;
 }
 
@@ -307,16 +320,15 @@ static char *get_key(int index)
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
+	const int count = *pcount;
 	const unsigned char one[] = { 1, 0, 0, 0 };
-	int i = 0;
+	int i;
 
 	if (!keys_prepared) {
 #ifdef _OPENMP
 #pragma omp parallel for
-		for (i = 0; i < count; i++)
 #endif
-		{
+		for (i = 0; i < count; i++) {
 			int len;
 			unsigned char K[KEY_SIZE];
 			unsigned char K1[KEY_SIZE];
@@ -338,9 +350,8 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (i = 0; i < count; i++)
 #endif
-	{
+	for (i = 0; i < count; i++) {
 		unsigned char K3[KEY_SIZE], cleartext[TIMESTAMP_SIZE];
 		HMACMD5Context ctx;
 		// key set up with K1 is stored in saved_ctx[i]
@@ -374,11 +385,10 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#ifdef _OPENMP
+	int index;
+
 	for (index = 0; index < count; index++)
-#endif
-		if (*(ARCH_WORD_32*)binary == output[index][0])
+		if (*(uint32_t*)binary == output[index][0])
 			return 1;
 	return 0;
 }
@@ -393,13 +403,8 @@ static int cmp_exact(char *source, int index)
 	return 1;
 }
 
-static int get_hash_0(int index) { return output[index][0] & 0xf; }
-static int get_hash_1(int index) { return output[index][0] & 0xff; }
-static int get_hash_2(int index) { return output[index][0] & 0xfff; }
-static int get_hash_3(int index) { return output[index][0] & 0xffff; }
-static int get_hash_4(int index) { return output[index][0] & 0xfffff; }
-static int get_hash_5(int index) { return output[index][0] & 0xffffff; }
-static int get_hash_6(int index) { return output[index][0] & 0x7ffffff; }
+#define COMMON_GET_HASH_VAR output
+#include "common-get-hash.h"
 
 static int salt_hash(void *salt)
 {
@@ -413,6 +418,7 @@ struct fmt_main fmt_mskrb5 = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
 		BINARY_ALIGN,
@@ -420,23 +426,20 @@ struct fmt_main fmt_mskrb5 = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_OMP | FMT_UNICODE | FMT_UTF8,
-#if FMT_MAIN_VERSION > 11
+		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_OMP | FMT_UNICODE | FMT_ENC,
 		{ NULL },
-#endif
+		{ FORMAT_TAG },
 		tests
 	}, {
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		fmt_default_prepare,
 		valid,
 		split,
-		binary,
-		salt,
-#if FMT_MAIN_VERSION > 11
+		get_binary,
+		get_salt,
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash_0,
@@ -448,22 +451,20 @@ struct fmt_main fmt_mskrb5 = {
 			fmt_default_binary_hash_6
 		},
 		salt_hash,
+		NULL,
 		set_salt,
 		set_key,
 		get_key,
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

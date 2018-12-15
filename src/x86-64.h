@@ -1,6 +1,6 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 2003,2006,2008,2010,2011 by Solar Designer
+ * Copyright (c) 2003,2006,2008,2010,2011,2015 by Solar Designer
  *
  * ...with a trivial change in the jumbo patch, by Alain Espinosa.
  *
@@ -32,28 +32,63 @@
 #define ARCH_BITS_STR			"64"
 #define ARCH_LITTLE_ENDIAN		1
 #define ARCH_INT_GT_32			0
-#define ARCH_ALLOWS_UNALIGNED		1
 #endif
 
+#if !defined(ARCH_ALLOWS_UNALIGNED)
+#define ARCH_ALLOWS_UNALIGNED		1
+#endif
 #define ARCH_INDEX(x)			((unsigned int)(unsigned char)(x))
 
 #define CPU_DETECT			0
+
+#if !defined(JOHN_NO_SIMD) && defined(__SSE2__)
 #define CPU_NAME			"SSE2"
-
-#ifdef __SSSE3__
-#undef CPU_NAME
-#define CPU_NAME		"SSSE3"
-#endif
-#ifdef __SSE4_1__
-#undef CPU_NAME
-#define CPU_NAME		"SSE4.1"
 #endif
 
-#ifdef __XOP__
-#define JOHN_XOP
+#if !defined(JOHN_NO_SIMD) && (__SSSE3__ || JOHN_SSSE3)
+#undef CPU_DETECT
+#define CPU_DETECT			1
+#define CPU_REQ				1
+#define CPU_REQ_SSSE3			1
+#undef CPU_NAME
+#define CPU_NAME			"SSSE3"
+#if CPU_FALLBACK && !defined(CPU_FALLBACK_BINARY)
+#define CPU_FALLBACK_BINARY		"john-non-ssse3"
+#define CPU_FALLBACK_BINARY_DEFAULT
 #endif
-#if defined(__AVX__) || defined(JOHN_XOP)
-#define JOHN_AVX
+#endif
+
+#if !defined(JOHN_NO_SIMD) && (__SSE4_1__ || JOHN_SSE4_1)
+#undef CPU_DETECT
+#define CPU_DETECT			1
+#define CPU_REQ				1
+#define CPU_REQ_SSE4_1			1
+#undef CPU_NAME
+#define CPU_NAME			"SSE4.1"
+#if CPU_FALLBACK && !defined(CPU_FALLBACK_BINARY)
+#define CPU_FALLBACK_BINARY		"john-non-sse4.1"
+#define CPU_FALLBACK_BINARY_DEFAULT
+#endif
+#endif
+
+#if !defined(JOHN_NO_SIMD) && (__SSE4_2__ || JOHN_SSE4_2)
+#undef CPU_DETECT
+#define CPU_DETECT			1
+#define CPU_REQ				1
+#define CPU_REQ_SSE4_2			1
+#undef CPU_NAME
+#define CPU_NAME			"SSE4.2"
+#if CPU_FALLBACK && !defined(CPU_FALLBACK_BINARY)
+#define CPU_FALLBACK_BINARY		"john-non-sse4.2"
+#define CPU_FALLBACK_BINARY_DEFAULT
+#endif
+#endif
+
+#if !defined(JOHN_NO_SIMD) && defined(__XOP__)
+#define JOHN_XOP			1
+#endif
+#if !defined(JOHN_NO_SIMD) && (defined(__AVX__) || defined(JOHN_XOP) || defined(JOHN_AVX2))
+#define JOHN_AVX			1
 #endif
 
 #define DES_ASM				0
@@ -64,10 +99,10 @@
 #define DES_EXTB			1
 #define DES_COPY			0
 #define DES_BS				1
-#if 0
+#if defined(JOHN_NO_SIMD) || !defined(__SSE2__)
 #define DES_BS_VECTOR			0
 #define DES_BS_ALGORITHM_NAME		"DES 64/64"
-#elif defined(JOHN_AVX) && (defined(__GNUC__) || defined(_OPENMP))
+#elif !defined(JOHN_NO_SIMD) && defined(JOHN_AVX) && (defined(__GNUC__) || defined(_OPENMP))
 /*
  * Require gcc for AVX/XOP because DES_bs_all is aligned in a gcc-specific way,
  * except in OpenMP-enabled builds, where it's aligned by different means.
@@ -75,12 +110,9 @@
 #undef CPU_DETECT
 #define CPU_DETECT			1
 #define CPU_REQ				1
-#define CPU_REQ_AVX
+#define CPU_REQ_AVX			1
 #undef CPU_NAME
 #define CPU_NAME			"AVX"
-#ifndef CPU_FALLBACK
-#define CPU_FALLBACK			0
-#endif
 #if CPU_FALLBACK && !defined(CPU_FALLBACK_BINARY)
 #define CPU_FALLBACK_BINARY		"john-non-avx"
 #define CPU_FALLBACK_BINARY_DEFAULT
@@ -126,17 +158,19 @@
 #define DES_BS_VECTOR_SIZE		8
 #define DES_BS_VECTOR			5
 #define DES_BS_ALGORITHM_NAME		"DES 256/256 AVX-16 + 64/64"
-#elif 0
+#elif __AVX2__ || JOHN_AVX2
 /* 256-bit as 1x256 */
 #define DES_BS_VECTOR			4
-#if defined(JOHN_XOP) && defined(__GNUC__)
-/* Require gcc for 256-bit XOP because of __builtin_ia32_vpcmov_v8sf256() */
-#undef DES_BS
-#define DES_BS				3
-#define DES_BS_ALGORITHM_NAME		"DES 256/256 XOP-16"
-#else
-#define DES_BS_ALGORITHM_NAME		"DES 256/256 AVX-16"
+#undef CPU_NAME
+#define CPU_NAME			"AVX2"
+#define CPU_DETECT			1
+#define CPU_REQ				1
+#define CPU_REQ_AVX2			1
+#if CPU_FALLBACK && !defined(CPU_FALLBACK_BINARY)
+#define CPU_FALLBACK_BINARY		"john-non-avx2"
+#define CPU_FALLBACK_BINARY_DEFAULT
 #endif
+#define DES_BS_ALGORITHM_NAME		"DES 256/256 AVX2-16"
 #elif 0
 /* 256-bit as 2x128 */
 #define DES_BS_NO_AVX256
@@ -159,7 +193,7 @@
 #define DES_BS_ALGORITHM_NAME		"DES 128/128 AVX-16"
 #endif
 #endif
-#elif (defined(__SSE2__) && defined(_OPENMP))
+#elif !defined(JOHN_NO_SIMD) && (defined(__SSE2__) && defined(_OPENMP))
 #define DES_BS_ASM			0
 #if 1
 #define DES_BS_VECTOR			2
@@ -188,13 +222,43 @@
 #endif
 #define DES_BS_EXPAND			1
 
-#if CPU_DETECT && DES_BS == 3
-#define CPU_REQ_XOP
+#if !defined(JOHN_NO_SIMD) && CPU_DETECT && DES_BS == 3
+#define CPU_REQ_XOP			1
 #undef CPU_NAME
 #define CPU_NAME			"XOP"
 #ifdef CPU_FALLBACK_BINARY_DEFAULT
 #undef CPU_FALLBACK_BINARY
 #define CPU_FALLBACK_BINARY		"john-non-xop"
+#endif
+#endif
+
+#if !defined(JOHN_NO_SIMD) && (__AVX512F__ || JOHN_AVX512F)
+#undef DES_BS_VECTOR
+#define DES_BS_VECTOR			8
+#undef DES_BS_ALGORITHM_NAME
+#define DES_BS_ALGORITHM_NAME		"DES 512/512 AVX-512"
+#undef CPU_DETECT
+#define CPU_DETECT			1
+#define CPU_REQ				1
+#define CPU_REQ_AVX512F			1
+#undef CPU_NAME
+#define CPU_NAME			"AVX512F"
+#if CPU_FALLBACK && !defined(CPU_FALLBACK_BINARY)
+#define CPU_FALLBACK_BINARY		"john-non-avx512f"
+#define CPU_FALLBACK_BINARY_DEFAULT
+#endif
+#endif
+
+#if !defined(JOHN_NO_SIMD) && (__AVX512BW__ || JOHN_AVX512BW)
+#undef CPU_DETECT
+#define CPU_DETECT			1
+#define CPU_REQ				1
+#define CPU_REQ_AVX512BW			1
+#undef CPU_NAME
+#define CPU_NAME			"AVX512BW"
+#if CPU_FALLBACK && !defined(CPU_FALLBACK_BINARY)
+#define CPU_FALLBACK_BINARY		"john-non-avx512bw"
+#define CPU_FALLBACK_BINARY_DEFAULT
 #endif
 #endif
 
@@ -208,115 +272,155 @@
 			 + __GNUC_PATCHLEVEL__)
 #endif
 
-#ifndef MD5_SSE_PARA
-#if defined(__INTEL_COMPILER) || defined(USING_ICC_S_FILE)
-#define MD5_SSE_PARA			3
-#define MD5_N_STR			"12x"
+#ifdef __SSE2__
+
+#if !defined(JOHN_NO_SIMD)
+
+#if __AVX512F__
+#define SIMD_COEF_32 16
+#define SIMD_COEF_64 8
+#elif __AVX2__
+#define SIMD_COEF_32 8
+#define SIMD_COEF_64 4
+#elif __SSE2__
+#define SIMD_COEF_32 4
+#define SIMD_COEF_64 2
+#elif __MMX__
+#define SIMD_COEF_32 2
+#define SIMD_COEF_64 1
+#endif
+
+#ifndef SIMD_PARA_MD4
+#if defined(__INTEL_COMPILER)
+#define SIMD_PARA_MD4			3
 #elif defined(__clang__)
-#define MD5_SSE_PARA			5
-#define MD5_N_STR			"20x"
+#define SIMD_PARA_MD4			4
 #elif defined(__llvm__)
-#define MD5_SSE_PARA			3
-#define MD5_N_STR			"12x"
+#define SIMD_PARA_MD4			3
+#elif defined(__GNUC__) && GCC_VERSION < 40405	// 4.4.5
+#define SIMD_PARA_MD4			1
+#elif defined(__GNUC__) && GCC_VERSION < 40500	// 4.5.0
+#define SIMD_PARA_MD4			3
+#elif defined(__GNUC__) && (GCC_VERSION < 40600 || defined(__XOP__)) // 4.6.0
+#define SIMD_PARA_MD4			2
+#else
+#define SIMD_PARA_MD4			3
+#endif
+#endif
+
+#ifndef SIMD_PARA_MD5
+#if defined(__INTEL_COMPILER)
+#define SIMD_PARA_MD5			3
+#elif defined(__clang__)
+#define SIMD_PARA_MD5			5
+#elif defined(__llvm__)
+#define SIMD_PARA_MD5			3
 #elif defined(__GNUC__) && GCC_VERSION == 30406	// 3.4.6
-#define MD5_SSE_PARA			3
-#define MD5_N_STR			"12x"
+#define SIMD_PARA_MD5			3
 #elif defined(__GNUC__) && GCC_VERSION < 40405	// 4.4.5
-#define MD5_SSE_PARA			1
-#define MD5_N_STR			"4x"
+#define SIMD_PARA_MD5			1
 #elif defined(__GNUC__) && GCC_VERSION < 40500	// 4.5.0
-#define MD5_SSE_PARA			3
-#define MD5_N_STR			"12x"
+#define SIMD_PARA_MD5			3
 #elif defined(__GNUC__) && (GCC_VERSION < 40600 || defined(__XOP__)) // 4.6.0
-#define MD5_SSE_PARA			2
-#define MD5_N_STR			"8x"
+#define SIMD_PARA_MD5			2
 #else
-#define MD5_SSE_PARA			3
-#define MD5_N_STR			"12x"
+#define SIMD_PARA_MD5			3
 #endif
 #endif
 
-#ifndef MD4_SSE_PARA
-#if defined(__INTEL_COMPILER) || defined(USING_ICC_S_FILE)
-#define MD4_SSE_PARA			3
-#define MD4_N_STR			"12x"
+#ifndef SIMD_PARA_SHA1
+#if defined(__INTEL_COMPILER)
+#define SIMD_PARA_SHA1			1
 #elif defined(__clang__)
-#define MD4_SSE_PARA			4
-#define MD4_N_STR			"16x"
+#define SIMD_PARA_SHA1			2
 #elif defined(__llvm__)
-#define MD4_SSE_PARA			3
-#define MD4_N_STR			"12x"
-#elif defined(__GNUC__) && GCC_VERSION < 40405	// 4.4.5
-#define MD4_SSE_PARA			1
-#define MD4_N_STR			"4x"
-#elif defined(__GNUC__) && GCC_VERSION < 40500	// 4.5.0
-#define MD4_SSE_PARA			3
-#define MD4_N_STR			"12x"
-#elif defined(__GNUC__) && (GCC_VERSION < 40600 || defined(__XOP__)) // 4.6.0
-#define MD4_SSE_PARA			2
-#define MD4_N_STR			"8x"
-#else
-#define MD4_SSE_PARA			3
-#define MD4_N_STR			"12x"
-#endif
-#endif
-
-#ifndef SHA1_SSE_PARA
-#if defined(__INTEL_COMPILER) || defined(USING_ICC_S_FILE)
-#define SHA1_SSE_PARA			1
-#define SHA1_N_STR			"4x"
-#elif defined(__clang__)
-#define SHA1_SSE_PARA			2
-#define SHA1_N_STR			"8x"
-#elif defined(__llvm__)
-#define SHA_BUF_SIZ			80
-#define SHA1_SSE_PARA			2
-#define SHA1_N_STR			"8x"
+#define SIMD_PARA_SHA1			2
 #elif defined(__GNUC__) && GCC_VERSION < 40504	// 4.5.4
-#define SHA1_SSE_PARA			1
-#define SHA1_N_STR			"4x"
-#elif !defined(JOHN_AVX) && defined(__GNUC__) && GCC_VERSION > 40700 // 4.7.0
-#define SHA1_SSE_PARA			1
-#define SHA1_N_STR			"4x"
+#define SIMD_PARA_SHA1			1
+#elif !defined(__AVX__) && defined(__GNUC__) && GCC_VERSION > 40700 // 4.7.0
+#define SIMD_PARA_SHA1			1
 #else
-#define SHA1_SSE_PARA			2
-#define SHA1_N_STR			"8x"
+#define SIMD_PARA_SHA1			1
 #endif
+#endif
+
+#ifndef SIMD_PARA_SHA256
+#if __XOP__
+#define SIMD_PARA_SHA256 2
+#else
+#define SIMD_PARA_SHA256 1
+#endif
+#endif
+#ifndef SIMD_PARA_SHA512
+#define SIMD_PARA_SHA512 1
 #endif
 
 #define STR_VALUE(arg)			#arg
-#define PARA_TO_N(n)			"4x" STR_VALUE(n)
+#define PARA_TO_N(n)			STR_VALUE(n) "x"
+#define PARA_TO_MxN(m, n)		STR_VALUE(m) "x" STR_VALUE(n)
 
-#ifndef MD4_N_STR
-#define MD4_N_STR			PARA_TO_N(MD4_SSE_PARA)
-#endif
-#ifndef MD5_N_STR
-#define MD5_N_STR			PARA_TO_N(MD5_SSE_PARA)
-#endif
-#ifndef SHA1_N_STR
-#define SHA1_N_STR			PARA_TO_N(SHA1_SSE_PARA)
-#endif
-
-#ifndef SHA_BUF_SIZ
-#ifdef SHA1_SSE_PARA
-// This can be 80 (old code) or 16 (new code)
-#define SHA_BUF_SIZ			16
+#if SIMD_PARA_MD4 > 1
+#define MD4_N_STR			PARA_TO_MxN(SIMD_COEF_32, SIMD_PARA_MD4)
 #else
-// This must be 80
-#define SHA_BUF_SIZ			80
+#define MD4_N_STR			PARA_TO_N(SIMD_COEF_32)
 #endif
+#if SIMD_PARA_MD5 > 1
+#define MD5_N_STR			PARA_TO_MxN(SIMD_COEF_32, SIMD_PARA_MD5)
+#else
+#define MD5_N_STR			PARA_TO_N(SIMD_COEF_32)
 #endif
-
-#define MMX_TYPE			" SSE2"
-#define MMX_COEF			4
-
-#define BF_ASM				0
-#define BF_SCALE			1
-#define BF_X2				3
+#if SIMD_PARA_SHA1 > 1
+#define SHA1_N_STR			PARA_TO_MxN(SIMD_COEF_32, SIMD_PARA_SHA1)
+#else
+#define SHA1_N_STR			PARA_TO_N(SIMD_COEF_32)
+#endif
+#if SIMD_PARA_SHA256 > 1
+#define SHA256_N_STR		PARA_TO_MxN(SIMD_COEF_32, SIMD_PARA_SHA256)
+#else
+#define SHA256_N_STR		PARA_TO_N(SIMD_COEF_32)
+#endif
+#if SIMD_PARA_SHA512 > 1
+#define SHA512_N_STR		PARA_TO_MxN(SIMD_COEF_64, SIMD_PARA_SHA512)
+#else
+#define SHA512_N_STR		PARA_TO_N(SIMD_COEF_64)
+#endif
 
 #define NT_X86_64
 
-#define MMX_COEF_SHA256 4
-#define MMX_COEF_SHA512 2
+#endif	/* !defined(JOHN_NO_SIMD) */
+
+#define SHA_BUF_SIZ			16
+
+#endif /* __SSE2__ */
+
+#define BF_ASM				0
+#define BF_SCALE			1
+
+/*
+ * 3x (as opposed to 2x) interleaving provides substantial speedup on Core 2
+ * CPUs, as well as slight speedup on some other CPUs.  Unfortunately, it
+ * results in lower cumulative performance with multiple concurrent threads or
+ * processes on some newer SMT-capable CPUs.  While this has nothing to do with
+ * AVX per se, building for AVX implies we do not intend to run on a Core 2
+ * (which has at most SSE4.1), so checking for AVX here provides an easy way to
+ * avoid this performance regression in AVX-enabled builds.  In multi-binary
+ * packages with runtime fallbacks, the AVX-enabled binary would invoke a
+ * non-AVX fallback binary from its john.c if run e.g. on a Core 2.  We could
+ * check for SSE4.2 rather than AVX here, as SSE4.2 was introduced along with
+ * SMT-capable Nehalem microarchitecture CPUs, but apparently those CPUs did
+ * not yet exhibit the performance regression with 3x interleaving.  Besides,
+ * some newer CPUs capable of SSE4.2 but not AVX happen to lack SMT, so will
+ * likely benefit from the 3x interleaving with no adverse effects for the
+ * multi-threaded case.
+ *
+ * In Jumbo, we may get BF_X2 from autoconf (after testing ht cpuid flag).
+ */
+#ifndef BF_X2
+#if !defined(JOHN_NO_SIMD) && __AVX__ && HAVE_HT && _OPENMP
+#define BF_X2				1
+#else
+#define BF_X2				3
+#endif
+#endif
 
 #endif

@@ -20,20 +20,28 @@
  *
  */
 
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_FGT;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_FGT);
+#else
+
 #include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "common.h"
 #include "formats.h"
 #include "misc.h"
-
 #include "sha.h"
-#include "base64.h"
-#include "sse-intrinsics.h"
+#include "base64_convert.h"
 #include "memdbg.h"
 
 #define FORMAT_LABEL		"Fortigate"
 #define FORMAT_NAME             "FortiOS"
-#define ALGORITHM_NAME		"SHA1 " SHA1_ALGORITHM_NAME
+#define ALGORITHM_NAME		"SHA1 32/" ARCH_BITS_STR
 
 #define BENCHMARK_COMMENT	""
 #define BENCHMARK_LENGTH	0
@@ -51,12 +59,17 @@
 #define FORTINET_MAGIC_LENGTH   24
 
 #define MIN_KEYS_PER_CRYPT		1
-#ifdef _OPENMP
-#define MAX_KEYS_PER_CRYPT		(0x200 * 3)
-#else
-#define MAX_KEYS_PER_CRYPT		0x100
-#endif
+#define MAX_KEYS_PER_CRYPT		512
 
+#ifdef __MIC__
+#ifndef OMP_SCALE
+#define OMP_SCALE               16
+#endif
+#else
+#ifndef OMP_SCALE
+#define OMP_SCALE               2 // Tuned w/ MKPC for core i7
+#endif
+#endif // __MIC__
 
 static struct fmt_tests fgt_tests[] =
 {
@@ -68,10 +81,28 @@ static struct fmt_tests fgt_tests[] =
 
 static SHA_CTX ctx_salt;
 
-static char saved_key[MAX_KEYS_PER_CRYPT][PLAINTEXT_LENGTH + 1];
-static int saved_key_len[MAX_KEYS_PER_CRYPT];
+static char (*saved_key)[PLAINTEXT_LENGTH + 1];
+static int (*saved_key_len);
+static uint32_t (*crypt_key)[BINARY_SIZE / sizeof(uint32_t)];
 
-static ARCH_WORD_32 crypt_key[MAX_KEYS_PER_CRYPT][BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static void init(struct fmt_main *self)
+{
+	omp_autotune(self, OMP_SCALE);
+
+	saved_key = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*saved_key));
+	crypt_key = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*crypt_key));
+	saved_key_len = mem_calloc(self->params.max_keys_per_crypt,
+	                           sizeof(*saved_key_len));
+}
+
+static void done(void)
+{
+	MEM_FREE(saved_key_len);
+	MEM_FREE(crypt_key);
+	MEM_FREE(saved_key);
+}
 
 static int valid(char *ciphertext, struct fmt_main *self)
 {
@@ -87,11 +118,12 @@ static void * get_salt(char *ciphertext)
 {
 	static union {
 		char b[SALT_SIZE];
-		ARCH_WORD_32 dummy;
+		uint32_t dummy;
 	} out;
 	char buf[SALT_SIZE+BINARY_SIZE+1];
 
-	base64_decode(ciphertext+3, CIPHERTEXT_LENGTH, buf);
+	base64_convert(ciphertext+3, e_b64_mime, CIPHERTEXT_LENGTH, buf, e_b64_raw, sizeof(buf), flg_Base64_NO_FLAGS, 0);
+
 	memcpy(out.b, buf, SALT_SIZE);
 
 	return out.b;
@@ -105,8 +137,7 @@ static void set_salt(void *salt)
 
 static void set_key(char *key, int index)
 {
-	strnzcpy(saved_key[index], key, PLAINTEXT_LENGTH+1);
-	saved_key_len[index] = strlen(key);
+	saved_key_len[index] = strnzcpyn(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char * get_key(int index)
@@ -114,16 +145,17 @@ static char * get_key(int index)
 	return saved_key[index];
 }
 
-static void * binary(char *ciphertext)
+static void * get_binary(char *ciphertext)
 {
 	static union {
 		char b[BINARY_SIZE];
-		ARCH_WORD_32 dummy;
+		uint32_t dummy;
 	} bin;
 	char buf[SALT_SIZE+BINARY_SIZE+1];
 
 	memset(buf, 0, sizeof(buf));
-	base64_decode(ciphertext+3, CIPHERTEXT_LENGTH, buf);
+	base64_convert(ciphertext+3, e_b64_mime, CIPHERTEXT_LENGTH, buf, e_b64_raw, sizeof(buf), flg_Base64_NO_FLAGS, 0);
+
 	// skip over the 12 bytes of salt and get only the hashed password
 	memcpy(bin.b, buf+SALT_SIZE, BINARY_SIZE);
 
@@ -133,11 +165,11 @@ static void * binary(char *ciphertext)
 
 static int cmp_all(void *binary, int count)
 {
-	ARCH_WORD_32 b0 = *(ARCH_WORD_32 *)binary;
+	uint32_t b0 = *(uint32_t *)binary;
 	int i;
 
 	for (i = 0; i < count; i++) {
-		if (b0 != *(ARCH_WORD_32 *)crypt_key[i])
+		if (b0 != *(uint32_t *)crypt_key[i])
 			continue;
 		if (!memcmp(binary, crypt_key[i], BINARY_SIZE))
 			return 1;
@@ -161,7 +193,7 @@ static int cmp_exact(char *source, int index)
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	int count = *pcount;
-	int i;
+	int i=0;
 	char *cp=FORTINET_MAGIC;
 
 #ifdef _OPENMP
@@ -180,19 +212,12 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 }
 
 
-
-static int get_hash_0(int index) { return ((ARCH_WORD_32 *)(crypt_key[index]))[0] & 0xf; }
-static int get_hash_1(int index) { return ((ARCH_WORD_32 *)(crypt_key[index]))[0] & 0xff; }
-static int get_hash_2(int index) { return ((ARCH_WORD_32 *)(crypt_key[index]))[0] & 0xfff; }
-static int get_hash_3(int index) { return ((ARCH_WORD_32 *)(crypt_key[index]))[0] & 0xffff; }
-static int get_hash_4(int index) { return ((ARCH_WORD_32 *)(crypt_key[index]))[0] & 0xfffff; }
-static int get_hash_5(int index) { return ((ARCH_WORD_32 *)(crypt_key[index]))[0] & 0xffffff; }
-static int get_hash_6(int index) { return ((ARCH_WORD_32 *)(crypt_key[index]))[0] & 0x7ffffff; }
-
+#define COMMON_GET_HASH_VAR crypt_key
+#include "common-get-hash.h"
 
 static int salt_hash(void *salt)
 {
-	ARCH_WORD_32 mysalt = *(ARCH_WORD_32 *)salt;
+	uint32_t mysalt = *(uint32_t *)salt;
 	return mysalt & (SALT_HASH_SIZE - 1);
 }
 
@@ -203,6 +228,7 @@ struct fmt_main fmt_FGT = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
 		BINARY_ALIGN,
@@ -211,22 +237,19 @@ struct fmt_main fmt_FGT = {
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT | FMT_OMP ,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
+		{ NULL },
 		fgt_tests
 	}, {
-		fmt_default_init,
-		fmt_default_done,
+		init,
+		done,
 		fmt_default_reset,
 		fmt_default_prepare,
 		valid,
 		fmt_default_split,
-		binary,
+		get_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash_0,
@@ -238,22 +261,20 @@ struct fmt_main fmt_FGT = {
 			fmt_default_binary_hash_6
 		},
 		salt_hash,
+		NULL,
 		set_salt,
 		set_key,
 		get_key,
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

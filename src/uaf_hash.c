@@ -16,15 +16,20 @@
  */
 #ifndef _uaf_hash_
 #define _uaf_hash_
-#include "uaf_encode_plug.c"
+#include "uaf_encode.c"
 
 #ifdef VMS
-#	include <ssdef.h>
+#include <ssdef.h>
+#define SSs_ABORT SS$_ABORT
+#define SSs_BADPARAM SS$_BADPARAM
+#define SSs_NORMAL SS$_NORMAL
 #else
-#	define SS$_ABORT	44
-#	define SS$_BADPARAM     20
-#	define SS$_NORMAL	1
-#	define __SSDEF_LOADED	1
+/*
+ * Emulate symbols defined for VMS services.
+ */
+#define SSs_ABORT        44
+#define SSs_BADPARAM     20
+#define SSs_NORMAL        1
 #endif
 
 #include "memdbg.h"
@@ -72,7 +77,7 @@ Comments:	The overall speed of this routine is not great.  This is
 
 */
 
-typedef struct dsc$descriptor_s string;
+typedef struct dsc_descriptor_s string;
 
 
 /*
@@ -172,19 +177,19 @@ static int hash_password (
     if ((encrypt < 1) || (encrypt > 3)) {
 	  puts("BAD BAD!");
 	    return -1;
-//         exit(SS$_BADPARAM);
+//         exit(SSs_BADPARAM);
     }
-    if (username->dsc$w_length > 31) {
+    if (username->dsc_w_length > 31) {
 	    puts("2");
 	printf("Internal coding error, username is more than 31 bytes long.\n");
-	exit(SS$_ABORT);
+	exit(SSs_ABORT);
     }
 
 
     /* Setup pointer references */
     r3 = password;			/* 1st COLLAPSE uses the password desc.   */
     r4 = &qword;			/* @r4..@r4+7 equals obuf */
-    r5 = username->dsc$w_length;
+    r5 = username->dsc_w_length;
     r7 = (encrypt == 3);
 
     /* Clear the output buffer (zero the quadword) */
@@ -193,41 +198,41 @@ static int hash_password (
     UAF_QW_SET(*output_hash,0);
 
     /* Check for the null password and return zero as the hash value if so */
-    if (password->dsc$w_length == 0) {
-	return SS$_NORMAL;
+    if (password->dsc_w_length == 0) {
+	return SSs_NORMAL;
     }
 
     switch (encrypt) {
       int ulen;
-      case UAI$C_AD_II:		/* CRC algorithm with Autodin II poly */
+      case UAIsC_AD_II:		/* CRC algorithm with Autodin II poly */
 	/* As yet unsupported */
-	return SS$_BADPARAM;
+	return SSs_BADPARAM;
 
-      case UAI$C_PURDY:		/* Purdy algorithm */
+      case UAIsC_PURDY:		/* Purdy algorithm */
 
 	/* Use a blank padded username */
 	strncpy(uname,"            ",sizeof(uname));
-	strncpy(uname, username->dsc$a_pointer, r5);
-	username->dsc$a_pointer = (char *)&uname;
-	username->dsc$w_length = 12;
+	strncpy(uname, username->dsc_a_pointer, r5);
+	username->dsc_a_pointer = (char *)&uname;
+	username->dsc_w_length = 12;
 	break;
 
-      case UAI$C_PURDY_V:		/* Purdy with blanks stripped */
-      case UAI$C_PURDY_S:		/* Hickory algorithm; Purdy_V with rotation */
+      case UAIsC_PURDY_V:		/* Purdy with blanks stripped */
+      case UAIsC_PURDY_S:		/* Hickory algorithm; Purdy_V with rotation */
 
 	/* Check padding.  Don't count blanks in the string length.
 	* Remember:  r6->username_descriptor   the first word is length, then
 	* 2 bytes of class information (4 bytes total), then the address of the
 	* buffer.  Usernames can not be longer than 31 characters.
 	*/
-	for ( ulen = username->dsc$w_length; ulen > 0; ulen-- ) {
-	    if ( username->dsc$a_pointer[ulen-1] != ' ' ) break;
-	    username->dsc$w_length--;
+	for ( ulen = username->dsc_w_length; ulen > 0; ulen-- ) {
+	    if ( username->dsc_a_pointer[ulen-1] != ' ' ) break;
+	    username->dsc_w_length--;
 	}
 
 	/* If Purdy_S:  Bytes 0-1 => plaintext length */
 	if (r7) {
-	   r4->ulw[0] = password->dsc$w_length;
+	   r4->ulw[0] = password->dsc_w_length;
 	}
 
 	break;
@@ -255,7 +260,7 @@ static int hash_password (
 
 
     /* Collapse the username into the quadword */
-    r3 = username;		/* Point r3 to the valid username desriptor */
+    r3 = username;		/* Point r3 to the valid username descriptor */
     COLLAPSE_R2 (r3, r4, r7);
 
     /* U (qword) contains the 8 character output buffer in quadword format */
@@ -267,7 +272,7 @@ static int hash_password (
     *((quad *) output_hash) = qword;
 
     /* Normal exit */
-    return SS$_NORMAL;
+    return SSs_NORMAL;
 
 } /* LGI$HPWD */
 
@@ -302,11 +307,11 @@ static void COLLAPSE_R2 (string *r3, quad *r4, char r7)
 
     /* --------------------------------------------------------------------- */
 
-    r0 = r3->dsc$w_length;		/* Obtain the number of input bytes */
+    r0 = r3->dsc_w_length;		/* Obtain the number of input bytes */
 
     if (r0 == 0) return;		/* Do nothing with empty string */
 
-    r2 = r3->dsc$a_pointer;		/* Obtain pointer to input string */
+    r2 = r3->dsc_a_pointer;		/* Obtain pointer to input string */
 
     for (; (r0 != 0); r0--) {		/* Loop until input string exhausted */
 
@@ -546,7 +551,7 @@ static void PQEXP_pair (quad *U, int highbit, uaf_lword n0,
  * 4.6.3, "Evaluation of Powers."  This algorithm is for calculating U^n with
  * fewer than (n-1) multiplies.  The result is U^n MOD P only because the
  * multiplication routine is MOD P.  Knuth's example is from Pingala's Hindu
- * algorthim in the Chandah-sutra.
+ * algorithm in the Chandah-sutra.
  */
 
 {

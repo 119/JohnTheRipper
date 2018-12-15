@@ -1,6 +1,6 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 1996-2003,2006,2010,2013 by Solar Designer
+ * Copyright (c) 1996-2003,2006,2010,2013,2015 by Solar Designer
  *
  * ...with changes in the jumbo patch, by JimF and magnum.
  *
@@ -10,31 +10,27 @@
  * There's ABSOLUTELY NO WARRANTY, express or implied.
  */
 
+#if _XOPEN_SOURCE < 500
+#undef _XOPEN_SOURCE
 #define _XOPEN_SOURCE 500 /* for setitimer(2) and siginterrupt(3) */
-
-#ifdef __ultrix__
-#define __POSIX
-#define _POSIX_SOURCE
 #endif
 
 #define NEED_OS_TIMER
 #define NEED_OS_FORK
 #include "os.h"
 
-#if HAVE_WINDOWS_H
+#if _MSC_VER || __MINGW32__ || __MINGW64__ || HAVE_WINDOWS_H
 #define WIN32_SIGNAL_HANDLER
 #define SIGALRM SIGFPE
 #define SIGHUP SIGILL
+#include <windows.h>
 #endif
 
-#ifdef _SCO_C_DIALECT
-#include <limits.h>
-#endif
 #include <stdio.h>
-#if HAVE_SYS_TIME_H
+#if !AC_BUILT || HAVE_SYS_TIME_H
 #include <sys/time.h>
 #endif
-#if HAVE_UNISTD_H
+#if (!AC_BUILT || HAVE_UNISTD_H) && !_MSC_VER
 #include <unistd.h>
 #endif
 #include <stdlib.h>
@@ -44,10 +40,6 @@
 
 #if HAVE_DOS_H
 #include <dos.h>
-#endif
-
-#if HAVE_WINDOWS_H
-#include <windows.h>
 #endif
 
 #include "arch.h"
@@ -60,9 +52,7 @@
 #include "john.h"
 #include "status.h"
 #include "signals.h"
-#ifdef HAVE_MPI
-#include "john-mpi.h"
-#endif
+#include "john_mpi.h"
 #include "memdbg.h"
 
 volatile int event_pending = 0, event_reload = 0;
@@ -71,9 +61,13 @@ volatile int event_ticksafety = 0;
 volatile int event_mpiprobe = 0, event_poll_files = 0;
 
 volatile int timer_abort = 0, timer_status = 0;
-static int timer_save_interval, timer_save_value;
+static int timer_save_interval;
+#ifndef BENCH_BUILD
+static int timer_save_value;
+#endif
 static clock_t timer_ticksafety_interval, timer_ticksafety_value;
 volatile int aborted_by_timer = 0;
+static int abort_grace_time = 30;
 
 #if !OS_TIMER
 
@@ -82,6 +76,7 @@ volatile int aborted_by_timer = 0;
 #include <sys/times.h>
 #endif
 
+static int timer_emu_running;
 static clock_t timer_emu_interval = 0;
 static unsigned int timer_emu_count = 0, timer_emu_max = 0;
 
@@ -89,6 +84,7 @@ void sig_timer_emu_init(clock_t interval)
 {
 	timer_emu_interval = interval;
 	timer_emu_count = 0; timer_emu_max = 0;
+	timer_emu_running = 1;
 }
 
 void sig_timer_emu_tick(void)
@@ -99,7 +95,10 @@ void sig_timer_emu_tick(void)
 	struct tms buf;
 #endif
 
-	if (++timer_emu_count < timer_emu_max) return;
+	if (!timer_emu_running)
+		return;
+	if (++timer_emu_count < timer_emu_max)
+		return;
 
 #if defined (__MINGW32__) || defined (_MSC_VER)
 	current = clock();
@@ -124,6 +123,16 @@ void sig_timer_emu_tick(void)
 	raise(SIGALRM);
 }
 
+#endif
+
+#if OS_FORK
+static void signal_children(int signum)
+{
+	int i;
+	for (i = 0; i < john_child_count; i++)
+		if (john_child_pids[i])
+			kill(john_child_pids[i], signum);
+}
 #endif
 
 static void sig_install(void *handler, int signum)
@@ -154,26 +163,38 @@ static void sig_remove_update(void)
 	signal(SIGHUP, SIG_IGN);
 }
 
+#ifdef SIGUSR2
+static void sig_remove_reload(void)
+{
+	signal(SIGUSR2, SIG_IGN);
+}
+#endif
+
 void check_abort(int be_async_signal_safe)
 {
+	char *abort_msg = (aborted_by_timer) ?
+		"Session stopped (max run-time reached)\n" :
+		"Session aborted\n";
+
 	if (!event_abort) return;
 
 	tty_done();
 
+	MEMDBG_PROGRAM_EXIT_CHECKS(stderr);
+
+#ifndef BENCH_BUILD
+	if (john_max_cands && status.cands >= john_max_cands)
+		abort_msg = "Session stopped (max candidates reached)\n";
+#endif
+
 	if (be_async_signal_safe) {
-		if (john_main_process) {
-			if (aborted_by_timer)
-				write_loop(2, "Session stopped (max run-time"
-				           " reached)\n", 39);
-			else
-				write_loop(2, "Session aborted\n", 16);
-		}
+		if (john_main_process)
+			write_loop(2, abort_msg, strlen(abort_msg));
 		_exit(1);
 	}
 
 	if (john_main_process)
-		fprintf(stderr, "Session %s\n", (aborted_by_timer) ?
-		        "stopped (max run-time reached)" : "aborted");
+		fprintf(stderr, "%s", abort_msg);
 	error();
 }
 
@@ -182,6 +203,38 @@ static void sig_install_abort(void);
 static void sig_handle_abort(int signum)
 {
 	int saved_errno = errno;
+
+#if OS_FORK
+	if (john_main_process && !aborted_by_timer) {
+/*
+ * We assume that our children are running on the same tty with us, so if we
+ * receive a SIGINT they probably do as well without us needing to forward the
+ * signal to them.  If we forwarded the signal anyway, this could result in
+ * them receiving the signal twice for a single Ctrl-C keypress and proceeding
+ * with immediate abort without updating the files, which is behavior that we
+ * reserve for (presumably intentional) repeated Ctrl-C keypress.
+ *
+ * We forward the signal as SIGINT even though ours was different (typically a
+ * SIGTERM) in order not to trigger a repeated same signal for children if the
+ * user does e.g. "killall john", which would send SIGTERM directly to children
+ * and also have us forward a signal.
+ */
+		if (signum != SIGINT)
+			signal_children(SIGINT);
+	} else {
+		static int prev_signum;
+/*
+ * If it's not the same signal twice in a row, don't proceed with immediate
+ * abort since these two signals could have been triggered by the same killall
+ * (perhaps a SIGTERM from killall directly and a SIGINT as forwarded by our
+ * parent).  event_abort would be set back to 1 just below the check_abort()
+ * call.  We only reset it to 0 temporarily to skip the immediate abort here.
+ */
+		if (prev_signum && signum != prev_signum)
+			event_abort = 0;
+		prev_signum = signum;
+	}
+#endif
 
 	check_abort(1);
 
@@ -195,7 +248,7 @@ static void sig_handle_abort(int signum)
 }
 
 #ifdef WIN32_SIGNAL_HANDLER
-#ifdef __CYGWIN32__
+#ifdef __CYGWIN__
 static CALLBACK BOOL sig_handle_abort_ctrl(DWORD ctrltype)
 #else
 static BOOL WINAPI sig_handle_abort_ctrl(DWORD ctrltype)
@@ -211,6 +264,13 @@ static void sig_install_abort(void)
 #ifdef __DJGPP__
 	setcbrk(1);
 #elif defined(WIN32_SIGNAL_HANDLER)
+/*
+ * "If the HandlerRoutine parameter is NULL, [...] a FALSE value restores
+ * normal processing of CTRL+C input.  This attribute of ignoring or processing
+ * CTRL+C is inherited by child processes."  So restore normal processing here
+ * in case our parent (such as Johnny the GUI) had disabled it.
+ */
+	SetConsoleCtrlHandler(NULL, FALSE);
 	SetConsoleCtrlHandler(sig_handle_abort_ctrl, TRUE);
 #endif
 
@@ -240,18 +300,12 @@ static void sig_remove_abort(void)
 #endif
 }
 
-#if OS_FORK
-static void signal_children(int signum)
-{
-	int i;
-	for (i = 0; i < john_child_count; i++)
-		if (john_child_pids[i])
-			kill(john_child_pids[i], signum);
-}
-#endif
-
 static void sig_install_timer(void);
+#ifndef BENCH_BUILD
+#ifdef SIGUSR2
 static void sig_handle_reload(int signum);
+#endif
+#endif
 
 static void sig_handle_timer(int signum)
 {
@@ -260,20 +314,20 @@ static void sig_handle_timer(int signum)
 	unsigned int time;
 #endif
 #ifndef BENCH_BUILD
-	/* Some stuff only done every third second */
-	if ((timer_save_value & 3) == 3) {
+#if OS_TIMER
+	/* Some stuff only done every few seconds */
+	if (timer_save_interval < 4 ||
+	    ((timer_save_interval - timer_save_value) & 3) == 3) {
 #ifdef HAVE_MPI
 		if (!event_reload && mpi_p > 1) {
 			event_pending = event_mpiprobe = 1;
 		}
 #endif
-#ifdef SIGUSR2
-
 		event_poll_files = event_pending = 1;
+#ifdef SIGUSR2
 		sig_install(sig_handle_reload, SIGUSR2);
 #endif
 	}
-#if OS_TIMER
 	if (!--timer_save_value) {
 		timer_save_value = timer_save_interval;
 		event_save = event_pending = 1;
@@ -281,7 +335,12 @@ static void sig_handle_timer(int signum)
 	}
 	if (timer_abort && !--timer_abort) {
 		aborted_by_timer = 1;
-		timer_abort = 3;
+		if (abort_grace_time > 0)
+			timer_abort = abort_grace_time;
+		else if (abort_grace_time < 0)
+			timer_abort = 0;
+		else /* no grace time, kill immediately */
+			event_abort = 1;
 		sig_handle_abort(0);
 	}
 	if (timer_status && !--timer_status) {
@@ -291,6 +350,18 @@ static void sig_handle_timer(int signum)
 #else /* no OS_TIMER */
 	time = status_get_time();
 
+	/* Some stuff only done every few seconds */
+	if ((time & 3) == 3) {
+#ifdef HAVE_MPI
+		if (!event_reload && mpi_p > 1) {
+			event_pending = event_mpiprobe = 1;
+		}
+#endif
+		event_poll_files = event_pending = 1;
+#ifdef SIGUSR2
+		sig_install(sig_handle_reload, SIGUSR2);
+#endif
+	}
 	if (time >= timer_save_value) {
 		timer_save_value += timer_save_interval;
 		event_save = event_pending = 1;
@@ -298,7 +369,12 @@ static void sig_handle_timer(int signum)
 	}
 	if (timer_abort && time >= timer_abort) {
 		aborted_by_timer = 1;
-		timer_abort += 3;
+		if (abort_grace_time > 0)
+			timer_abort += abort_grace_time;
+		else if (abort_grace_time < 0)
+			timer_abort = 0;
+		else /* no grace time, kill immediately */
+			event_abort = 1;
 		sig_handle_abort(0);
 	}
 	if (timer_status && time >= timer_status) {
@@ -402,6 +478,7 @@ static void sig_remove_timer(void)
 	signal(SIGALRM, SIG_DFL);
 }
 
+#ifdef SIGUSR1
 static void sig_handle_status(int signum)
 {
 	/* We currently disable --fork for Cygwin in os.h due to problems
@@ -424,7 +501,10 @@ static void sig_handle_status(int signum)
 	sig_install(sig_handle_status, signum);
 #endif
 }
+#endif
 
+#ifndef BENCH_BUILD
+#ifdef SIGUSR2
 static void sig_handle_reload(int signum)
 {
 #if OS_FORK && !defined(BENCH_BUILD)
@@ -441,8 +521,20 @@ static void sig_handle_reload(int signum)
 	   in sig_handle_timer() */
 	signal(signum, SIG_IGN);
 }
+#endif
+#endif
 
 static void sig_done(void);
+
+void sig_preinit(void)
+{
+#ifdef SIGUSR2
+	sig_remove_reload();
+#endif
+#ifdef SIGUSR1
+	sig_install(sig_handle_status, SIGUSR1);
+#endif
+}
 
 void sig_init(void)
 {
@@ -454,11 +546,11 @@ void sig_init(void)
 	else
 	if ((timer_save_interval /= TIMER_INTERVAL) <= 0)
 		timer_save_interval = 1;
-#if OS_TIMER
-	timer_save_value = timer_save_interval;
-#elif !defined(BENCH_BUILD)
-	timer_save_value = status_get_time() + timer_save_interval;
-#endif
+	if (cfg_get_param(SECTION_OPTIONS, NULL, "AbortGraceTime")) {
+		abort_grace_time =
+			cfg_get_int(SECTION_OPTIONS, NULL, "AbortGraceTime");
+	}
+
 	timer_ticksafety_interval = (clock_t)1 << (sizeof(clock_t) * 8 - 4);
 	timer_ticksafety_interval /= clk_tck;
 	if ((timer_ticksafety_interval /= TIMER_INTERVAL) <= 0)
@@ -467,21 +559,41 @@ void sig_init(void)
 
 	atexit(sig_done);
 
-	sig_install(sig_handle_update, SIGHUP);
 	sig_install_abort();
-	sig_install_timer();
-#ifdef SIGUSR1
-	sig_install(sig_handle_status, SIGUSR1);
+}
+
+void sig_init_late(void)
+{
+#ifndef BENCH_BUILD
+	unsigned int time;
+
+#if OS_TIMER
+	timer_save_value = timer_save_interval;
+
+	time = 0;
+#else
+	timer_save_value = status_get_time() + timer_save_interval;
+	time = status_get_time();
 #endif
-#ifdef SIGUSR2
-	sig_install(sig_handle_reload, SIGUSR2);
+#endif
+
+	sig_install(sig_handle_update, SIGHUP);
+	sig_install_timer();
+#ifndef BENCH_BUILD
+	if (options.max_run_time)
+		timer_abort = time + abs(options.max_run_time);
+	if (options.status_interval)
+		timer_status = time + options.status_interval;
 #endif
 }
 
 void sig_init_child(void)
 {
-#if OS_TIMER
-	sig_init_timer();
+#ifdef SIGUSR1
+	sig_install(sig_handle_status, SIGUSR1);
+#endif
+#ifdef SIGUSR2
+	sig_remove_reload();
 #endif
 }
 
@@ -490,4 +602,7 @@ static void sig_done(void)
 	sig_remove_update();
 	sig_remove_abort();
 	sig_remove_timer();
+#ifdef SIGUSR2
+	sig_remove_reload();
+#endif
 }

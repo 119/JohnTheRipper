@@ -49,9 +49,11 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <stdarg.h>
-#include "stdint.h"
-#include "md5.h"
+#include <stdint.h>
 #include <openssl/sha.h>
+
+#include "misc.h"	// error()
+#include "md5.h"
 #include "memory.h"
 #include "memdbg.h"
 /* Defines */
@@ -68,18 +70,18 @@
 
 /* PSK parameter entry */
 typedef struct {
-	unsigned char *skeyid_data;	/* Data for SKEYID calculation */
-	unsigned char *hash_r_data;	/* Data for HASH_R calculation */
-	unsigned char *hash_r;	/* HASH_R received from server */
-	char *hash_r_hex;	/* Server HASH_R as hex for display */
-	const char *hash_name;	/* Hash algo. name for display */
-	const char *nortel_user;	/* User for nortel cracking, or NULL */
+	unsigned char skeyid_data[MAXLEN];	/* Data for SKEYID calculation */
+	unsigned char hash_r_data[MAXLEN];	/* Data for HASH_R calculation (must hold SHA1 in hex) */
+	unsigned char hash_r[20];	/* HASH_R received from server */
+	char hash_r_hex[44];	/* Server HASH_R as hex for display */
+	char nortel_user[64];	/* User for nortel cracking, or NULL */
 	size_t skeyid_data_len;	/* Length of skeyid_data field */
 	size_t hash_r_data_len;	/* Length of hash_r_data field */
 	size_t hash_r_len;	/* Length of hash_r field */
 	int hash_type;		/* Hash algorithm used for hmac */
 	int isnortel;
 } psk_entry;
+
 
 /* Functions */
 
@@ -173,10 +175,10 @@ static unsigned char *hex2data(const char *string, size_t * data_len)
  *	This function is based on the code from the RFC 2104 appendix.
  *
  *	We use #ifdef to select either the OpenSSL MD5 functions or the
- *	built-in MD5 functions depending on whether HAVE_OPENSSL is defined.
+ *	built-in MD5 functions depending on whether HAVE_LIBSSL is defined.
  *	This is faster that calling OpenSSL "HMAC" directly.
  */
-static inline unsigned char *hmac_md5(unsigned char *text,
+inline static unsigned char *hmac_md5(unsigned char *text,
     size_t text_len, unsigned char *key, size_t key_len, unsigned char *md)
 {
 	static unsigned char m[16];
@@ -255,10 +257,10 @@ static inline unsigned char *hmac_md5(unsigned char *text,
  *	This function is based on the code from the RFC 2104 appendix.
  *
  *	We use #ifdef to select either the OpenSSL SHA1 functions or the
- *	built-in SHA1 functions depending on whether HAVE_OPENSSL is defined.
+ *	built-in SHA1 functions depending on whether HAVE_LIBSSL is defined.
  *	This is faster that calling OpenSSL "HMAC" directly.
  */
-static inline unsigned char *hmac_sha1(const unsigned char *text,
+inline static unsigned char *hmac_sha1(const unsigned char *text,
     size_t text_len, const unsigned char *key, size_t key_len,
     unsigned char *md)
 {
@@ -356,7 +358,7 @@ load_psk_params(const char *ciphertext, const char *nortel_user,
 	char idir_b_hex[MAXLEN];
 	char ni_b_hex[MAXLEN];
 	char nr_b_hex[MAXLEN];
-	char hash_r_hex[MAXLEN];
+	char hash_r_hex[44];
 	unsigned char *g_xr;	/* Individual PSK params as binary */
 	unsigned char *g_xi;
 	unsigned char *cky_r;
@@ -373,15 +375,15 @@ load_psk_params(const char *ciphertext, const char *nortel_user,
 	size_t idir_b_len;
 	size_t ni_b_len;
 	size_t nr_b_len;
-	size_t hash_r_hex_len;
 	n = sscanf(ciphertext,
 	    "%[^*]*%[^*]*%[^*]*%[^*]*%[^*]*%[^*]*%[^*]*%[^*]*%[^*\r\n]",
 	    g_xr_hex, g_xi_hex, cky_r_hex, cky_i_hex, sai_b_hex,
 	    idir_b_hex, ni_b_hex, nr_b_hex, hash_r_hex);
 	if (n != 9) {
 		fprintf(stderr, "ERROR: Format error in PSK data file\n");
-		exit(-1);
+		error();
 	}
+	memset(pe, 0, sizeof(*pe));
 /*
  *	Convert hex to binary representation, and construct SKEYID
  *	and HASH_R data.
@@ -406,7 +408,7 @@ load_psk_params(const char *ciphertext, const char *nortel_user,
 
 /* skeyid_data = ni_b | nr_b */
 	skeyid_data_len = ni_b_len + nr_b_len;
-	skeyid_data = mem_alloc_tiny(skeyid_data_len, MEM_ALIGN_WORD);
+	skeyid_data = mem_alloc(skeyid_data_len);
 	cp = skeyid_data;
 	memcpy(cp, ni_b, ni_b_len);
 	cp += ni_b_len;
@@ -417,7 +419,7 @@ load_psk_params(const char *ciphertext, const char *nortel_user,
 /* hash_r_data = g_xr | g_xi | cky_r | cky_i | sai_b | idir_b */
 	hash_r_data_len = g_xr_len + g_xi_len + cky_r_len + cky_i_len +
 	    sai_b_len + idir_b_len;
-	hash_r_data = mem_alloc_tiny(hash_r_data_len, MEM_ALIGN_WORD);
+	hash_r_data = mem_alloc(hash_r_data_len);
 	cp = hash_r_data;
 	memcpy(cp, g_xr, g_xr_len);
 	cp += g_xr_len;
@@ -439,19 +441,18 @@ load_psk_params(const char *ciphertext, const char *nortel_user,
 /*
  *	Store the PSK parameters in the current psk list entry.
  */
-	pe->skeyid_data = skeyid_data;
+	memcpy(pe->skeyid_data, skeyid_data, skeyid_data_len);
 	pe->skeyid_data_len = skeyid_data_len;
-	pe->hash_r_data = hash_r_data;
+	memcpy(pe->hash_r_data, hash_r_data, hash_r_data_len);
 	pe->hash_r_data_len = hash_r_data_len;
 	{
 		unsigned char *c = hex2data(hash_r_hex, &pe->hash_r_len);
-		pe->hash_r = mem_alloc_copy(c, pe->hash_r_len, MEM_ALIGN_WORD);
+		memcpy(pe->hash_r, c, pe->hash_r_len);
 		MEM_FREE(c);
 	}
-	hash_r_hex_len = strlen(hash_r_hex) + 1;	/* includes terminating null */
-	pe->hash_r_hex = mem_alloc_tiny(hash_r_hex_len, MEM_ALIGN_WORD);
-	strncpy(pe->hash_r_hex, hash_r_hex, hash_r_hex_len);
-	pe->nortel_user = nortel_user;
+	strncpy(pe->hash_r_hex, hash_r_hex, sizeof(pe->hash_r_hex));
+	if (nortel_user)
+		strcpy(pe->nortel_user, nortel_user);
 /*
  *	Determine hash type based on the length of the hash, and
  *	store this in the current psk list entry.
@@ -464,6 +465,8 @@ load_psk_params(const char *ciphertext, const char *nortel_user,
 		//err_msg("Cannot determine hash type from %u byte HASH_R",
 		//      pe->hash_r_len);
 	}
+	MEM_FREE(skeyid_data);
+	MEM_FREE(hash_r_data);
 }
 
 /*
@@ -491,7 +494,7 @@ load_psk_params(const char *ciphertext, const char *nortel_user,
  *	b) Calculate HASH_R using SKEYID and the other PSK parameters.
  *
  */
-static inline void compute_hash(const psk_entry * psk_params,
+inline static void compute_hash(const psk_entry * psk_params,
     char *password, unsigned char *hash_r)
 {
 	size_t password_len = strlen(password);
@@ -499,9 +502,9 @@ static inline void compute_hash(const psk_entry * psk_params,
 /*
  *	Calculate SKEYID
  */
-	if (psk_params->nortel_user == NULL) {	/* RFC 2409 SKEYID calculation */
+	if (psk_params->nortel_user[0] == 0) {	/* RFC 2409 SKEYID calculation */
 		if (psk_params->hash_type == HASH_TYPE_MD5) {
-			hmac_md5(psk_params->skeyid_data,
+			hmac_md5((unsigned char*)psk_params->skeyid_data,
 			    psk_params->skeyid_data_len,
 			    (unsigned char *) password, password_len, skeyid);
 		} else {	/* SHA1 */
@@ -519,7 +522,7 @@ static inline void compute_hash(const psk_entry * psk_params,
 		    strlen(psk_params->nortel_user), nortel_pwd_hash,
 		    SHA1_HASH_LEN, nortel_psk);
 		if (psk_params->hash_type == HASH_TYPE_MD5) {
-			hmac_md5(psk_params->skeyid_data,
+			hmac_md5((unsigned char*)psk_params->skeyid_data,
 			    psk_params->skeyid_data_len, nortel_psk,
 			    SHA1_HASH_LEN, skeyid);
 		} else {	/* SHA1 */
@@ -532,7 +535,7 @@ static inline void compute_hash(const psk_entry * psk_params,
  *	Calculate HASH_R
  */
 	if (psk_params->hash_type == HASH_TYPE_MD5) {
-		hmac_md5(psk_params->hash_r_data, psk_params->hash_r_data_len,
+		hmac_md5((unsigned char*)psk_params->hash_r_data, psk_params->hash_r_data_len,
 		    skeyid, psk_params->hash_r_len, hash_r);
 	} else {		/* SHA1 */
 		hmac_sha1(psk_params->hash_r_data, psk_params->hash_r_data_len,

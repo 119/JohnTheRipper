@@ -15,6 +15,15 @@
 #ifndef _JOHN_ARCH_H
 #define _JOHN_ARCH_H
 
+#if defined (JOHN_ALTIVEC)
+// in autoconfig builds, we always link to this header,
+// but later KNOW that we are ALTIVEC, so once we know
+// we then include the proper header
+#undef _JOHN_ARCH_H
+#include "ppc64alt.h"
+
+#else
+
 #if AC_BUILT
 #include "autoconfig.h"
 #else
@@ -23,10 +32,15 @@
 #define ARCH_BITS			64
 #define ARCH_BITS_LOG			6
 #define ARCH_BITS_STR			"64"
-#define ARCH_LITTLE_ENDIAN		0
-#define ARCH_INT_GT_32			0
-#define ARCH_ALLOWS_UNALIGNED		0
+#if defined(__LITTLE_ENDIAN__)
+#define ARCH_LITTLE_ENDIAN              1
+#else
+#define ARCH_LITTLE_ENDIAN              0
 #endif
+#define ARCH_INT_GT_32			0
+#endif
+
+#define ARCH_ALLOWS_UNALIGNED		0
 #define ARCH_INDEX(x)			((unsigned int)(unsigned char)(x))
 
 #define CPU_DETECT			0
@@ -40,15 +54,18 @@
 #define DES_COPY			0
 #define DES_BS_ASM			0
 #define DES_BS				1
-#define DES_BS_VECTOR			0
 #define DES_BS_EXPAND			1
+#define DES_BS_VECTOR			0
 
-#define MD5_ASM				0
+#define MD5_ASM			0
 #define MD5_X2				1
-#define MD5_IMM				0
+#define MD5_IMM			0
 
 #define BF_ASM				0
 #define BF_SCALE			0
 #define BF_X2				0
 
+#define SHA_BUF_SIZ			16
+
+#endif
 #endif

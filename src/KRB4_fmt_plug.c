@@ -32,6 +32,12 @@
   ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_KRB4;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_KRB4);
+#else
+
 #include <string.h>
 #include <ctype.h>
 #include <openssl/des.h>
@@ -48,6 +54,10 @@
 
 #define FORMAT_LABEL		"krb4"
 #define FORMAT_NAME		"Kerberos v4 TGT"
+#define FORMAT_TAG		"$af$"
+#define FORMAT_TAG2		"$k4$"
+#define FORMAT_TAG_LEN	(sizeof(FORMAT_TAG)-1)
+
 #define ALGORITHM_NAME		"DES 32/" ARCH_BITS_STR
 #define BENCHMARK_COMMENT	""
 #define BENCHMARK_LENGTH	-1
@@ -94,7 +104,7 @@ static const unsigned char odd_parity[256]={
 
 static struct salt_st {
 	unsigned char		tgt[TGT_LENGTH];
-	char			realm[REALM_SZ];
+	char			realm[REALM_SZ+1];
 } *saved_salt;
 
 static struct key_st {
@@ -106,21 +116,21 @@ static struct key_st {
 
 static int valid(char *ciphertext, struct fmt_main *self)
 {
-	char *p, *tgt;
+	char *tgt;
 
-	if (strncmp(ciphertext, "$k4$", 4) != 0 &&
-	    strncmp(ciphertext, "$af$", 4) != 0)
+	if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN) != 0 &&
+	    strncmp(ciphertext, FORMAT_TAG2, FORMAT_TAG_LEN) != 0)
 		return 0;
-
-	tgt = strchr(ciphertext + 4, '$');
+	ciphertext += FORMAT_TAG_LEN;
+	tgt = strchr(ciphertext, '$');
 
 	if (!tgt)
 		return 0;
-
-	for (p = ++tgt; *p != '\0'; p++)
-		if (!isxdigit((int)*p)) return 0;
-
-	if (p - tgt != TGT_LENGTH * 2)
+	if (tgt-ciphertext > REALM_SZ)
+		return 0;
+	++tgt;
+	if (!ishexlc(tgt)) return 0;
+	if (strlen(tgt) != TGT_LENGTH * 2)
 		return 0;
 
 	return 1;
@@ -151,13 +161,14 @@ static int hex_decode(char *src, unsigned char *dst, int outsize)
 	return (q - dst);
 }
 
-static void *salt(char *ciphertext)
+static void *get_salt(char *ciphertext)
 {
 	static struct salt_st salt;
 	char *p;
 
-	if (strncmp(ciphertext, "$af$", 4) == 0) {
-		ciphertext += 4;
+	memset(&salt, 0, sizeof(salt));
+	if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN) == 0) {
+		ciphertext += FORMAT_TAG_LEN;
 		p = strchr(ciphertext, '$');
 		strnzcpy(salt.realm, ciphertext, (p - ciphertext) + 1);
 		ciphertext = p + 1;
@@ -180,11 +191,6 @@ static void set_salt(void *salt)
 
 static void krb4_set_key(char *key, int index)
 {
-	if (saved_salt->realm[0] != '\0')
-		afs_string_to_key(key, saved_salt->realm, &saved_key.key);
-	else
-		des_string_to_key(key, &saved_key.key);
-
 	strnzcpy(saved_key.string, key, sizeof(saved_key.string));
 }
 
@@ -195,6 +201,14 @@ static char *get_key(int index)
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
+	if (saved_salt->realm[0] != '\0')
+		afs_string_to_key(saved_key.string,
+		                  saved_salt->realm,
+		                  &saved_key.key);
+	else
+		DES_string_to_key(saved_key.string,
+		                  &saved_key.key);
+
 	return *pcount;
 }
 
@@ -206,7 +220,7 @@ static int krb4_check_parity(DES_cblock *key)
 		if ((*key)[i] != odd_parity[(*key)[i]])
 			return (0);
 	}
-	return (1);
+	return 1;
 }
 
 static int cmp_all(void *binary, int count)
@@ -235,7 +249,7 @@ static int cmp_one(void *binary, int count)
 
 static int cmp_exact(char *source, int index)
 {
-	return (1);	/* XXX - fallthrough from cmp_one() */
+	return 1;
 }
 
 struct fmt_main fmt_KRB4 = {
@@ -245,6 +259,7 @@ struct fmt_main fmt_KRB4 = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
 		BINARY_ALIGN,
@@ -253,9 +268,8 @@ struct fmt_main fmt_KRB4 = {
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
+		{ FORMAT_TAG, FORMAT_TAG2 },
 		tests
 	}, {
 		fmt_default_init,
@@ -265,10 +279,8 @@ struct fmt_main fmt_KRB4 = {
 		valid,
 		fmt_default_split,
 		fmt_default_binary,
-		salt,
-#if FMT_MAIN_VERSION > 11
+		get_salt,
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash,
@@ -278,6 +290,7 @@ struct fmt_main fmt_KRB4 = {
 			fmt_default_binary_hash
 		},
 		fmt_default_salt_hash,
+		NULL,
 		set_salt,
 		krb4_set_key,
 		get_key,
@@ -295,3 +308,5 @@ struct fmt_main fmt_KRB4 = {
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

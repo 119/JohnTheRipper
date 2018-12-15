@@ -9,608 +9,40 @@
  */
 
 #include "opencl_device_info.h"
+#define AMD_PUTCHAR_NOCAST
+#include "opencl_misc.h"
+#include "opencl_unicode.h"
+#define RC4_IN_PLACE
+#include "opencl_rc4.h"
+#include "opencl_md4.h"
+#include "opencl_md5.h"
+#include "opencl_mask.h"
 
-#if gpu_amd(DEVICE_INFO)
-#define USE_BITSELECT
-#endif
-
-/* Workaround for problem seen with 9600GT */
-#if gpu_nvidia(DEVICE_INFO)
-#define MAYBE_CONSTANT const __global
+#if __OS_X__ && (cpu(DEVICE_INFO) || gpu_nvidia(DEVICE_INFO))
+/* This is a workaround for driver/runtime bugs */
+#define MAYBE_VOLATILE volatile
 #else
-#define MAYBE_CONSTANT __constant
+#define MAYBE_VOLATILE
 #endif
-
-/* Do not support full UTF-16 with surrogate pairs */
-//#define UCS_2
-
-/* Unicode types */
-typedef uint   UTF32;
-typedef ushort UTF16;
-typedef uchar  UTF8;
-
-__constant uint halfShift  = 10; /* used for shifting by 10 bits */
-__constant UTF32 halfBase = 0x0010000U;
-__constant UTF32 halfMask = 0x3FFU;
-
-/*
- * Index into the table below with the first byte of a UTF-8 sequence to
- * get the number of trailing bytes that are supposed to follow it.
- * Note that *legal* UTF-8 values can't have 4 or 5-bytes. The table is
- * left as-is for anyone who may want to do such conversion, which was
- * allowed in earlier algorithms.
- *
- * Trimmed for speed: Use with [c & 0x3f]
- */
-__constant char opt_trailingBytesUTF8[64] = {
-/*	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, */
-	1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
-	2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3,4,4,4,4,5,5,5,5
-};
-
-/*
- * Magic values subtracted from a buffer value during UTF8 conversion.
- * This table contains as many values as there might be trailing bytes
- * in a UTF-8 sequence.
- */
-__constant UTF32 offsetsFromUTF8[6] = { 0x00000000UL, 0x00003080UL,
-                                        0x000E2080UL, 0x03C82080UL,
-                                        0xFA082080UL, 0x82082080UL };
-
-#define UNI_MAX_BMP         (UTF32)0x0000FFFF
-#define UNI_SUR_HIGH_START  (UTF32)0xD800
-#define UNI_SUR_HIGH_END    (UTF32)0xDBFF
-#define UNI_SUR_LOW_START   (UTF32)0xDC00
-#define UNI_SUR_LOW_END     (UTF32)0xDFFF
-
-#if 0 // gpu_nvidia(DEVICE_INFO) || amd_gcn(DEVICE_INFO)
-inline uint SWAP32(uint x)
-{
-	x = rotate(x, 16U);
-	return ((x & 0x00FF00FF) << 8) + ((x >> 8) & 0x00FF00FF);
-}
-#else
-#define SWAP32(a)	(as_uint(as_uchar4(a).wzyx))
-#endif
-
-#if no_byte_addressable(DEVICE_INFO)
-#define PUTCHAR(buf, index, val) (buf)[(index)>>2] = ((buf)[(index)>>2] & ~(0xffU << (((index) & 3) << 3))) + ((val) << (((index) & 3) << 3))
-#define PUTSHORT(buf, index, val) (buf)[(index)>>1] = ((buf)[(index)>>1] & ~(0xffffU << (((index) & 1) << 4))) + ((val) << (((index) & 1) << 4))
-#define XORCHAR(buf, index, val) (buf)[(index)>>2] = ((buf)[(index)>>2]) ^ ((val) << (((index) & 3) << 3))
-#else
-#define PUTCHAR(buf, index, val) ((uchar*)(buf))[index] = (val)
-#define PUTSHORT(buf, index, val) ((ushort*)(buf))[index] = (val)
-#define XORCHAR(buf, index, val) ((uchar*)(buf))[index] ^= (val)
-#endif
-
-/* Conversion tables from codepage to UTF-16. These define the high 128 bytes. */
-#ifdef ISO_8859_2
-__constant UTF16 cp[] = {
-0x0080,0x0081,0x0082,0x0083,0x0084,0x0085,0x0086,0x0087,0x0088,0x0089,0x008A,0x008B,0x008C,0x008D,0x008E,0x008F,
-0x0090,0x0091,0x0092,0x0093,0x0094,0x0095,0x0096,0x0097,0x0098,0x0099,0x009A,0x009B,0x009C,0x009D,0x009E,0x009F,
-0x00A0,0x0104,0x02D8,0x0141,0x00A4,0x013D,0x015A,0x00A7,0x00A8,0x0160,0x015E,0x0164,0x0179,0x00AD,0x017D,0x017B,
-0x00B0,0x0105,0x02DB,0x0142,0x00B4,0x013E,0x015B,0x02C7,0x00B8,0x0161,0x015F,0x0165,0x017A,0x02DD,0x017E,0x017C,
-0x0154,0x00C1,0x00C2,0x0102,0x00C4,0x0139,0x0106,0x00C7,0x010C,0x00C9,0x0118,0x00CB,0x011A,0x00CD,0x00CE,0x010E,
-0x0110,0x0143,0x0147,0x00D3,0x00D4,0x0150,0x00D6,0x00D7,0x0158,0x016E,0x00DA,0x0170,0x00DC,0x00DD,0x0162,0x00DF,
-0x0155,0x00E1,0x00E2,0x0103,0x00E4,0x013A,0x0107,0x00E7,0x010D,0x00E9,0x0119,0x00EB,0x011B,0x00ED,0x00EE,0x010F,
-0x0111,0x0144,0x0148,0x00F3,0x00F4,0x0151,0x00F6,0x00F7,0x0159,0x016F,0x00FA,0x0171,0x00FC,0x00FD,0x0163,0x02D9 };
-#elif defined(ISO_8859_7)
-__constant UTF16 cp[] = {
-0x0080,0x0081,0x0082,0x0083,0x0084,0x0085,0x0086,0x0087,0x0088,0x0089,0x008A,0x008B,0x008C,0x008D,0x008E,0x008F,
-0x0090,0x0091,0x0092,0x0093,0x0094,0x0095,0x0096,0x0097,0x0098,0x0099,0x009A,0x009B,0x009C,0x009D,0x009E,0x009F,
-0x00A0,0x2018,0x2019,0x00A3,0x20AC,0x20AF,0x00A6,0x00A7,0x00A8,0x00A9,0x037A,0x00AB,0x00AC,0x00AD,0x00AE,0x2015,
-0x00B0,0x00B1,0x00B2,0x00B3,0x0384,0x0385,0x0386,0x00B7,0x0388,0x0389,0x038A,0x00BB,0x038C,0x00BD,0x038E,0x038F,
-0x0390,0x0391,0x0392,0x0393,0x0394,0x0395,0x0396,0x0397,0x0398,0x0399,0x039A,0x039B,0x039C,0x039D,0x039E,0x039F,
-0x03A0,0x03A1,0x00D2,0x03A3,0x03A4,0x03A5,0x03A6,0x03A7,0x03A8,0x03A9,0x03AA,0x03AB,0x03AC,0x03AD,0x03AE,0x03AF,
-0x03B0,0x03B1,0x03B2,0x03B3,0x03B4,0x03B5,0x03B6,0x03B7,0x03B8,0x03B9,0x03BA,0x03BB,0x03BC,0x03BD,0x03BE,0x03BF,
-0x03C0,0x03C1,0x03C2,0x03C3,0x03C4,0x03C5,0x03C6,0x03C7,0x03C8,0x03C9,0x03CA,0x03CB,0x03CC,0x03CD,0x03CE,0x00FF };
-#elif defined(ISO_8859_15)
-__constant UTF16 cp[] = {
-0x0080,0x0081,0x0082,0x0083,0x0084,0x0085,0x0086,0x0087,0x0088,0x0089,0x008A,0x008B,0x008C,0x008D,0x008E,0x008F,
-0x0090,0x0091,0x0092,0x0093,0x0094,0x0095,0x0096,0x0097,0x0098,0x0099,0x009A,0x009B,0x009C,0x009D,0x009E,0x009F,
-0x00A0,0x00A1,0x00A2,0x00A3,0x20AC,0x00A5,0x0160,0x00A7,0x0161,0x00A9,0x00AA,0x00AB,0x00AC,0x00AD,0x00AE,0x00AF,
-0x00B0,0x00B1,0x00B2,0x00B3,0x017D,0x00B5,0x00B6,0x00B7,0x017E,0x00B9,0x00BA,0x00BB,0x0152,0x0153,0x0178,0x00BF,
-0x00C0,0x00C1,0x00C2,0x00C3,0x00C4,0x00C5,0x00C6,0x00C7,0x00C8,0x00C9,0x00CA,0x00CB,0x00CC,0x00CD,0x00CE,0x00CF,
-0x00D0,0x00D1,0x00D2,0x00D3,0x00D4,0x00D5,0x00D6,0x00D7,0x00D8,0x00D9,0x00DA,0x00DB,0x00DC,0x00DD,0x00DE,0x00DF,
-0x00E0,0x00E1,0x00E2,0x00E3,0x00E4,0x00E5,0x00E6,0x00E7,0x00E8,0x00E9,0x00EA,0x00EB,0x00EC,0x00ED,0x00EE,0x00EF,
-0x00F0,0x00F1,0x00F2,0x00F3,0x00F4,0x00F5,0x00F6,0x00F7,0x00F8,0x00F9,0x00FA,0x00FB,0x00FC,0x00FD,0x00FE,0x00FF };
-#elif defined(KOI8_R)
-__constant UTF16 cp[] = {
-0x2500,0x2502,0x250C,0x2510,0x2514,0x2518,0x251C,0x2524,0x252C,0x2534,0x253C,0x2580,0x2584,0x2588,0x258C,0x2590,
-0x2591,0x2592,0x2593,0x2320,0x25A0,0x2219,0x221A,0x2248,0x2264,0x2265,0x00A0,0x2321,0x00B0,0x00B2,0x00B7,0x00F7,
-0x2550,0x2551,0x2552,0x0451,0x2553,0x2554,0x2555,0x2556,0x2557,0x2558,0x2559,0x255A,0x255B,0x255C,0x255D,0x255E,
-0x255F,0x2560,0x2561,0x0401,0x2562,0x2563,0x2564,0x2565,0x2566,0x2567,0x2568,0x2569,0x256A,0x256B,0x256C,0x00A9,
-0x044E,0x0430,0x0431,0x0446,0x0434,0x0435,0x0444,0x0433,0x0445,0x0438,0x0439,0x043A,0x043B,0x043C,0x043D,0x043E,
-0x043F,0x044F,0x0440,0x0441,0x0442,0x0443,0x0436,0x0432,0x044C,0x044B,0x0437,0x0448,0x044D,0x0449,0x0447,0x044A,
-0x042E,0x0410,0x0411,0x0426,0x0414,0x0415,0x0424,0x0413,0x0425,0x0418,0x0419,0x041A,0x041B,0x041C,0x041D,0x041E,
-0x041F,0x042F,0x0420,0x0421,0x0422,0x0423,0x0416,0x0412,0x042C,0x042B,0x0417,0x0428,0x042D,0x0429,0x0427,0x042A };
-#elif defined(CP437)
-__constant UTF16 cp[] = {
-0x00C7,0x00FC,0x00E9,0x00E2,0x00E4,0x00E0,0x00E5,0x00E7,0x00EA,0x00EB,0x00E8,0x00EF,0x00EE,0x00EC,0x00C4,0x00C5,
-0x00C9,0x00E6,0x00C6,0x00F4,0x00F6,0x00F2,0x00FB,0x00F9,0x00FF,0x00D6,0x00DC,0x00A2,0x00A3,0x00A5,0x20A7,0x0192,
-0x00E1,0x00ED,0x00F3,0x00FA,0x00F1,0x00D1,0x00AA,0x00BA,0x00BF,0x2310,0x00AC,0x00BD,0x00BC,0x00A1,0x00AB,0x00BB,
-0x2591,0x2592,0x2593,0x2502,0x2524,0x2561,0x2562,0x2556,0x2555,0x2563,0x2551,0x2557,0x255D,0x255C,0x255B,0x2510,
-0x2514,0x2534,0x252C,0x251C,0x2500,0x253C,0x255E,0x255F,0x255A,0x2554,0x2569,0x2566,0x2560,0x2550,0x256C,0x2567,
-0x2568,0x2564,0x2565,0x2559,0x2558,0x2552,0x2553,0x256B,0x256A,0x2518,0x250C,0x2588,0x2584,0x258C,0x2590,0x2580,
-0x03B1,0x00DF,0x0393,0x03C0,0x03A3,0x03C3,0x00B5,0x03C4,0x03A6,0x0398,0x03A9,0x03B4,0x221E,0x03C6,0x03B5,0x2229,
-0x2261,0x00B1,0x2265,0x2264,0x2320,0x2321,0x00F7,0x2248,0x00B0,0x2219,0x00B7,0x221A,0x207F,0x00B2,0x25A0,0x00A0 };
-#elif defined(CP737)
-__constant UTF16 cp[] = {
-0x0391,0x0392,0x0393,0x0394,0x0395,0x0396,0x0397,0x0398,0x0399,0x039A,0x039B,0x039C,0x039D,0x039E,0x039F,0x03A0,
-0x03A1,0x03A3,0x03A4,0x03A5,0x03A6,0x03A7,0x03A8,0x03A9,0x03B1,0x03B2,0x03B3,0x03B4,0x03B5,0x03B6,0x03B7,0x03B8,
-0x03B9,0x03BA,0x03BB,0x03BC,0x03BD,0x03BE,0x03BF,0x03C0,0x03C1,0x03C3,0x03C2,0x03C4,0x03C5,0x03C6,0x03C7,0x03C8,
-0x2591,0x2592,0x2593,0x2502,0x2524,0x2561,0x2562,0x2556,0x2555,0x2563,0x2551,0x2557,0x255D,0x255C,0x255B,0x2510,
-0x2514,0x2534,0x252C,0x251C,0x2500,0x253C,0x255E,0x255F,0x255A,0x2554,0x2569,0x2566,0x2560,0x2550,0x256C,0x2567,
-0x2568,0x2564,0x2565,0x2559,0x2558,0x2552,0x2553,0x256B,0x256A,0x2518,0x250C,0x2588,0x2584,0x258C,0x2590,0x2580,
-0x03C9,0x03AC,0x03AD,0x03AE,0x03CA,0x03AF,0x03CC,0x03CD,0x03CB,0x03CE,0x0386,0x0388,0x0389,0x038A,0x038C,0x038E,
-0x038F,0x00B1,0x2265,0x2264,0x03AA,0x03AB,0x00F7,0x2248,0x00B0,0x2219,0x00B7,0x221A,0x207F,0x00B2,0x25A0,0x00A0 };
-#elif defined(CP850)
-__constant UTF16 cp[] = {
-0x00C7,0x00FC,0x00E9,0x00E2,0x00E4,0x00E0,0x00E5,0x00E7,0x00EA,0x00EB,0x00E8,0x00EF,0x00EE,0x00EC,0x00C4,0x00C5,
-0x00C9,0x00E6,0x00C6,0x00F4,0x00F6,0x00F2,0x00FB,0x00F9,0x00FF,0x00D6,0x00DC,0x00F8,0x00A3,0x00D8,0x00D7,0x0192,
-0x00E1,0x00ED,0x00F3,0x00FA,0x00F1,0x00D1,0x00AA,0x00BA,0x00BF,0x00AE,0x00AC,0x00BD,0x00BC,0x00A1,0x00AB,0x00BB,
-0x2591,0x2592,0x2593,0x2502,0x2524,0x00C1,0x00C2,0x00C0,0x00A9,0x2563,0x2551,0x2557,0x255D,0x00A2,0x00A5,0x2510,
-0x2514,0x2534,0x252C,0x251C,0x2500,0x253C,0x00E3,0x00C3,0x255A,0x2554,0x2569,0x2566,0x2560,0x2550,0x256C,0x00A4,
-0x00F0,0x00D0,0x00CA,0x00CB,0x00C8,0x0131,0x00CD,0x00CE,0x00CF,0x2518,0x250C,0x2588,0x2584,0x00A6,0x00CC,0x2580,
-0x00D3,0x00DF,0x00D4,0x00D2,0x00F5,0x00D5,0x00B5,0x00FE,0x00DE,0x00DA,0x00DB,0x00D9,0x00FD,0x00DD,0x00AF,0x00B4,
-0x00AD,0x00B1,0x2017,0x00BE,0x00B6,0x00A7,0x00F7,0x00B8,0x00B0,0x00A8,0x00B7,0x00B9,0x00B3,0x00B2,0x25A0,0x00A0 };
-#elif defined(CP852)
-__constant UTF16 cp[] = {
-0x00C7,0x00FC,0x00E9,0x00E2,0x00E4,0x016F,0x0107,0x00E7,0x0142,0x00EB,0x0150,0x0151,0x00EE,0x0179,0x00C4,0x0106,
-0x00C9,0x0139,0x013A,0x00F4,0x00F6,0x013D,0x013E,0x015A,0x015B,0x00D6,0x00DC,0x0164,0x0165,0x0141,0x00D7,0x010D,
-0x00E1,0x00ED,0x00F3,0x00FA,0x0104,0x0105,0x017D,0x017E,0x0118,0x0119,0x00AC,0x017A,0x010C,0x015F,0x00AB,0x00BB,
-0x2591,0x2592,0x2593,0x2502,0x2524,0x00C1,0x00C2,0x011A,0x015E,0x2563,0x2551,0x2557,0x255D,0x017B,0x017C,0x2510,
-0x2514,0x2534,0x252C,0x251C,0x2500,0x253C,0x0102,0x0103,0x255A,0x2554,0x2569,0x2566,0x2560,0x2550,0x256C,0x00A4,
-0x0111,0x0110,0x010E,0x00CB,0x010F,0x0147,0x00CD,0x00CE,0x011B,0x2518,0x250C,0x2588,0x2584,0x0162,0x016E,0x2580,
-0x00D3,0x00DF,0x00D4,0x0143,0x0144,0x0148,0x0160,0x0161,0x0154,0x00DA,0x0155,0x0170,0x00FD,0x00DD,0x0163,0x00B4,
-0x00AD,0x02DD,0x02DB,0x02C7,0x02D8,0x00A7,0x00F7,0x00B8,0x00B0,0x00A8,0x02D9,0x0171,0x0158,0x0159,0x25A0,0x00A0 };
-#elif defined(CP858)
-__constant UTF16 cp[] = {
-0x00C7,0x00FC,0x00E9,0x00E2,0x00E4,0x00E0,0x00E5,0x00E7,0x00EA,0x00EB,0x00E8,0x00EF,0x00EE,0x00EC,0x00C4,0x00C5,
-0x00C9,0x00E6,0x00C6,0x00F4,0x00F6,0x00F2,0x00FB,0x00F9,0x00FF,0x00D6,0x00DC,0x00F8,0x00A3,0x00D8,0x00D7,0x0192,
-0x00E1,0x00ED,0x00F3,0x00FA,0x00F1,0x00D1,0x00AA,0x00BA,0x00BF,0x00AE,0x00AC,0x00BD,0x00BC,0x00A1,0x00AB,0x00BB,
-0x2591,0x2592,0x2593,0x2502,0x2524,0x00C1,0x00C2,0x00C0,0x00A9,0x2563,0x2551,0x2557,0x255D,0x00A2,0x00A5,0x2510,
-0x2514,0x2534,0x252C,0x251C,0x2500,0x253C,0x00E3,0x00C3,0x255A,0x2554,0x2569,0x2566,0x2560,0x2550,0x256C,0x00A4,
-0x00F0,0x00D0,0x00CA,0x00CB,0x00C8,0x20AC,0x00CD,0x00CE,0x00CF,0x2518,0x250C,0x2588,0x2584,0x00A6,0x00CC,0x2580,
-0x00D3,0x00DF,0x00D4,0x00D2,0x00F5,0x00D5,0x00B5,0x00FE,0x00DE,0x00DA,0x00DB,0x00D9,0x00FD,0x00DD,0x00AF,0x00B4,
-0x00AD,0x00B1,0x2017,0x00BE,0x00B6,0x00A7,0x00F7,0x00B8,0x00B0,0x00A8,0x00B7,0x00B9,0x00B3,0x00B2,0x25A0,0x00A0 };
-#elif defined(CP866)
-__constant UTF16 cp[] = {
-0x0410,0x0411,0x0412,0x0413,0x0414,0x0415,0x0416,0x0417,0x0418,0x0419,0x041A,0x041B,0x041C,0x041D,0x041E,0x041F,
-0x0420,0x0421,0x0422,0x0423,0x0424,0x0425,0x0426,0x0427,0x0428,0x0429,0x042A,0x042B,0x042C,0x042D,0x042E,0x042F,
-0x0430,0x0431,0x0432,0x0433,0x0434,0x0435,0x0436,0x0437,0x0438,0x0439,0x043A,0x043B,0x043C,0x043D,0x043E,0x043F,
-0x2591,0x2592,0x2593,0x2502,0x2524,0x2561,0x2562,0x2556,0x2555,0x2563,0x2551,0x2557,0x255D,0x255C,0x255B,0x2510,
-0x2514,0x2534,0x252C,0x251C,0x2500,0x253C,0x255E,0x255F,0x255A,0x2554,0x2569,0x2566,0x2560,0x2550,0x256C,0x2567,
-0x2568,0x2564,0x2565,0x2559,0x2558,0x2552,0x2553,0x256B,0x256A,0x2518,0x250C,0x2588,0x2584,0x258C,0x2590,0x2580,
-0x0440,0x0441,0x0442,0x0443,0x0444,0x0445,0x0446,0x0447,0x0448,0x0449,0x044A,0x044B,0x044C,0x044D,0x044E,0x044F,
-0x0401,0x0451,0x0404,0x0454,0x0407,0x0457,0x040E,0x045E,0x00B0,0x2219,0x00B7,0x221A,0x2116,0x00A4,0x25A0,0x00A0 };
-#elif defined(CP1250)
-__constant UTF16 cp[] = {
-0x20AC,0x0081,0x201A,0x0083,0x201E,0x2026,0x2020,0x2021,0x0088,0x2030,0x0160,0x2039,0x015A,0x0164,0x017D,0x0179,
-0x0090,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014,0x0098,0x2122,0x0161,0x203A,0x015B,0x0165,0x017E,0x017A,
-0x00A0,0x02C7,0x02D8,0x0141,0x00A4,0x0104,0x00A6,0x00A7,0x00A8,0x00A9,0x015E,0x00AB,0x00AC,0x00AD,0x00AE,0x017B,
-0x00B0,0x00B1,0x02DB,0x0142,0x00B4,0x00B5,0x00B6,0x00B7,0x00B8,0x0105,0x015F,0x00BB,0x013D,0x02DD,0x013E,0x017C,
-0x0154,0x00C1,0x00C2,0x0102,0x00C4,0x0139,0x0106,0x00C7,0x010C,0x00C9,0x0118,0x00CB,0x011A,0x00CD,0x00CE,0x010E,
-0x0110,0x0143,0x0147,0x00D3,0x00D4,0x0150,0x00D6,0x00D7,0x0158,0x016E,0x00DA,0x0170,0x00DC,0x00DD,0x0162,0x00DF,
-0x0155,0x00E1,0x00E2,0x0103,0x00E4,0x013A,0x0107,0x00E7,0x010D,0x00E9,0x0119,0x00EB,0x011B,0x00ED,0x00EE,0x010F,
-0x0111,0x0144,0x0148,0x00F3,0x00F4,0x0151,0x00F6,0x00F7,0x0159,0x016F,0x00FA,0x0171,0x00FC,0x00FD,0x0163,0x02D9 };
-#elif defined(CP1251)
-__constant UTF16 cp[] = {
-0x0402,0x0403,0x201A,0x0453,0x201E,0x2026,0x2020,0x2021,0x20AC,0x2030,0x0409,0x2039,0x040A,0x040C,0x040B,0x040F,
-0x0452,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014,0x0098,0x2122,0x0459,0x203A,0x045A,0x045C,0x045B,0x045F,
-0x00A0,0x040E,0x045E,0x0408,0x00A4,0x0490,0x00A6,0x00A7,0x0401,0x00A9,0x0404,0x00AB,0x00AC,0x00AD,0x00AE,0x0407,
-0x00B0,0x00B1,0x0406,0x0456,0x0491,0x00B5,0x00B6,0x00B7,0x0451,0x2116,0x0454,0x00BB,0x0458,0x0405,0x0455,0x0457,
-0x0410,0x0411,0x0412,0x0413,0x0414,0x0415,0x0416,0x0417,0x0418,0x0419,0x041A,0x041B,0x041C,0x041D,0x041E,0x041F,
-0x0420,0x0421,0x0422,0x0423,0x0424,0x0425,0x0426,0x0427,0x0428,0x0429,0x042A,0x042B,0x042C,0x042D,0x042E,0x042F,
-0x0430,0x0431,0x0432,0x0433,0x0434,0x0435,0x0436,0x0437,0x0438,0x0439,0x043A,0x043B,0x043C,0x043D,0x043E,0x043F,
-0x0440,0x0441,0x0442,0x0443,0x0444,0x0445,0x0446,0x0447,0x0448,0x0449,0x044A,0x044B,0x044C,0x044D,0x044E,0x044F };
-#elif defined(CP1252)
-__constant UTF16 cp[] = {
-0x20AC,0x0081,0x201A,0x0192,0x201E,0x2026,0x2020,0x2021,0x02C6,0x2030,0x0160,0x2039,0x0152,0x008D,0x017D,0x008F,
-0x0090,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014,0x02DC,0x2122,0x0161,0x203A,0x0153,0x009D,0x017E,0x0178,
-0x00A0,0x00A1,0x00A2,0x00A3,0x00A4,0x00A5,0x00A6,0x00A7,0x00A8,0x00A9,0x00AA,0x00AB,0x00AC,0x00AD,0x00AE,0x00AF,
-0x00B0,0x00B1,0x00B2,0x00B3,0x00B4,0x00B5,0x00B6,0x00B7,0x00B8,0x00B9,0x00BA,0x00BB,0x00BC,0x00BD,0x00BE,0x00BF,
-0x00C0,0x00C1,0x00C2,0x00C3,0x00C4,0x00C5,0x00C6,0x00C7,0x00C8,0x00C9,0x00CA,0x00CB,0x00CC,0x00CD,0x00CE,0x00CF,
-0x00D0,0x00D1,0x00D2,0x00D3,0x00D4,0x00D5,0x00D6,0x00D7,0x00D8,0x00D9,0x00DA,0x00DB,0x00DC,0x00DD,0x00DE,0x00DF,
-0x00E0,0x00E1,0x00E2,0x00E3,0x00E4,0x00E5,0x00E6,0x00E7,0x00E8,0x00E9,0x00EA,0x00EB,0x00EC,0x00ED,0x00EE,0x00EF,
-0x00F0,0x00F1,0x00F2,0x00F3,0x00F4,0x00F5,0x00F6,0x00F7,0x00F8,0x00F9,0x00FA,0x00FB,0x00FC,0x00FD,0x00FE,0x00FF };
-#elif defined(CP1253)
-__constant UTF16 cp[] = {
-0x20AC,0x0081,0x201A,0x0192,0x201E,0x2026,0x2020,0x2021,0x0088,0x2030,0x008A,0x2039,0x008C,0x008D,0x008E,0x008F,
-0x0090,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014,0x0098,0x2122,0x009A,0x203A,0x009C,0x009D,0x009E,0x009F,
-0x00A0,0x0385,0x0386,0x00A3,0x00A4,0x00A5,0x00A6,0x00A7,0x00A8,0x00A9,0x00AA,0x00AB,0x00AC,0x00AD,0x00AE,0x2015,
-0x00B0,0x00B1,0x00B2,0x00B3,0x0384,0x00B5,0x00B6,0x00B7,0x0388,0x0389,0x038A,0x00BB,0x038C,0x00BD,0x038E,0x038F,
-0x0390,0x0391,0x0392,0x0393,0x0394,0x0395,0x0396,0x0397,0x0398,0x0399,0x039A,0x039B,0x039C,0x039D,0x039E,0x039F,
-0x03A0,0x03A1,0x00D2,0x03A3,0x03A4,0x03A5,0x03A6,0x03A7,0x03A8,0x03A9,0x03AA,0x03AB,0x03AC,0x03AD,0x03AE,0x03AF,
-0x03B0,0x03B1,0x03B2,0x03B3,0x03B4,0x03B5,0x03B6,0x03B7,0x03B8,0x03B9,0x03BA,0x03BB,0x03BC,0x03BD,0x03BE,0x03BF,
-0x03C0,0x03C1,0x03C2,0x03C3,0x03C4,0x03C5,0x03C6,0x03C7,0x03C8,0x03C9,0x03CA,0x03CB,0x03CC,0x03CD,0x03CE,0x00FF };
-#endif
-
-/* Functions common to MD4 and MD5 */
-#ifdef USE_BITSELECT
-#define F(x, y, z)	bitselect((z), (y), (x))
-#else
-#define F(x, y, z)	((z) ^ ((x) & ((y) ^ (z))))
-#endif
-
-#define H(x, y, z)	((x) ^ (y) ^ (z))
-
-
-/* The basic MD4 functions */
-#define MD4G(x, y, z)	(((x) & ((y) | (z))) | ((y) & (z)))
-
-
-/* The MD4 transformation for all three rounds. */
-#define MD4STEP(f, a, b, c, d, x, s)  \
-	(a) += f((b), (c), (d)) + (x); \
-	    (a) = rotate((a), (uint)(s))
-
-
-/* Raw'n'lean MD4 with context in output buffer */
-/* NOTE: This version thrashes the input block! */
-#define	md4_block(block, output) { \
-		a = output[0]; \
-		b = output[1]; \
-		c = output[2]; \
-		d = output[3]; \
-		MD4STEP(F, a, b, c, d, block[0], 3); \
-		MD4STEP(F, d, a, b, c, block[1], 7); \
-		MD4STEP(F, c, d, a, b, block[2], 11); \
-		MD4STEP(F, b, c, d, a, block[3], 19); \
-		MD4STEP(F, a, b, c, d, block[4], 3); \
-		MD4STEP(F, d, a, b, c, block[5], 7); \
-		MD4STEP(F, c, d, a, b, block[6], 11); \
-		MD4STEP(F, b, c, d, a, block[7], 19); \
-		MD4STEP(F, a, b, c, d, block[8], 3); \
-		MD4STEP(F, d, a, b, c, block[9], 7); \
-		MD4STEP(F, c, d, a, b, block[10], 11); \
-		MD4STEP(F, b, c, d, a, block[11], 19); \
-		MD4STEP(F, a, b, c, d, block[12], 3); \
-		MD4STEP(F, d, a, b, c, block[13], 7); \
-		MD4STEP(F, c, d, a, b, block[14], 11); \
-		MD4STEP(F, b, c, d, a, block[15], 19); \
-		MD4STEP(MD4G, a, b, c, d, block[0] + 0x5a827999, 3); \
-		MD4STEP(MD4G, d, a, b, c, block[4] + 0x5a827999, 5); \
-		MD4STEP(MD4G, c, d, a, b, block[8] + 0x5a827999, 9); \
-		MD4STEP(MD4G, b, c, d, a, block[12] + 0x5a827999, 13); \
-		MD4STEP(MD4G, a, b, c, d, block[1] + 0x5a827999, 3); \
-		MD4STEP(MD4G, d, a, b, c, block[5] + 0x5a827999, 5); \
-		MD4STEP(MD4G, c, d, a, b, block[9] + 0x5a827999, 9); \
-		MD4STEP(MD4G, b, c, d, a, block[13] + 0x5a827999, 13); \
-		MD4STEP(MD4G, a, b, c, d, block[2] + 0x5a827999, 3); \
-		MD4STEP(MD4G, d, a, b, c, block[6] + 0x5a827999, 5); \
-		MD4STEP(MD4G, c, d, a, b, block[10] + 0x5a827999, 9); \
-		MD4STEP(MD4G, b, c, d, a, block[14] + 0x5a827999, 13); \
-		MD4STEP(MD4G, a, b, c, d, block[3] + 0x5a827999, 3); \
-		MD4STEP(MD4G, d, a, b, c, block[7] + 0x5a827999, 5); \
-		MD4STEP(MD4G, c, d, a, b, block[11] + 0x5a827999, 9); \
-		MD4STEP(MD4G, b, c, d, a, block[15] + 0x5a827999, 13); \
-		MD4STEP(H, a, b, c, d, block[0] + 0x6ed9eba1, 3); \
-		MD4STEP(H, d, a, b, c, block[8] + 0x6ed9eba1, 9); \
-		MD4STEP(H, c, d, a, b, block[4] + 0x6ed9eba1, 11); \
-		MD4STEP(H, b, c, d, a, block[12] + 0x6ed9eba1, 15); \
-		MD4STEP(H, a, b, c, d, block[2] + 0x6ed9eba1, 3); \
-		MD4STEP(H, d, a, b, c, block[10] + 0x6ed9eba1, 9); \
-		MD4STEP(H, c, d, a, b, block[6] + 0x6ed9eba1, 11); \
-		MD4STEP(H, b, c, d, a, block[14] + 0x6ed9eba1, 15); \
-		MD4STEP(H, a, b, c, d, block[1] + 0x6ed9eba1, 3); \
-		MD4STEP(H, d, a, b, c, block[9] + 0x6ed9eba1, 9); \
-		MD4STEP(H, c, d, a, b, block[5] + 0x6ed9eba1, 11); \
-		MD4STEP(H, b, c, d, a, block[13] + 0x6ed9eba1, 15); \
-		MD4STEP(H, a, b, c, d, block[3] + 0x6ed9eba1, 3); \
-		MD4STEP(H, d, a, b, c, block[11] + 0x6ed9eba1, 9); \
-		MD4STEP(H, c, d, a, b, block[7] + 0x6ed9eba1, 11); \
-		MD4STEP(H, b, c, d, a, block[15] + 0x6ed9eba1, 15); \
-		output[0] += a; \
-		output[1] += b; \
-		output[2] += c; \
-		output[3] += d; \
-	}
-
-/* The basic MD5 functions */
-/* F and H are the same as for MD4, above */
-#ifdef USE_BITSELECT
-#define G(x, y, z)	bitselect((y), (x), (z))
-#else
-#define G(x, y, z)	((y) ^ ((z) & ((x) ^ (y))))
-#endif
-
-#define I(x, y, z)	((y) ^ ((x) | ~(z)))
-
-
-/* The MD5 transformation for all four rounds. */
-#define STEP(f, a, b, c, d, x, t, s)	  \
-	(a) += f((b), (c), (d)) + (x) + (t); \
-	    (a) = rotate((a), (uint)(s)); \
-	    (a) += (b)
-
-
-/* Raw'n'lean MD5 with context in output buffer */
-/* NOTE: This version thrashes the input block! */
-#define md5_block(block, output)  \
-	{ \
-		a = output[0]; \
-		b = output[1]; \
-		c = output[2]; \
-		d = output[3]; \
-		STEP(F, a, b, c, d, block[0], 0xd76aa478, 7); \
-		STEP(F, d, a, b, c, block[1], 0xe8c7b756, 12); \
-		STEP(F, c, d, a, b, block[2], 0x242070db, 17); \
-		STEP(F, b, c, d, a, block[3], 0xc1bdceee, 22); \
-		STEP(F, a, b, c, d, block[4], 0xf57c0faf, 7); \
-		STEP(F, d, a, b, c, block[5], 0x4787c62a, 12); \
-		STEP(F, c, d, a, b, block[6], 0xa8304613, 17); \
-		STEP(F, b, c, d, a, block[7], 0xfd469501, 22); \
-		STEP(F, a, b, c, d, block[8], 0x698098d8, 7); \
-		STEP(F, d, a, b, c, block[9], 0x8b44f7af, 12); \
-		STEP(F, c, d, a, b, block[10], 0xffff5bb1, 17); \
-		STEP(F, b, c, d, a, block[11], 0x895cd7be, 22); \
-		STEP(F, a, b, c, d, block[12], 0x6b901122, 7); \
-		STEP(F, d, a, b, c, block[13], 0xfd987193, 12); \
-		STEP(F, c, d, a, b, block[14], 0xa679438e, 17); \
-		STEP(F, b, c, d, a, block[15], 0x49b40821, 22); \
-		STEP(G, a, b, c, d, block[1], 0xf61e2562, 5); \
-		STEP(G, d, a, b, c, block[6], 0xc040b340, 9); \
-		STEP(G, c, d, a, b, block[11], 0x265e5a51, 14); \
-		STEP(G, b, c, d, a, block[0], 0xe9b6c7aa, 20); \
-		STEP(G, a, b, c, d, block[5], 0xd62f105d, 5); \
-		STEP(G, d, a, b, c, block[10], 0x02441453, 9); \
-		STEP(G, c, d, a, b, block[15], 0xd8a1e681, 14); \
-		STEP(G, b, c, d, a, block[4], 0xe7d3fbc8, 20); \
-		STEP(G, a, b, c, d, block[9], 0x21e1cde6, 5); \
-		STEP(G, d, a, b, c, block[14], 0xc33707d6, 9); \
-		STEP(G, c, d, a, b, block[3], 0xf4d50d87, 14); \
-		STEP(G, b, c, d, a, block[8], 0x455a14ed, 20); \
-		STEP(G, a, b, c, d, block[13], 0xa9e3e905, 5); \
-		STEP(G, d, a, b, c, block[2], 0xfcefa3f8, 9); \
-		STEP(G, c, d, a, b, block[7], 0x676f02d9, 14); \
-		STEP(G, b, c, d, a, block[12], 0x8d2a4c8a, 20); \
-		STEP(H, a, b, c, d, block[5], 0xfffa3942, 4); \
-		STEP(H, d, a, b, c, block[8], 0x8771f681, 11); \
-		STEP(H, c, d, a, b, block[11], 0x6d9d6122, 16); \
-		STEP(H, b, c, d, a, block[14], 0xfde5380c, 23); \
-		STEP(H, a, b, c, d, block[1], 0xa4beea44, 4); \
-		STEP(H, d, a, b, c, block[4], 0x4bdecfa9, 11); \
-		STEP(H, c, d, a, b, block[7], 0xf6bb4b60, 16); \
-		STEP(H, b, c, d, a, block[10], 0xbebfbc70, 23); \
-		STEP(H, a, b, c, d, block[13], 0x289b7ec6, 4); \
-		STEP(H, d, a, b, c, block[0], 0xeaa127fa, 11); \
-		STEP(H, c, d, a, b, block[3], 0xd4ef3085, 16); \
-		STEP(H, b, c, d, a, block[6], 0x04881d05, 23); \
-		STEP(H, a, b, c, d, block[9], 0xd9d4d039, 4); \
-		STEP(H, d, a, b, c, block[12], 0xe6db99e5, 11); \
-		STEP(H, c, d, a, b, block[15], 0x1fa27cf8, 16); \
-		STEP(H, b, c, d, a, block[2], 0xc4ac5665, 23); \
-		STEP(I, a, b, c, d, block[0], 0xf4292244, 6); \
-		STEP(I, d, a, b, c, block[7], 0x432aff97, 10); \
-		STEP(I, c, d, a, b, block[14], 0xab9423a7, 15); \
-		STEP(I, b, c, d, a, block[5], 0xfc93a039, 21); \
-		STEP(I, a, b, c, d, block[12], 0x655b59c3, 6); \
-		STEP(I, d, a, b, c, block[3], 0x8f0ccc92, 10); \
-		STEP(I, c, d, a, b, block[10], 0xffeff47d, 15); \
-		STEP(I, b, c, d, a, block[1], 0x85845dd1, 21); \
-		STEP(I, a, b, c, d, block[8], 0x6fa87e4f, 6); \
-		STEP(I, d, a, b, c, block[15], 0xfe2ce6e0, 10); \
-		STEP(I, c, d, a, b, block[6], 0xa3014314, 15); \
-		STEP(I, b, c, d, a, block[13], 0x4e0811a1, 21); \
-		STEP(I, a, b, c, d, block[4], 0xf7537e82, 6); \
-		STEP(I, d, a, b, c, block[11], 0xbd3af235, 10); \
-		STEP(I, c, d, a, b, block[2], 0x2ad7d2bb, 15); \
-		STEP(I, b, c, d, a, block[9], 0xeb86d391, 21); \
-		output[0] += a; \
-		output[1] += b; \
-		output[2] += c; \
-		output[3] += d; \
-	}
-
-
-#define md5_init(output) {	  \
-	output[0] = 0x67452301; \
-	output[1] = 0xefcdab89; \
-	output[2] = 0x98badcfe; \
-	output[3] = 0x10325476; \
-	}
-
-#define md4_init(output)	md5_init(output)
-
-#if !no_byte_addressable(DEVICE_INFO)
-__constant uint rc4_iv[64] = { 0x03020100, 0x07060504, 0x0b0a0908, 0x0f0e0d0c,
-                                 0x13121110, 0x17161514, 0x1b1a1918, 0x1f1e1d1c,
-                                 0x23222120, 0x27262524, 0x2b2a2928, 0x2f2e2d2c,
-                                 0x33323130, 0x37363534, 0x3b3a3938, 0x3f3e3d3c,
-                                 0x43424140, 0x47464544, 0x4b4a4948, 0x4f4e4d4c,
-                                 0x53525150, 0x57565554, 0x5b5a5958, 0x5f5e5d5c,
-                                 0x63626160, 0x67666564, 0x6b6a6968, 0x6f6e6d6c,
-                                 0x73727170, 0x77767574, 0x7b7a7978, 0x7f7e7d7c,
-                                 0x83828180, 0x87868584, 0x8b8a8988, 0x8f8e8d8c,
-                                 0x93929190, 0x97969594, 0x9b9a9998, 0x9f9e9d9c,
-                                 0xa3a2a1a0, 0xa7a6a5a4, 0xabaaa9a8, 0xafaeadac,
-                                 0xb3b2b1b0, 0xb7b6b5b4, 0xbbbab9b8, 0xbfbebdbc,
-                                 0xc3c2c1c0, 0xc7c6c5c4, 0xcbcac9c8, 0xcfcecdcc,
-                                 0xd3d2d1d0, 0xd7d6d5d4, 0xdbdad9d8, 0xdfdedddc,
-                                 0xe3e2e1e0, 0xe7e6e5e4, 0xebeae9e8, 0xefeeedec,
-                                 0xf3f2f1f0, 0xf7f6f5f4, 0xfbfaf9f8, 0xfffefdfc
-};
-#endif
-
-#if 0
-#define swap_byte(a, b) (((a) ^= (b)), ((b) ^= (a)), ((a) ^= (b)))
-#else
-#define swap_byte(a, b) {	  \
-		uchar tmp = a; \
-		a = b; \
-		b = tmp; \
-	}
-#endif
-
-#define swap_state(n) {	  \
-		index2 = (key[index1] + state[(n)] + index2) & 255; \
-		swap_byte(state[(n)], state[index2]); \
-		index1 = (index1 + 1) & 15 /* (& 15 == % length) */; \
-	}
-
-/* One-shot rc4 with fixed key length and decrypt length of 16 */
-inline void rc4(const uint *key_w, MAYBE_CONSTANT uint *in,
-                __global uint *out /*, uint length */)
-{
-	const uchar *key = (uchar*)key_w;
-	uint x;
-	uint y = 0;
-	uint index1 = 0;
-	uint index2 = 0;
-#if no_byte_addressable(DEVICE_INFO)
-	uint state[256];
-
-	/* RC4_init() */
-	for (x = 0; x < 256; x++)
-		state[x] = x;
-#else
-	uint state_w[64];
-	uchar *state = (uchar*)state_w;
-
-	/* RC4_init() */
-	for (x = 0; x < 64; x++)
-		state_w[x] = rc4_iv[x];
-#endif
-#if 0
-	/* RC4_set_key() */
-	for (x = 0; x < 256; x++)
-		swap_state(x);
-#else
-	/* RC4_set_key() */
-	/* Unrolled hard-coded for key length 16 */
-	for (x = 0; x < 256; x++) {
-		index2 = (key[index1] + state[x] + index2) & 255;
-		swap_byte(state[x], state[index2]);
-		index1++; x++;
-
-		index2 = (key[index1] + state[x] + index2) & 255;
-		swap_byte(state[x], state[index2]);
-		index1++; x++;
-
-		index2 = (key[index1] + state[x] + index2) & 255;
-		swap_byte(state[x], state[index2]);
-		index1++; x++;
-
-		index2 = (key[index1] + state[x] + index2) & 255;
-		swap_byte(state[x], state[index2]);
-		index1++; x++;
-
-		index2 = (key[index1] + state[x] + index2) & 255;
-		swap_byte(state[x], state[index2]);
-		index1++; x++;
-
-		index2 = (key[index1] + state[x] + index2) & 255;
-		swap_byte(state[x], state[index2]);
-		index1++; x++;
-
-		index2 = (key[index1] + state[x] + index2) & 255;
-		swap_byte(state[x], state[index2]);
-		index1++; x++;
-
-		index2 = (key[index1] + state[x] + index2) & 255;
-		swap_byte(state[x], state[index2]);
-		index1++; x++;
-
-		index2 = (key[index1] + state[x] + index2) & 255;
-		swap_byte(state[x], state[index2]);
-		index1++; x++;
-
-		index2 = (key[index1] + state[x] + index2) & 255;
-		swap_byte(state[x], state[index2]);
-		index1++; x++;
-
-		index2 = (key[index1] + state[x] + index2) & 255;
-		swap_byte(state[x], state[index2]);
-		index1++; x++;
-
-		index2 = (key[index1] + state[x] + index2) & 255;
-		swap_byte(state[x], state[index2]);
-		index1++; x++;
-
-		index2 = (key[index1] + state[x] + index2) & 255;
-		swap_byte(state[x], state[index2]);
-		index1++; x++;
-
-		index2 = (key[index1] + state[x] + index2) & 255;
-		swap_byte(state[x], state[index2]);
-		index1++; x++;
-
-		index2 = (key[index1] + state[x] + index2) & 255;
-		swap_byte(state[x], state[index2]);
-		index1++; x++;
-
-		index2 = (key[index1] + state[x] + index2) & 255;
-		swap_byte(state[x], state[index2]);
-		index1 = 0;
-	}
-#endif
-
-	/* RC4() */
-	/* Unrolled for avoiding byte-addressed stores */
-	for (x = 1; x <= 16 /* length */; x++) {
-		uint xor_word;
-
-		y = (state[x] + y) & 255;
-		swap_byte(state[x], state[y]);
-		xor_word = state[(state[x++] + state[y]) & 255];
-
-		y = (state[x] + y) & 255;
-		swap_byte(state[x], state[y]);
-		xor_word |= state[(state[x++] + state[y]) & 255] << 8;
-
-		y = (state[x] + y) & 255;
-		swap_byte(state[x], state[y]);
-		xor_word |= state[(state[x++] + state[y]) & 255] << 16;
-
-		y = (state[x] + y) & 255;
-		swap_byte(state[x], state[y]);
-		xor_word |= state[(state[x] + state[y]) & 255] << 24;
-
-		*out++ = *in++ ^ xor_word;
-	}
-}
-
-#define dump_stuff_msg(msg, x, size) {	  \
-		uint ii; \
-		printf("%s : ", msg); \
-		for (ii = 0; ii < (size)/4; ii++) \
-			printf("%08x ", SWAP32(x[ii])); \
-		printf("\n"); \
-	}
 
 #ifdef UTF_8
 
-__kernel void krb5pa_md5_nthash(const __global uchar *source,
-                                __global const uint *index,
-                                __global uint *nthash)
+inline
+void prepare(const __global uint *key, uint length,
+             MAYBE_VOLATILE uint *nt_buffer)
 {
-	uint i;
-	uint gid = get_global_id(0);
-	uint block[16] = { 0 };
-	uint a, b, c, d;
-	uint output[4];
-	uint base = index[gid];
-	const __global UTF8 *sourceEnd;
-	UTF16 *target = (UTF16*)block;
-	UTF16 *targetStart = target;
-	const UTF16 *targetEnd = &target[PLAINTEXT_LENGTH];
+	const __global UTF8 *source = (const __global uchar*)key;
+	const __global UTF8 *sourceEnd = &source[length];
+	MAYBE_VOLATILE UTF16 *target = (UTF16*)nt_buffer;
+	MAYBE_VOLATILE const UTF16 *targetEnd = &target[PLAINTEXT_LENGTH];
 	UTF32 ch;
 	uint extraBytesToRead;
-
-	sourceEnd = source + index[gid + 1];
-	source += base;
 
 	/* Input buffer is UTF-8 without zero-termination */
 	while (source < sourceEnd) {
 		if (*source < 0xC0) {
 			*target++ = (UTF16)*source++;
-			if (*source == 0 || target >= targetEnd) {
+			if (source >= sourceEnd || target >= targetEnd) {
 				break;
 			}
 			continue;
@@ -635,10 +67,10 @@ __kernel void krb5pa_md5_nthash(const __global uchar *source,
 			++source;
 			break;
 		default:
-			*target = 0x80;
+			*target = UNI_REPLACEMENT_CHAR;
 			break; // from switch
 		}
-		if (*target == 0x80)
+		if (*target == UNI_REPLACEMENT_CHAR)
 			break; // from while
 		ch -= offsetsFromUTF8[extraBytesToRead];
 #ifdef UCS_2
@@ -656,109 +88,59 @@ __kernel void krb5pa_md5_nthash(const __global uchar *source,
 			*target++ = (UTF16)((ch & halfMask) + UNI_SUR_LOW_START);
 		}
 #endif
-		if (*source == 0 || target >= targetEnd)
+		if (source >= sourceEnd || target >= targetEnd)
 			break;
 	}
+
 	*target = 0x80;	// Terminate
 
-	block[14] = (uint)(target - targetStart) << 4;
-
-	/* Initial hash of password */
-	md4_init(output);
-	md4_block(block, output);
-
-	for (i = 0; i < 4; i++)
-		nthash[gid * 4 + i] = output[i];
-}
-
-#elif !defined(ISO_8859_1) && !defined(ASCII)
-
-__kernel void krb5pa_md5_nthash(const __global uchar *password,
-                                __global const uint *index,
-                                __global uint *nthash)
-{
-	uint i;
-	uint gid = get_global_id(0);
-	uint block[16] = { 0 };
-	uint a, b, c, d;
-	uint output[4];
-	uint base = index[gid];
-	uint len = index[gid + 1] - base;
-
-	password += base;
-
-	/* Work-around for self-tests not always calling set_key() like IRL */
-	len = (len > PLAINTEXT_LENGTH) ? 0 : len;
-
-	/* Input buffer is in a 'codepage' encoding, without zero-termination */
-	for (i = 0; i < len; i++)
-		PUTSHORT(block, i, (password[i] < 0x80) ?
-		        password[i] : cp[password[i] & 0x7f]);
-	PUTCHAR(block, 2 * i, 0x80);
-	block[14] = i << 4;
-
-	/* Initial hash of password */
-	md4_init(output);
-	md4_block(block, output);
-
-	for (i = 0; i < 4; i++)
-		nthash[gid * 4 + i] = output[i];
+	nt_buffer[14] = (uint)(target - (UTF16*)nt_buffer) << 4;
 }
 
 #else
 
-__kernel void krb5pa_md5_nthash(const __global uchar *password,
-                            __global const uint *index,
-                            __global uint *nthash)
+inline
+void prepare(const __global uint *key, uint length, uint *nt_buffer)
 {
-	uint i;
-	uint gid = get_global_id(0);
-	uint block[16] = { 0 };
-	uint a, b, c, d;
-	uint output[4];
-	uint base = index[gid];
-	uint len = index[gid + 1] - base;
+	uint i, nt_index, keychars;
 
-	password += base;
-
-	/* Work-around for self-tests not always calling set_key() like IRL */
-	len = (len > PLAINTEXT_LENGTH) ? 0 : len;
-
-	/* Input buffer is in ISO-8859-1 encoding, without zero-termination.
-	   we can just type-cast this to UTF16 */
-	for (i = 0; i < len; i++)
-		PUTCHAR(block, 2 * i, password[i]);
-	PUTCHAR(block, 2 * i, 0x80);
-	block[14] = i << 4;
-
-	/* Initial hash of password */
-	md4_init(output);
-	md4_block(block, output);
-
-	for (i = 0; i < 4; i++)
-		nthash[gid * 4 + i] = output[i];
+	nt_index = 0;
+	for (i = 0; i < (length + 3)/ 4; i++) {
+		keychars = key[i];
+		nt_buffer[nt_index++] = CP_LUT(keychars & 0x000000FF) | (CP_LUT((keychars & 0x0000FF00) >> 8) << 16);
+		nt_buffer[nt_index++] = CP_LUT((keychars & 0x00FF0000) >> 16) | (CP_LUT(keychars >> 24) << 16);
+	}
+	nt_index = length >> 1;
+	nt_buffer[nt_index] = (nt_buffer[nt_index] & 0xFFFF) | (0x80 << ((length & 1) << 4));
+	nt_buffer[nt_index + 1] = 0;
+	nt_buffer[14] = length << 4;
 }
 
 #endif /* encodings */
 
-__kernel void krb5pa_md5_final(const __global uint *nthash,
-                               MAYBE_CONSTANT uint *salts,
-                               __global uint *result)
+inline
+void krb5pa_md5_final(const uint *K,
+                      MAYBE_CONSTANT uint *salts,
+#ifdef RC4_USE_LOCAL
+                      __local uint *state_l,
+#endif
+                      uint *K2)
 {
 	uint i;
-	uint gid = get_global_id(0);
 	uint block[16];
-	uint output[4], hash[4];
-	uint a, b, c, d;
+	uint plain[36/4];
+	uchar *cleartext = (uchar*)plain;
+	uint K1[4], K3[4], ihash[4];
 
-	/* 1st HMAC */
-	md5_init(output);
-
+	/*
+	 * K = MD4(UTF-16LE(password)), ordinary 16-byte NTLM hash
+	 * 1st HMAC K1 = HMAC-MD5(K, 1LE)
+	 */
 	for (i = 0; i < 4; i++)
-		block[i] = 0x36363636 ^ nthash[gid * 4 + i];
+		block[i] = 0x36363636 ^ K[i];
 	for (i = 4; i < 16; i++)
 		block[i] = 0x36363636;
-	md5_block(block, output); /* md5_update(ipad, 64) */
+	md5_single(uint, block, ihash); /* md5_update(ipad, 64) */
 
 	block[0] = 0x01;    /* little endian "one", 4 bytes */
 	block[1] = 0x80;
@@ -766,37 +148,32 @@ __kernel void krb5pa_md5_final(const __global uint *nthash,
 		block[i] = 0;
 	block[14] = (64 + 4) << 3;
 	block[15] = 0;
-	md5_block(block, output); /* md5_update(one, 4), md5_final() */
+	md5_block(uint, block, ihash); /* md5_update(one, 4), md5_final() */
 
 	for (i = 0; i < 4; i++)
-		hash[i] = output[i];
-	for (i = 0; i < 4; i++)
-		block[i] = 0x5c5c5c5c ^ nthash[gid * 4 + i];
-
-	md5_init(output);
+		block[i] = 0x5c5c5c5c ^ K[i];
 	for (i = 4; i < 16; i++)
 		block[i] = 0x5c5c5c5c;
-	md5_block(block, output); /* md5_update(opad, 64) */
+	md5_single(uint, block, K1); /* md5_update(opad, 64) */
 
 	for (i = 0; i < 4; i++)
-		block[i] = hash[i];
+		block[i] = ihash[i];
 	block[4] = 0x80;
 	for (i = 5; i < 14; i++)
 		block[i] = 0;
 	block[14] = (64 + 16) << 3;
 	block[15] = 0;
-	md5_block(block, output); /* md5_update(hash, 16), md5_final() */
+	md5_block(uint, block, K1); /* md5_update(ihash, 16), md5_final() */
 
-	/* 2nd HMAC */
-	for (i = 0; i < 4; i++)
-		hash[i] = output[i];
-	for (i = 0; i < 4; i++)
-		block[i] = 0x36363636 ^ output[i];
 
-	md5_init(output);
+	/*
+	 * 2nd HMAC K3 = HMAC-MD5(K1, CHECKSUM)
+	 */
+	for (i = 0; i < 4; i++)
+		block[i] = 0x36363636 ^ K1[i];
 	for (i = 4; i < 16; i++)
 		block[i] = 0x36363636;
-	md5_block(block, output); /* md5_update(ipad, 64) */
+	md5_single(uint, block, ihash); /* md5_update(ipad, 64) */
 
 	for (i = 0; i < 4; i++)
 		block[i] = *salts++; /* checksum, 16 bytes */
@@ -805,27 +182,267 @@ __kernel void krb5pa_md5_final(const __global uint *nthash,
 		block[i] = 0;
 	block[14] = (64 + 16) << 3;
 	block[15] = 0;
-	md5_block(block, output); /* md5_update(cs, 16), md5_final() */
+	md5_block(uint, block, ihash); /* md5_update(cs, 16), md5_final() */
 
 	for (i = 0; i < 4; i++)
-		block[i] = 0x5c5c5c5c ^ hash[i];
-	for (i = 0; i < 4; i++)
-		hash[i] = output[i];
-
-	md5_init(output);
+		block[i] = 0x5c5c5c5c ^ K1[i];
 	for (i = 4; i < 16; i++)
 		block[i] = 0x5c5c5c5c;
-	md5_block(block, output); /* md5_update(opad, 64) */
+	md5_single(uint, block, K3); /* md5_update(opad, 64) */
 
 	for (i = 0; i < 4; i++)
-		block[i] = hash[i];
+		block[i] = ihash[i];
 	block[4] = 0x80;
 	for (i = 5; i < 14; i++)
 		block[i] = 0;
 	block[14] = (64 + 16) << 3;
 	block[15] = 0;
-	md5_block(block, output); /* md5_update(hash, 16), md5_final() */
+	md5_block(uint, block, K3); /* md5_update(ihash, 16), md5_final() */
 
-	/* output is our RC4 key. salts now point to encrypted timestamp. */
-	rc4(output, salts, &result[gid * 4]);
+	/* Salts now point to encrypted timestamp. */
+	for (i = 0; i < 4; i++)
+		plain[i] = salts[i];
+
+	/* K3 is our RC4 key. First decrypt just one block for early rejection */
+#ifdef RC4_USE_LOCAL
+	rc4(state_l, K3, plain, 16);
+#else
+	rc4(K3, plain, 16);
+#endif
+
+	/* Known-plain UTC timestamp */
+	if (cleartext[14] == '2' && cleartext[15] == '0') {
+		for (i = 0; i < 9; i++)
+			plain[i] = salts[i];
+
+#ifdef RC4_USE_LOCAL
+		rc4(state_l, K3, plain, 36);
+#else
+		rc4(K3, plain, 36);
+#endif
+		if (cleartext[28] == 'Z') {
+			/*
+			 * 3rd HMAC K2 = HMAC-MD5(K1, plaintext)
+			 */
+			for (i = 0; i < 4; i++)
+				block[i] = 0x36363636 ^ K1[i];
+			for (i = 4; i < 16; i++)
+				block[i] = 0x36363636;
+			md5_single(uint, block, ihash); /* md5_update(ipad, 64) */
+
+			for (i = 0; i < 9; i++)
+				block[i] = plain[i]; /* plaintext, 36 bytes */
+			block[9] = 0x80;
+			for (i = 10; i < 14; i++)
+				block[i] = 0;
+			block[14] = (64 + 36) << 3;
+			block[15] = 0;
+			md5_block(uint, block, ihash); /* md5_update(cs, 16), md5_final() */
+
+			for (i = 0; i < 4; i++)
+				block[i] = 0x5c5c5c5c ^ K1[i];
+			for (i = 4; i < 16; i++)
+				block[i] = 0x5c5c5c5c;
+			md5_single(uint, block, K2); /* md5_update(opad, 64) */
+
+			for (i = 0; i < 4; i++)
+				block[i] = ihash[i];
+			block[4] = 0x80;
+			for (i = 5; i < 14; i++)
+				block[i] = 0;
+			block[14] = (64 + 16) << 3;
+			block[15] = 0;
+			md5_block(uint, block, K2); /* md5_update(ihash, 16), md5_final() */
+		}
+		else {
+			K2[0] = 0;
+		}
+	}
+	else {
+		K2[0] = 0;
+	}
+}
+
+inline
+void cmp_final(uint gid,
+               uint iter,
+               __private uint *hash,
+               __global uint *offset_table,
+               __global uint *hash_table,
+               MAYBE_CONSTANT uint *salt,
+               __global uint *return_hashes,
+               volatile __global uint *output,
+               volatile __global uint *bitmap_dupe)
+{
+	uint t, offset_table_index, hash_table_index;
+	unsigned long LO, HI;
+	unsigned long p;
+
+	HI = ((unsigned long)hash[3] << 32) | (unsigned long)hash[2];
+	LO = ((unsigned long)hash[1] << 32) | (unsigned long)hash[0];
+
+	p = (HI % salt[SALT_PARAM_BASE + 1]) * salt[SALT_PARAM_BASE + 3];
+	p += LO % salt[SALT_PARAM_BASE + 1];
+	p %= salt[SALT_PARAM_BASE + 1];
+	offset_table_index = (unsigned int)p;
+
+	//error: chances of overflow is extremely low.
+	LO += (unsigned long)offset_table[offset_table_index];
+
+	p = (HI % salt[SALT_PARAM_BASE + 2]) * salt[SALT_PARAM_BASE + 4];
+	p += LO % salt[SALT_PARAM_BASE + 2];
+	p %= salt[SALT_PARAM_BASE + 2];
+	hash_table_index = (unsigned int)p;
+
+	if (hash_table[hash_table_index] == hash[0])
+	if (hash_table[salt[SALT_PARAM_BASE + 2] + hash_table_index] == hash[1])
+	{
+/*
+ * Prevent duplicate keys from cracking same hash
+ */
+		if (!(atomic_or(&bitmap_dupe[hash_table_index/32], (1U << (hash_table_index % 32))) & (1U << (hash_table_index % 32)))) {
+			t = atomic_inc(&output[0]);
+			output[1 + 3 * t] = gid;
+			output[2 + 3 * t] = iter;
+			output[3 + 3 * t] = hash_table_index;
+			return_hashes[2 * t] = hash[2];
+			return_hashes[2 * t + 1] = hash[3];
+		}
+	}
+}
+
+inline
+void cmp(uint gid,
+         uint iter,
+         __private uint *hash,
+         __global uint *bitmaps,
+         uint bitmap_sz_bits,
+         __global uint *offset_table,
+         __global uint *hash_table,
+         MAYBE_CONSTANT uint *salt,
+         __global uint *return_hashes,
+         volatile __global uint *output,
+         volatile __global uint *bitmap_dupe)
+{
+	uint bitmap_index, tmp = 1;
+
+	bitmap_index = hash[3] & salt[SALT_PARAM_BASE];
+	tmp &= (bitmaps[bitmap_index >> 5] >> (bitmap_index & 31)) & 1U;
+	bitmap_index = hash[2] & salt[SALT_PARAM_BASE];
+	tmp &= (bitmaps[(bitmap_sz_bits >> 5) + (bitmap_index >> 5)] >> (bitmap_index & 31)) & 1U;
+
+	if (tmp)
+		cmp_final(gid, iter, hash, offset_table, hash_table, salt, return_hashes, output, bitmap_dupe);
+}
+
+#ifdef RC4_USE_LOCAL
+__attribute__((work_group_size_hint(64,1,1)))
+#endif
+__kernel
+void krb5pa_md5(__global const uint *keys,
+                __global const uint *index,
+                MAYBE_CONSTANT uint *salts,
+                __global uint *int_key_loc,
+#if USE_CONST_CACHE
+                __constant
+#else
+                __global
+#endif
+                uint *int_keys
+#if !defined(__OS_X__) && USE_CONST_CACHE && gpu_amd(DEVICE_INFO)
+                __attribute__((max_constant_size (NUM_INT_KEYS * 4)))
+#endif
+                , __global uint *bitmaps,
+                __global uint *offset_table,
+                __global uint *hash_table,
+                __global uint *return_hashes,
+                volatile __global uint *out_hash_ids,
+                volatile __global uint *bitmap_dupe)
+{
+	uint gid = get_global_id(0);
+	uint base = index[gid];
+	uint len = base & 127;
+	uint nt_buffer[16] = { 0 };
+	uint nt_hash[4];
+	uint final_hash[4];
+	uint i;
+#ifdef RC4_USE_LOCAL
+	/*
+	 * The "+ 1" extra element (actually never touched) give a huge boost
+	 * on Maxwell and GCN due to access patterns or whatever.
+	 */
+	__local uint state_l[64][256/4 + 1];
+#endif
+	uint bitmap_sz_bits = salts[SALT_PARAM_BASE] + 1;
+#if NUM_INT_KEYS > 1 && !IS_STATIC_GPU_MASK
+	uint ikl = int_key_loc[gid];
+	uint loc0 = ikl & 0xff;
+#if MASK_FMT_INT_PLHDR > 1
+#if LOC_1 >= 0
+	uint loc1 = (ikl & 0xff00) >> 8;
+#endif
+#endif
+#if MASK_FMT_INT_PLHDR > 2
+#if LOC_2 >= 0
+	uint loc2 = (ikl & 0xff0000) >> 16;
+#endif
+#endif
+#if MASK_FMT_INT_PLHDR > 3
+#if LOC_3 >= 0
+	uint loc3 = (ikl & 0xff000000) >> 24;
+#endif
+#endif
+#endif
+
+#if !IS_STATIC_GPU_MASK
+#define GPU_LOC_0 loc0
+#define GPU_LOC_1 loc1
+#define GPU_LOC_2 loc2
+#define GPU_LOC_3 loc3
+#else
+#define GPU_LOC_0 LOC_0
+#define GPU_LOC_1 LOC_1
+#define GPU_LOC_2 LOC_2
+#define GPU_LOC_3 LOC_3
+#endif
+
+	keys += base >> 7;
+
+	/* Parse keys input buffer and re-encode to UTF-16LE */
+	prepare(keys, len, nt_buffer);
+
+	/* Apply GPU-side mask */
+	for (i = 0; i < NUM_INT_KEYS; i++) {
+#if NUM_INT_KEYS > 1
+		PUTSHORT(nt_buffer, GPU_LOC_0, CP_LUT(int_keys[i] & 0xff));
+#if MASK_FMT_INT_PLHDR > 1
+#if LOC_1 >= 0
+		PUTSHORT(nt_buffer, GPU_LOC_1, CP_LUT((int_keys[i] & 0xff00) >> 8));
+#endif
+#endif
+#if MASK_FMT_INT_PLHDR > 2
+#if LOC_2 >= 0
+		PUTSHORT(nt_buffer, GPU_LOC_2, CP_LUT((int_keys[i] & 0xff0000) >> 16));
+#endif
+#endif
+#if MASK_FMT_INT_PLHDR > 3
+#if LOC_3 >= 0
+		PUTSHORT(nt_buffer, GPU_LOC_3, CP_LUT((int_keys[i] & 0xff000000) >> 24));
+#endif
+#endif
+#endif
+		/* Initial hash of password */
+		md4_single(uint, nt_buffer, nt_hash);
+
+		/* Final krb5pa-md5 hash */
+		krb5pa_md5_final(nt_hash, salts,
+#ifdef RC4_USE_LOCAL
+		                 state_l[get_local_id(0)],
+#endif
+		                 final_hash);
+
+		/* GPU-side compare */
+		cmp(gid, i, final_hash, bitmaps, bitmap_sz_bits, offset_table,
+		    hash_table, salts, return_hashes, out_hash_ids, bitmap_dupe);
+	}
 }

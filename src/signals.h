@@ -62,9 +62,20 @@ extern void sig_timer_emu_tick(void);
 #endif
 
 /*
+ * Mitigate a race condition where a children receives a SIGUSR2 before
+ * being prepared for it.
+ */
+void sig_preinit(void);
+
+/*
  * Installs the signal handlers.
  */
 extern void sig_init(void);
+
+/*
+ * Starts "the clock". Called after loading, auto-tuning, etc.
+ */
+extern void sig_init_late(void);
 
 /*
  * Performs additional (re-)initialization after fork().  Assumes that

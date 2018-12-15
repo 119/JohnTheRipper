@@ -2,6 +2,10 @@
  * Copyright (C) 2013 Dhiru Kholia
  * Modified "pgpdump" for JtR
  *
+ * https://github.com/kazu-yamamoto/pgpdump
+ *
+ * cat pgpdump.c types.c tagfuncs.c packet.c subfunc.c signature.c keys.c buffer.c uatfunc.c > ~/combined.c
+ *
  * Copyright (C) 2002 Kazuhiko Yamamoto
  * All rights reserved.
  *
@@ -32,13 +36,31 @@
  */
 
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
-#include <libgen.h>
+//#include <libgen.h>
 #include <ctype.h>
-#include <strings.h>
 #include <stdarg.h>
+#include <errno.h>
 
+#if !AC_BUILT
+#define HAVE_LIBZ 1
+ #include <string.h>
+ #ifndef _MSC_VER
+  #include <strings.h>
+ #endif
+#else
+ #include "autoconfig.h"
+ #if STRING_WITH_STRINGS
+  #include <string.h>
+  #include <strings.h>
+ #elif HAVE_STRING_H
+  #include <string.h>
+ #elif HAVE_STRINGS_H
+  #include <strings.h>
+ #endif
+#endif
+
+#include "arch.h"
 #ifdef HAVE_UNIXLIB_LOCAL_H
 #include <unixlib/local.h>
 int __riscosify_control = __RISCOSIFY_NO_PROCESS;
@@ -53,47 +75,53 @@ int __riscosify_control = __RISCOSIFY_NO_PROCESS;
 typedef char * string;
 typedef unsigned char byte;
 
-#define HAVE_LIBZ 1
-
-#ifdef HAVE_LIBZ
+#if HAVE_LIBZ
 #include <zlib.h>
 private int inflate_gzip(byte *, unsigned int);
 private z_stream z;
 #endif  /* HAVE_LIBZ */
 
+// HAVE_LIBBZ2 is defined in autoconfig.h for autoconf builds.
 // #define HAVE_LIBBZ2 1
 
-#ifdef HAVE_LIBBZ2  // XXX ask the team about this
+#if HAVE_LIBBZ2
 #include <bzlib.h>
 private int inflate_bzip2(byte *, unsigned int);
 private bz_stream bz;
 #endif  /* HAVE_LIBBZ2 */
 
 #if TIME_WITH_SYS_TIME
-# include <sys/time.h>
-# include <time.h>
+ #include <sys/time.h>
+ #include <time.h>
 #else
-# if HAVE_SYS_TIME_H
-#  include <sys/time.h>
-# else
-#  include <time.h>
-# endif
+ #if HAVE_SYS_TIME_H
+  #include <sys/time.h>
+ #else
+  #include <time.h>
+ #endif
+#endif
+
+#ifdef _MSC_VER
+#define HAVE_TZNAME 1
 #endif
 
 #if HAVE_STRUCT_TM_TM_ZONE
-# define tm_zone(tm) (tm->tm_zone)
+ #define tm_zone(tm) (tm->tm_zone)
 #elif HAVE_TZNAME
-# define tm_zone(tm) (tzname[tm->tm_isdst])
+ #define tm_zone(tm) (tzname[tm->tm_isdst])
 #elif __MINGW32__
-# define tm_zone(tm) (tzname[tm->tm_isdst])
+ #define tm_zone(tm) (tzname[tm->tm_isdst])
 #else
-# ifndef tzname  /* For SGI. */
+ #ifndef tzname  /* For SGI. */
   extern string tzname[]; /* RS6000 and others reject char **tzname. */
-# endif
-# define tm_zone(tm) (tzname[tm->tm_isdst])
+ #endif
+ #define tm_zone(tm) (tzname[tm->tm_isdst])
 #endif
 
+#include "jumbo.h"
 #include "misc.h"
+#include "params.h"
+#include "memory.h"
 #include "memdbg.h"	// Must be last included header
 
 #define YES 1
@@ -101,40 +129,51 @@ private bz_stream bz;
 
 #define NULL_VER -1
 
-#define BIG_ENOUGH 8192
-
 /* Global Stuff */
 
-static unsigned char d[BIG_ENOUGH];
-static unsigned char u[BIG_ENOUGH];
-static unsigned char p[BIG_ENOUGH];
-static unsigned char q[BIG_ENOUGH];
-static unsigned char g[BIG_ENOUGH];
-static unsigned char y[BIG_ENOUGH];
-static unsigned char n[BIG_ENOUGH];
-static unsigned char e[BIG_ENOUGH];
-// static unsigned char x[BIG_ENOUGH];
-static unsigned char m_data[BIG_ENOUGH];
-static char gecos[BIG_ENOUGH];
+static unsigned char d[16384]; // used for RSA, more than big enough
+static unsigned char u[16384]; // used for RSA, more than big enough
+static unsigned char p[16384];
+static unsigned char q[16384];
+static unsigned char g[16384];
+static unsigned char y[16384];
+static unsigned char n[16384];
+static unsigned char e[16384];
+static unsigned char m_data[90000];  // FIXME: I think 8192 is biggest data per block ???
+static char gecos[1024];
+static char *last_hash;
 static unsigned char m_salt[64];
 static unsigned char iv[16];
-char *filename;
+static char *filename;
+static int offset;
+static int gpg_dbg;
+static int dump_subkeys;
+static int is_subkey;
+static size_t m_flen;
 
-int m_spec;
-int m_algorithm;
-int m_datalen;
-int key_bits;
-int d_bits;
-int p_bits;
-int q_bits;
-int g_bits;
-int y_bits;
-int n_bits;
-int u_bits;
-int e_bits;
-int m_datalen;
-int m_usage, m_hashAlgorithm, m_cipherAlgorithm, bs;
-int m_count;
+static int m_spec;
+static int m_algorithm;
+//static int m_datalen;
+static unsigned key_bits;
+static unsigned d_bits;
+static unsigned p_bits;
+static unsigned q_bits;
+static unsigned g_bits;
+static unsigned y_bits;
+static unsigned n_bits;
+static unsigned u_bits;
+static unsigned e_bits;
+static int m_usage, m_hashAlgorithm, m_cipherAlgorithm, bs;
+static int m_count;
+static int hash_generated = 0;
+
+
+/* Global data for read_radix64 and decode_radix64 functions, reset for each new file */
+static int done_rr = NO;
+static int done_dr = NO;
+static unsigned int avail_dr = 0;
+static int found_rr = NO;
+static byte *qdr = NULL;
 
 /*
  * pgpdump.c
@@ -142,11 +181,11 @@ int m_count;
 
 public void warning(const string, ...);
 public void warn_exit(const string, ...);
-public void skip(int);
-public void dump(int);
-public void pdump(int);
-public void kdump(int);
-public void give(int, unsigned char*);
+public void skip(unsigned);
+public void dump(unsigned);
+public void pdump(unsigned);
+public void kdump(unsigned);
+public int give(const unsigned, unsigned char *, const unsigned);
 
 /*
  * buffer.c
@@ -166,7 +205,7 @@ public void Getc_resetlen(void);
  *  packet.c
  */
 
-public void parse_packet(void);
+public void parse_packet(char *);
 public void parse_signature_subpacket(string, int);
 public void parse_userattr_subpacket(string, int);
 
@@ -176,10 +215,10 @@ public void parse_userattr_subpacket(string, int);
 
 public void pub_algs(unsigned int);
 public void sym_algs(unsigned int);
-public void sym_algs2(unsigned int);
+public char *sym_algs2(unsigned int);
 public int  iv_len(unsigned int);
 public void comp_algs(unsigned int);
-public void hash_algs(unsigned int);
+public char *hash_algs(unsigned int);
 public void key_id(void);
 public void fingerprint(void);
 public void time4(string);
@@ -197,13 +236,13 @@ public void multi_precision_integer(string);
 public void Reserved(int);
 public void Public_Key_Encrypted_Session_Key_Packet(int);
 public void Symmetric_Key_Encrypted_Session_Key_Packet(int);
-public void Symmetrically_Encrypted_Data_Packet(int);
+public void Symmetrically_Encrypted_Data_Packet(int,int,int,char*);
 public void Marker_Packet(int);
 public void Literal_Data_Packet(int);
 public void Trust_Packet(int);
 public void User_ID_Packet(int);
 public void User_Attribute_Packet(int);
-public void Symmetrically_Encrypted_and_MDC_Packet(int);
+public void Symmetrically_Encrypted_and_MDC_Packet(int,int,int,char*);
 public void Modification_Detection_Code_Packet(int);
 public void Private_Packet(int);
 
@@ -261,14 +300,14 @@ public void image_attribute(int);
 /*
  * pgpdump.c
  */
-int aflag;
-int dflag;
-int gflag;
-int iflag;
-int lflag;
-int mflag;
-int pflag;
-int uflag;
+static int aflag;
+//static int dflag;
+//static int gflag;
+//static int iflag;
+static int lflag;
+static int mflag;
+//static int pflag;
+static int uflag;
 
 public void
 warning(const string fmt, ...)
@@ -296,24 +335,114 @@ warn_exit(const string fmt, ...)
 	exit(EXIT_FAILURE);
 }
 
+static int print_hex(unsigned char *str, int len, char *cp)
+{
+	int i;
+	for (i = 0; i < len; ++i)
+		cp += sprintf(cp, "%02x", str[i]);
+	return len*2;
+}
 
 int gpg2john(int argc, char **argv)
 {
-	string target = argv[1];
-        if (argc < 2) {
-                fprintf(stderr, "Usage: %s <GPG Secret Key File(s)>\n", argv[0]);
-                exit(-1);
-        }
+	int i;
+	int something_failed = 0;
 
-	filename = argv[1];
-	if (freopen(target, "rb", stdin) == NULL)
-		warn_exit("can't open %s.", target);
-	parse_packet();
+	while (argc > 2 && (!strcmp(argv[1], "-d") || !strcmp(argv[1], "-S"))) {
+		if (!strcmp(argv[1], "-d"))
+			gpg_dbg = 1;
+		else
+			dump_subkeys = 1;
+		for (i = 1; i < argc; ++i)
+			argv[i] = argv[i+1];
+		--argc;
+	}
+	if (argc < 2) {
+		fprintf(stderr, "Usage: %s [-d] [-S] <GPG Secret Key File(s)>\n", argv[0]);
+		fprintf(stderr, "   if -d is used, then debugging of the object types decoded is written\n");
+		fprintf(stderr, "   if -S is used, then subkeys will also be output\n");
+		exit(-1);
+	}
+
+	for (i = 1; i < argc; ++i) {
+		FILE *fp;
+		char *hash;
+		char *marker = NULL;
+		size_t ret = 0;
+
+		/* reset global state */
+		done_rr = NO;
+		done_dr = NO;
+		avail_dr = 0;
+		found_rr = NO;
+		qdr = NULL;
+		hash_generated = 0;
+
+		fprintf(stderr, "\nFile %s\n", argv[i]);
+		filename = argv[i];
+		fp = fopen(filename, "rb");
+		if (!fp) {
+			fprintf(stderr, "%s: %s!\n", filename, strerror(errno));
+			something_failed = 1;
+			continue;
+		}
+		jtr_fseek64(fp, 0, SEEK_END);
+		m_flen = (size_t)jtr_ftell64(fp);
+		jtr_fseek64(fp, 0, SEEK_SET);
+		hash = mem_alloc((m_flen + 256) << 1);
+		ret = fread(hash, m_flen, 1, fp);
+		if (ret != 1) {
+			fprintf(stderr, "%s: unable to load in memory!\n", filename);
+			something_failed = 1;
+		}
+		marker = memmem(hash, m_flen, "---BEGIN", 8);
+		if (marker) {
+			if (m_flen - (int)(marker - hash) - 1 > 8) {
+				marker = memmem(marker + 1, m_flen - (int)(marker - hash) - 1, "---BEGIN", 8);
+				if (marker) {
+					fprintf(stderr, "Error: Ensure that the input file %s "
+					        "contains a single private key only.\n", filename);
+					something_failed = 1;
+				}
+			}
+		}
+		fclose(fp);
+		if (freopen(filename, "rb", stdin) == NULL)
+			warn_exit("can't open %s.", filename);
+		parse_packet(hash);
+		if (last_hash && *last_hash) {
+			char login[4096], *cp;
+			char *gecos_remains = gecos;
+			const char *ext[] = {".gpg", ".pgp"};
+			if (!gecos[0]) {
+				cp = strip_suffixes(jtr_basename(filename), ext, 2);
+				strnzcpy(gecos, cp, sizeof(gecos));
+			}
+			strnzcpy(login, gecos, sizeof(login));
+			if ((cp = strchr(login, '('))) 	memset(cp, 0, 1);
+			if ((cp = strrchr(login, '<'))) memset(cp, 0, 1);
+			gecos_remains += strlen(login);
+			cp = &login[strlen(login) - 1];
+			while (cp > login && *cp == ' ') *cp-- = 0;
+			printf("%s:%s:::%s::%s\n", login, last_hash, gecos, filename);
+			MEM_FREE(last_hash);
+		}
+		if (!hash_generated) {
+			fprintf(stderr, "Error: No hash was generated for %s, ensure that the input file contains a single private key only.\n", filename);
+			MEM_FREE(hash);
+			something_failed = 1;
+			continue;
+		}
+		MEM_FREE(hash);
+	}
+
+	if (something_failed)
+		exit(EXIT_FAILURE);
 	exit(EXIT_SUCCESS);
 }
 
 public void
-skip(int len)
+skip(unsigned len)
 {
 	int i;
 	for (i = 0; i < len; i++)
@@ -321,45 +450,60 @@ skip(int len)
 }
 
 public void
-dump(int len)
+dump(unsigned len)
 {
 	int i;
 	for (i = 0; i < len; i++)
-		printf("%02x", Getc());
+		fprintf(stderr, "%02x", Getc());
+}
+
+public int
+give(const unsigned len, unsigned char *buf, const unsigned buf_size)
+{
+	int i, tmp;
+
+	if (len > buf_size)
+		warn_exit("Bad parameter: give(len=%u, buf=%p, buf_size=%u), len can not be bigger than buf_size.",
+			len, buf, buf_size);
+
+	for (i = 0; i < len; i++) {
+		tmp = Getc();
+		if (tmp == EOF)
+			return -1;
+		buf[i] = tmp;
+	}
+	return len;
 }
 
 public void
-give(int len, unsigned char *buf)
+pdump(unsigned len)
 {
 	int i;
 	for (i = 0; i < len; i++)
-		buf[i] = Getc();
+		fprintf(stderr, "%c", Getc());
 }
 
 public void
-pdump(int len)
+give_pdump(unsigned len)
 {
 	int i;
-	for (i = 0; i < len; i++)
-		printf("%c", Getc());
-}
 
-public void
-give_pdump(int len)
-{
-	int i;
+	if (len > sizeof(gecos))
+		warn_exit("Bad parameter: give_pdump(len=%u), len can not be bigger than sizeof(gecos)=%u.",
+			len, sizeof(gecos));
+
 	for (i = 0; i < len; i++)
 		gecos[i] = Getc();
 	gecos[i] = 0;
 }
 
 public void
-kdump(int len)
+kdump(unsigned len)
 {
         int i;
-        printf("0x");
+        fprintf(stderr, "0x");
         for (i = 0; i < len; i++)
-                printf("%02X", Getc());
+                fprintf(stderr, "%02X", Getc());
 }
 
 /*
@@ -405,7 +549,7 @@ pub_algs(unsigned int type)
 	if (type < PUB_ALGS_NUM)
 		printf("%s", PUB_ALGS[type]);
 	else
-		printf("unknown(pub %d)", type);
+		printf("unknown(pub %u)", type);
 	printf("\n"); */
 }
 
@@ -432,19 +576,19 @@ SYM_ALGS[] = {
 public void
 sym_algs(unsigned int type)
 {
-	// printf("\tSym alg - ");
+	if (gpg_dbg) fprintf(stderr, "\tSym alg - ");
 	m_cipherAlgorithm = type;
-	// sym_algs2(type);
-	// printf("\n");
+	if (gpg_dbg) fprintf(stderr, "%s\n", sym_algs2(type));
 }
 
-public void
+public char *
 sym_algs2(unsigned int type)
 {
-	/* if (type < SYM_ALGS_NUM)
-		fprintf(stderr, "%s", SYM_ALGS[type]);
-	else
-		printf("unknown(sym %d)", type); */
+	static char S[48];
+	if (type < SYM_ALGS_NUM)
+		return SYM_ALGS[type];
+	sprintf(S, "unknown(sym %u)", type);
+	return S;
 }
 
 private int
@@ -468,6 +612,8 @@ IV_LEN[] = {
 public int
 iv_len(unsigned int type)
 {
+	(void) SYM_ALGS; /* Mutes a compiler warning in clang */
+
 	if (type < SYM_ALGS_NUM)
 		return IV_LEN[type];
 	else
@@ -491,11 +637,11 @@ comp_algs(unsigned int type)
 	if (type < COMP_ALGS_NUM)
 		fprintf(stderr, "%s", COMP_ALGS[type]);
 	else
-		fprintf(stderr, "unknown(comp %d)", type);
+		fprintf(stderr, "unknown(comp %u)", type);
 	printf("\n"); */
 }
 
-/* private string
+private string
 HASH_ALGS[] = {
 	"unknown(hash 0)",
 	"MD5(hash 1)",
@@ -509,37 +655,40 @@ HASH_ALGS[] = {
 	"SHA384(hash 9)",
 	"SHA512(hash 10)",
 	"SHA224(hash 11)",
-}; */
+};
 
 #define HASH_ALGS_NUM (sizeof(HASH_ALGS) / sizeof(string))
 
-public void
+public char *
 hash_algs(unsigned int type)
 {
-	/* printf("\tHash alg - ");
+	static char S[48];
 	if (type < HASH_ALGS_NUM)
-		printf("%s", HASH_ALGS[type]);
-	else
-		printf("unknown(hash %d)", type);
-	printf("\n"); */
+		return HASH_ALGS[type];
+	sprintf(S, "unknown(hash %u)", type);
+	return S;
 }
 
 public void
 key_id(void)
 {
-	// printf("\tKey ID - ");
-	// kdump(8);
-	skip(8);
-	// printf("\n");
+	if (gpg_dbg) fprintf(stderr, "\tKey ID - ");
+	if (gpg_dbg)
+		kdump(8);
+	else
+		skip(8);
+	if (gpg_dbg) fprintf(stderr, "\n");
 }
 
 public void
 fingerprint(void)
 {
-	// printf("\tFingerprint - ");
-	// dump(20);
-	skip(20);
-	// printf("\n");
+	if (gpg_dbg) fprintf(stderr, "\tFingerprint - ");
+	if (gpg_dbg)
+		dump(20);
+	else
+		skip(20);
+	if (gpg_dbg) fprintf(stderr, "\n");
 }
 
 private void
@@ -550,7 +699,7 @@ time4_base(string str, time_t *pt)
 	// char* pyr;
 
 	if (*pt < 0) {  /* 32 bit time_t and after 2038-01-19 */
-		printf("\t%s - cannot print date after 2038-01-19\n", str);
+		fprintf(stderr, "\t%s - cannot print date after 2038-01-19\n", str);
 		return;
 	}
 
@@ -658,50 +807,54 @@ string_to_key(void)
 
 	switch (type) {
 	case 0:
-		// fprintf(stderr, "\tSimple string-to-key(s2k %d):\n", type);
-		// printf("\t");
+		if (gpg_dbg) fprintf(stderr, "\tSimple string-to-key(s2k %d):\n", type);
+		if (gpg_dbg) fprintf(stderr, "\t");
 		m_spec = type;
 		// hash_algs(Getc());
 		m_hashAlgorithm = Getc();
 		break;
 	case 1:
-		// printf("\tSalted string-to-key(s2k %d):\n", type);
+		if (gpg_dbg) fprintf(stderr, "\tSalted string-to-key(s2k %d):\n", type);
 		m_spec = type;
 		m_count = 0; // ;(
 		// hash_algs(Getc());
 		m_hashAlgorithm = Getc();
-		// printf("\t\tSalt - ");
-		give(8, m_salt);
-		// dump(8);
-		// printf("\n");
+		if (gpg_dbg) fprintf(stderr, "\t\tSalt - ");
+		if (gpg_dbg)
+			dump(8);
+		else
+			give(8, m_salt, sizeof(m_salt));
+		if (gpg_dbg) fprintf(stderr, "\n");
 		break;
 	case 2:
-		// printf("\tReserved string-to-key(s2k %d)\n", type);
+		if (gpg_dbg) fprintf(stderr, "\tReserved string-to-key(s2k %d)\n", type);
 		break;
 	case 3:
-		// fprintf(stderr, "\tIterated and salted string-to-key(s2k %d):\n", type);
-		// printf("\t");
+		if (gpg_dbg) fprintf(stderr, "\tIterated and salted string-to-key(s2k %d):\n", type);
+		if (gpg_dbg) fprintf(stderr, "\t");
 		m_spec = type;
 		m_hashAlgorithm = Getc();
 		// hash_algs(Getc());
-		// printf("\t\tSalt - ");
-		// dump(8);
-		give(8, m_salt);
-		// printf("\n");
+		if (gpg_dbg) fprintf(stderr, "\t\tSalt - ");
+		if (gpg_dbg)
+			dump(8);
+		else
+			give(8, m_salt, sizeof(m_salt));
+		if (gpg_dbg) fprintf(stderr, "\n");
 		{
 			int count, c = Getc();
 			count = (16 + (c & 15)) << ((c >> 4) + EXPBIAS);
-			// printf("\t\tCount - %d(coded count %d)\n", count, c);
+			if (gpg_dbg) fprintf(stderr, "\t\tCount - %d(coded count %d)\n", count, c);
 			m_count = count;
 		}
 		break;
 	case 101:
-		printf("\tGnuPG string-to-key(s2k %d)\n", type);
+		if (gpg_dbg) fprintf(stderr, "\tGnuPG string-to-key(s2k %d)\n", type);
 		has_iv = NO;
 		skip(5);
 		break;
 	default:
-		printf("\tUnknown string-to-key(s2k %d)\n", type);
+		fprintf(stderr, "\tUnknown string-to-key(s2k %d)\n", type);
 	}
 	return has_iv;
 }
@@ -730,21 +883,22 @@ skip_multi_precision_integer(string str)
 	skip(bytes);
 }
 
-
-public int
-give_multi_precision_integer(unsigned char *buf, int *key_bits)
+public unsigned
+give_multi_precision_integer(unsigned char *buf, const unsigned buf_size, unsigned *key_bits)
 {
-	int bytes;
-	int bits = Getc() * 256;
+	unsigned bytes;
+	unsigned bits = Getc() * 256;
 	bits += Getc();
 	bytes = (bits + 7) / 8;
 	*key_bits = bits;
 
-	// printf("\t%s(%d bits) - ", str, bits);
-	give(bytes, buf);
+	//if (gpg_dbg) fprintf(stderr, "\t%s(%d bits) - ", str, bits);
+	if (gpg_dbg)
+		dump(bytes);
+	else
+		give(bytes, buf, buf_size);
+	if (gpg_dbg) fprintf(stderr, "\n");
 	return bytes;
-	// dump(bytes);
-	// printf("\n");
 }
 /*
  * tagfunc.c
@@ -757,7 +911,7 @@ give_multi_precision_integer(unsigned char *buf, int *key_bits)
 private int sym_alg_mode = SYM_ALG_MODE_NOT_SPECIFIED;
 private void reset_sym_alg_mode();
 private void set_sym_alg_mode(int);
-// private int get_sym_alg_mode();
+private int get_sym_alg_mode();
 
 private void
 reset_sym_alg_mode()
@@ -771,11 +925,11 @@ set_sym_alg_mode(int mode)
 	sym_alg_mode = mode;
 }
 
-/* private int
+private int
 get_sym_alg_mode()
 {
 	return sym_alg_mode;
-} */
+}
 
 public void
 Reserved(int len)
@@ -807,10 +961,10 @@ Public_Key_Encrypted_Session_Key_Packet(int len)
 		skip_multi_precision_integer("DSA ?");
 		break;
 	default:
-		printf("\t\tunknown(pub %d)\n", pub);
+		fprintf(stderr, "\t\tunknown(pub %d)\n", pub);
 		skip(len - 10);
 	}
-	// printf("\t\t-> m = sym alg(1 byte) + checksum(2 bytes) + PKCS-1 block type 02\n");
+	if (gpg_dbg) fprintf(stderr, "\t\t-> m = sym alg(1 byte) + checksum(2 bytes) + PKCS-1 block type 02\n");
 	set_sym_alg_mode(SYM_ALG_MODE_PUB_ENC);
 }
 
@@ -818,7 +972,6 @@ public void
 Symmetric_Key_Encrypted_Session_Key_Packet(int len)
 {
 	int left = len, alg;
-	fprintf(stderr, "(Symmetric_Key_Encrypted_Session_Key_Packet) Make us add support for such files ;(\n");
 	ver(NULL_VER, 4, Getc());
 	alg = Getc();
 	sym_algs(alg);
@@ -827,43 +980,86 @@ Symmetric_Key_Encrypted_Session_Key_Packet(int len)
 	string_to_key();
 	left -= Getc_getlen();
 	if (left != 0) {
-		// printf("\tEncrypted session key\n");
-		// printf("\t\t-> sym alg(1 bytes) + session key\n");
+		if (gpg_dbg) fprintf(stderr, "\tEncrypted session key\n");
+		if (gpg_dbg) fprintf(stderr, "\t\t-> sym alg(1 bytes) + session key\n");
 		skip(left);
 	}
 	set_sym_alg_mode(SYM_ALG_MODE_SYM_ENC);
 }
 
 public void
-Symmetrically_Encrypted_Data_Packet(int len)
+Symmetrically_Encrypted_Data_Packet(int len, int first, int partial, char *hash)
 {
-	/* int mode = get_sym_alg_mode();
+	int mode = get_sym_alg_mode();
+	static char *cp;
+	static uint64_t totlen;
+	int abort = 0;
+
+	if (first) {
+		cp = hash;
+		totlen = 0;
+	}
+	totlen += len;
+
+
 	switch (mode) {
-	case SYM_ALG_MODE_NOT_SPECIFIED:
-		printf("\tEncrypted data [sym alg is IDEA, simple string-to-key]\n");
+	case SYM_ALG_MODE_NOT_SPECIFIED:  // Such files can be generated by PGP 8.0 for Windows.
+		printf("[DEBUG] Encrypted data [sym alg is IDEA, simple string-to-key]. This combination is not supported yet!\n");
+		abort = 1;
 		break;
 	case SYM_ALG_MODE_SYM_ENC:
-		printf("\tEncrypted data [sym alg is specified in sym-key encrypted session key]\n");
+		if (gpg_dbg) fprintf(stderr, "Symmetrically_Encrypted_Data_Packet -> Encrypted data [sym alg is specified in sym-key encrypted session key]\n");
 		break;
 	case SYM_ALG_MODE_PUB_ENC:
-		printf("\tEncrypted data [sym alg is specified in pub-key encrypted session key]\n");
+		if (gpg_dbg) fprintf(stderr, "\tEncrypted data [sym alg is specified in pub-key encrypted session key]\n");
 		break;
-	} */
-	skip(len);
-	reset_sym_alg_mode();
+	}
+	// https://www.ietf.org/rfc/rfc2440.txt
+	//
+	// The repetition of 16 bits in the 80 bits of random data prefixed to
+	// the message allows the receiver to immediately check whether the
+	// session key is incorrect. This is a decent verifier, the MDC isn't
+	// used in Symmetrically Encrypted Data Packet (Tag 9) packets.
+	//
+	// The decrypted data will typically contain other packets (often
+	// literal data packets or compressed data packets).
+
+	if (give(len, m_data, sizeof(m_data)) != len)
+		return;
+	cp += print_hex(m_data, len, cp);
+
+	if (abort)
+		return;
+
+	if (!partial) {
+		// we only dump the packet out when we get the 'non-partial' packet (i.e. last one).
+
+		// m_usage is not really used in gpg_fmt_plug.c for symmetric hashes,
+		// let's hijack it for specifying tag values.
+		m_usage = 9; // Symmetrically Encrypted Data Packet (these lack MDC)
+		fprintf(stderr, "[gpg2john] MDC is missing, expect lots of false positives!\n");
+		printf("$gpg$*%d*%"PRId64"*%s*%d*%d*%d*%d*%d*", m_algorithm, (int64_t)totlen, hash, m_spec, m_usage, m_hashAlgorithm, m_cipherAlgorithm, m_count);
+		cp = hash;
+		cp += print_hex(m_salt, 8, cp);
+		printf("%s\n", hash);
+		if (gpg_dbg)
+			fprintf(stderr, "  Key being dumped: Symmetrically_Encrypted_and_MDC_Packet.   hashAlgo=%s cipherAlgo=%s\n", hash_algs(m_hashAlgorithm), sym_algs2(m_cipherAlgorithm));
+		reset_sym_alg_mode();
+		hash_generated = 1;
+	}
 }
 
 public void
 Marker_Packet(int len)
 {
-	// printf("\tString - ");
+	if (gpg_dbg) fprintf(stderr, "\tString - ");
 	if (mflag) {
 		pdump(len);
 	} else {
-		// printf("...");
+		if (gpg_dbg) fprintf(stderr, "...");
 		skip(len);
 	}
-	// printf("\n");
+	if (gpg_dbg) fprintf(stderr, "\n");
 }
 
 public void
@@ -872,56 +1068,58 @@ Literal_Data_Packet(int len)
 	int format, flen, blen;
 
 	format = Getc();
-	printf("\tFormat - ");
+	fprintf(stderr, "\tFormat - ");
 	switch (format) {
 	case 'b':
-		printf("binary");
+		fprintf(stderr, "binary");
 		break;
 	case 't':
-		printf("text");
+		fprintf(stderr, "text");
 		break;
 	case 'u':
-		printf("UTF-8 text");
+		fprintf(stderr, "UTF-8 text");
 		break;
 	case 'l':
 		/* RFC 1991 incorrectly define this as '1' */
-		printf("local");
+		fprintf(stderr, "local");
 		break;
 	default:
-		printf("unknown");
+		fprintf(stderr, "unknown");
 	}
-	printf("\n");
+	fprintf(stderr, "\n");
 	flen = Getc();
-	printf("\tFilename - ");
+	fprintf(stderr, "\tFilename - ");
 	pdump(flen);
-	printf("\n");
+	fprintf(stderr, "\n");
 	time4("File modified time");
 	blen = len - 6 - flen;
-	printf("\tLiteral - ");
+	fprintf(stderr, "\tLiteral - ");
 	if (lflag) {
 		pdump(blen);
 	} else {
-		printf("...");
+		fprintf(stderr, "...");
 		skip(blen);
 	}
-	printf("\n");
+	fprintf(stderr, "\n");
 }
 
 public void
 Trust_Packet(int len)
 {
-	// printf("\tTrust - ");
-	// dump(len);
-	skip(len);
-	// printf("\n");
+	if (gpg_dbg) fprintf(stderr, "\tTrust - ");
+	if (gpg_dbg)
+		dump(len);
+	else
+		skip(len);
+	if (gpg_dbg) fprintf(stderr, "\n");
 }
 
 public void
 User_ID_Packet(int len)
 {
-	// printf("\tUser ID - ");
+	if (gpg_dbg) fprintf(stderr, "\tUser ID - ");
 	give_pdump(len);
-	// printf("\n");
+	if (gpg_dbg) fprintf(stderr, "\n");
 }
 
 public void
@@ -931,23 +1129,45 @@ User_Attribute_Packet(int len)
 }
 
 public void
-Symmetrically_Encrypted_and_MDC_Packet(int len)
+Symmetrically_Encrypted_and_MDC_Packet(int len, int first, int partial, char *hash)
 {
-	// int mode = get_sym_alg_mode();
-	// printf("\tVer %d\n", Getc());
-	fprintf(stderr, "(Symmetrically_Encrypted_and_MDC_Packet) Make us add support for such files ;(\n");
-	Getc();
-	/* switch (mode) {
+	int mode = get_sym_alg_mode();
+	static char *cp;
+	static uint64_t totlen;
+
+	if (first) {
+		cp = hash;
+		totlen = 0;
+		if (gpg_dbg) fprintf(stderr, "\tVer %d\n", Getc());
+		Getc(); // version (we only read this from the first packet. Not read from rest of the 'partial' packets.
+	} else
+		++len;  // we want the 'full' length for subsquent partial packets, since the logic is len-1 we simply fake it out.
+	totlen += (len-1);
+	switch (mode) {
 	case SYM_ALG_MODE_SYM_ENC:
-		printf("\tEncrypted data [sym alg is specified in sym-key encrypted session key]\n");
+		if (gpg_dbg) fprintf(stderr, "\tEncrypted data [sym alg is specified in sym-key encrypted session key]\n");
 		break;
 	case SYM_ALG_MODE_PUB_ENC:
-		printf("\tEncrypted data [sym alg is specified in pub-key encrypted session key]\n");
+		fprintf(stderr, "\tEncrypted data [sym alg is specified in pub-key encrypted session key]\n");
+		fprintf(stderr, "SYM_ALG_MODE_PUB_ENC is not supported yet!\n");
 		break;
-	} */
-	// printf("\t\t(plain text + MDC SHA1(20 bytes))\n");
-	skip(len - 1);
-	reset_sym_alg_mode();
+	}
+	if (give(len - 1, m_data, sizeof(m_data)) != len-1)
+		return;
+	cp += print_hex(m_data, len - 1, cp);
+
+	if (!partial) {
+		// we only dump the packet out when we get the 'non-partial' packet (i.e. last one).
+		m_usage = 18; // Sym. Encrypted Integrity Protected Data Packet (Tag 18)
+		printf("$gpg$*%d*%"PRId64"*%s*%d*%d*%d*%d*%d*", m_algorithm, (int64_t)totlen, hash, m_spec, m_usage, m_hashAlgorithm, m_cipherAlgorithm, m_count);
+		cp = hash;
+		cp += print_hex(m_salt, 8, cp);
+		printf("%s\n", hash);
+		if (gpg_dbg)
+			fprintf(stderr, "  Key being dumped: Symmetrically_Encrypted_and_MDC_Packet.   hashAlgo=%s cipherAlgo=%s\n", hash_algs(m_hashAlgorithm), sym_algs2(m_cipherAlgorithm));
+		reset_sym_alg_mode();
+		hash_generated = 1;
+	}
 }
 
 /* this function is not used because this packet appears only
@@ -955,7 +1175,7 @@ Symmetrically_Encrypted_and_MDC_Packet(int len)
 public void
 Modification_Detection_Code_Packet(int len)
 {
-	// printf("\tMDC - SHA1(20 bytes)\n");
+	if (gpg_dbg) fprintf(stderr, "\tMDC - SHA1(20 bytes)\n");
 	skip(len);
 }
 
@@ -1134,6 +1354,77 @@ private void
 	Private_Packet,
 };
 
+char *pkt_type(int tag) {
+	switch(tag) {
+	case 0: return "Reserved";
+	case 1: return "Public_Key_Encrypted_Session_Key_Packet";
+	case 2: return "Signature_Packet";
+	case 3: return "Symmetric_Key_Encrypted_Session_Key_Packet";
+	case 4: return "One_Pass_Signature_Packet";
+	case 5: return "Secret_Key_Packet";
+	case 6: return "Public_Key_Packet";
+	case 7: return "Secret_Subkey_Packet";
+	case 8: return "Compressed_Data_Packet";
+	case 9: return "Symmetrically_Encrypted_Data_Packet";
+	case 10: return "Marker_Packet";
+	case 11: return "Literal_Data_Packet";
+	case 12: return "Trust_Packet";
+	case 13: return "User_ID_Packet";
+	case 14: return "Public_Subkey_Packet";
+	case 15: return "NULL";
+	case 16: return "NULL";
+	case 17: return "User_Attribute_Packet";
+	case 18: return "Symmetrically_Encrypted_and_MDC_Packet";
+	case 19: return "Modification_Detection_Code_Packet";
+	case 20: return "NULL";
+	case 21: return "NULL";
+	case 22: return "NULL";
+	case 23: return "NULL";
+	case 24: return "NULL";
+	case 25: return "NULL";
+	case 26: return "NULL";
+	case 27: return "NULL";
+	case 28: return "NULL";
+	case 29: return "NULL";
+	case 30: return "NULL";
+	case 31: return "NULL";
+	case 32: return "NULL";
+	case 33: return "NULL";
+	case 34: return "NULL";
+	case 35: return "NULL";
+	case 36: return "NULL";
+	case 37: return "NULL";
+	case 38: return "NULL";
+	case 39: return "NULL";
+	case 40: return "NULL";
+	case 41: return "NULL";
+	case 42: return "NULL";
+	case 43: return "NULL";
+	case 44: return "NULL";
+	case 45: return "NULL";
+	case 46: return "NULL";
+	case 47: return "NULL";
+	case 48: return "NULL";
+	case 49: return "NULL";
+	case 50: return "NULL";
+	case 51: return "NULL";
+	case 52: return "NULL";
+	case 53: return "NULL";
+	case 54: return "NULL";
+	case 55: return "NULL";
+	case 56: return "NULL";
+	case 57: return "NULL";
+	case 58: return "NULL";
+	case 59: return "NULL";
+	case 60: return "NULL";
+	case 61: return "Private_Packet";
+	case 62: return "Private_Packet";
+	case 63: return "Private_Packet";
+	case 64: return "Private_Packet";
+	default: return "Unk, past end!";
+};
+
+}
 private string
 SIGSUB[] = {
 	"reserved(sub 0)",
@@ -1251,7 +1542,7 @@ is_partial(int c)
 }
 
 public void
-parse_packet(void)
+parse_packet(char *hash)
 {
 	int c, tag, len = 0;
 	int partial = NO;
@@ -1259,6 +1550,7 @@ parse_packet(void)
 
 	c = getchar();
 	ungetc(c, stdin);
+	offset = 0;
 
 	/* If the PGP packet is in the binary raw form, 7th bit of
 	 * the first byte is always 1. If it is set, let's assume
@@ -1277,14 +1569,14 @@ parse_packet(void)
 		partial = NO;
 		tag = c & TAG_MASK;
 		if (c & NEW_TAG_FLAG) {
-			// printf("New: ");
+			if (gpg_dbg) fprintf(stderr, "New: ");
 			c = Getc();
 			len = get_new_len(c);
 			partial = is_partial(c);
 		} else {
 			int tlen;
 
-			// printf("Old: ");
+			if (gpg_dbg) fprintf(stderr, "Old: ");
 			tlen = c & OLD_LEN_MASK;
 			tag >>= OLD_TAG_SHIFT;
 
@@ -1311,35 +1603,47 @@ parse_packet(void)
 			}
 		}
 		if (tag < TAG_NUM)
-			// printf("%s(tag %d)", TAG[tag], tag);
-			;
+			{if (gpg_dbg) fprintf(stderr, "%s(tag %d)", TAG[tag], tag);}
 		else
-			printf("unknown(tag %d)", tag);
+			fprintf(stderr, "unknown(tag %d)", tag);
 
 		if (partial == YES)
-			printf("(%d bytes) partial start\n", len);
-		else if (tag == TAG_COMPRESSED)
-			printf("\n");
-		else if (len == EOF)
-			printf("(until eof)\n");
-		else
-			// printf("(%d bytes)\n", len);
 			;
+			if (gpg_dbg) fprintf(stderr, "(%d bytes) partial start\n", len);
+		else if (tag == TAG_COMPRESSED)
+			fprintf(stderr, "\n");
+		else if (len == EOF)
+			fprintf(stderr, "(until eof)\n");
+		// else printf("(%d bytes)\n", len);
 
-		if (tag < TAG_NUM && tag_func[tag] != NULL)
-			(*tag_func[tag])(len);
-		else
+		if (tag < TAG_NUM && tag_func[tag] != NULL) {
+			if (gpg_dbg)
+				fprintf(stderr, "Packet type %d, len %d at offset %d  (Processing) (pkt-type %s) (Partial %s)\n", tag, len, offset, pkt_type(tag), partial?"yes":"no");
+			(*tag_func[tag])(len, 1, partial, hash);	// first packet (possibly only one if partial is false).
+		} else {
+			if (gpg_dbg)
+				fprintf(stderr, "Packet type %d, len %d at offset %d  (Skipping) (Partial %s)\n", tag, len, offset, partial?"yes":"no");
 			skip(len);
+		}
 		while (partial == YES) {
-			printf("New: ");
+			if (gpg_dbg) fprintf(stderr, "New: ");
 			c = Getc();
 			len = get_new_len(c);
 			partial = is_partial(c);
-			if (partial == YES)
-				printf("\t(%d bytes) partial continue\n", len);
-			else
-				printf("\t(%d bytes) partial end\n", len);
-			skip(len);
+			if (partial == YES) {
+				if (gpg_dbg)
+					fprintf(stderr, "\t(%d bytes) partial continue\n", len);
+			}
+			else {
+				if (gpg_dbg)
+					fprintf(stderr, "\t(%d bytes) partial end\n", len);
+			}
+			if (tag < TAG_NUM && tag_func[tag] != NULL) {
+				if (gpg_dbg)
+					fprintf(stderr, "Packet type %d, len %d at offset %d  (Processing) (pkt-type %s) (Partial %s)\n", tag, len, offset, pkt_type(tag), partial?"yes":"no");
+				(*tag_func[tag])(len, 0, partial, hash);	// subsquent packets.
+			} else
+				skip(len);
 		}
 		if (len == EOF) return;
 	}
@@ -1383,6 +1687,7 @@ parse_signature_subpacket(string prefix, int tlen)
 		else
 			printf("\t%s: unknown(sub %d%s)", prefix, subtype, critical ? ", critical" : "");
 		printf("(%d bytes)\n", len); */
+		(void) SIGSUB; /* mute a compiler warning in clang */
 		if (subtype < SIGSUB_NUM && sigsub_func[subtype] != NULL)
 			(*sigsub_func[subtype])(len);
 		else
@@ -1414,10 +1719,10 @@ parse_userattr_subpacket(string prefix, int tlen)
 		len--;  /* len includes this field byte */
 
 		if (subtype < UATSUB_NUM)
-			printf("\t%s: %s", prefix, UATSUB[subtype]);
+			fprintf(stderr, "\t%s: %s", prefix, UATSUB[subtype]);
 		else
-			printf("\t%s: unknown(sub %d)", prefix, subtype);
-		// printf("(%d bytes)\n", len);
+			fprintf(stderr, "\t%s: unknown(sub %d)", prefix, subtype);
+		if (gpg_dbg) fprintf(stderr, "(%d bytes)\n", len);
 		if (subtype < UATSUB_NUM && uatsub_func[subtype] != NULL)
 			(*uatsub_func[subtype])(len);
 		else
@@ -1433,89 +1738,106 @@ parse_userattr_subpacket(string prefix, int tlen)
 public void
 signature_creation_time(int len)
 {
-	// printf("\t");
-	skip(4);
-	// sig_creation_time4("Time");
+	if (gpg_dbg) fprintf(stderr, "\t");
+	if (gpg_dbg)
+		sig_creation_time4("Time");
+	else
+		skip(4);
+
 }
 
 public void
 signature_expiration_time(int len)
 {
-	// printf("\t");
-	skip(4);
-	// sig_expiration_time4("Time");
+	if (gpg_dbg) fprintf(stderr, "\t");
+	if (gpg_dbg)
+		sig_expiration_time4("Time");
+	else
+		skip(4);
 }
 
 public void
 exportable_certification(int len)
 {
-	// printf("\t\tExportable - ");
-	if (Getc() == 0);
-		// printf("No");
-	else;
-		// printf("Yes");
-	// printf("\n");
+#if DEBUG
+	printf("\t\tExportable - ");
+	if (Getc() == 0)
+		printf("No");
+	else
+		printf("Yes");
+	printf("\n");
+#else
+	Getc();
+#endif
 }
 
 public void
 trust_signature(int len)
 {
-	// printf("\t\tLevel - ");
+	if (gpg_dbg) fprintf(stderr, "\t\tLevel - ");
 	skip(1);
-	// printf("\n");
-	// printf("\t\tAmount - ");
+	if (gpg_dbg) fprintf(stderr, "\n");
+	if (gpg_dbg) fprintf(stderr, "\t\tAmount - ");
 	skip(1);
-	// printf("\n");
+	if (gpg_dbg) fprintf(stderr, "\n");
 }
 
 public void
 regular_expression(int len)
 {
-	// printf("\t\tRegex - ");
-	// pdump(len);
-	skip(len);
-	// printf("\n");
+	if (gpg_dbg) fprintf(stderr, "\t\tRegex - ");
+	if (gpg_dbg)
+		pdump(len);
+	else
+		skip(len);
+	if (gpg_dbg) fprintf(stderr, "\n");
 }
 
 public void
 revocable(int len)
 {
-	// printf("\t\tRevocable - ");
-	if (Getc() == 0);
-		// printf("No");
-	else;
-		// printf("Yes");
-	// printf("\n");
+#if DEBUG
+	printf("\t\tRevocable - ");
+	if (Getc() == 0)
+		printf("No");
+	else
+		printf("Yes");
+	printf("\n");
+#else
+	Getc();
+#endif
 }
 
 public void
 key_expiration_time(int len)
 {
-	// printf("\t");
-	skip(4);
-	// key_expiration_time4("Time");
+	if (gpg_dbg) fprintf(stderr, "\t");
+	if (gpg_dbg)
+		key_expiration_time4("Time");
+	else
+		skip(4);
 }
 
 public void
 additional_decryption_key(int len)
 {
 	int c = Getc();
-	printf("\t\tClass - ");
+	fprintf(stderr, "\t\tClass - ");
 	switch (c) {
 	case 0x80:
-		printf("Strong request");
+		fprintf(stderr, "Strong request");
 		break;
 	case 0x0:
-		printf("Normal");
+		fprintf(stderr, "Normal");
 		break;
 	default:
-		printf("Unknown class(%02x)", c);
+		fprintf(stderr, "Unknown class(%02x)", c);
 		break;
 	}
-	// printf("\n");
-	// printf("\t");
+	if (gpg_dbg) fprintf(stderr, "\n");
+	if (gpg_dbg) fprintf(stderr, "\t");
 	pub_algs(Getc());
-	// printf("\t");
+	if (gpg_dbg) fprintf(stderr, "\t");
 	fingerprint();
 }
 
@@ -1524,7 +1846,7 @@ preferred_symmetric_algorithms(int len)
 {
 	int i;
 	for (i = 0; i < len; i++) {
-		// printf("\t");
+		if (gpg_dbg) fprintf(stderr, "\t");
 		sym_algs(Getc());
 	}
 }
@@ -1533,33 +1855,33 @@ public void
 revocation_key(int len)
 {
 	int c = Getc();
-	printf("\t\tClass - ");
+	fprintf(stderr, "\t\tClass - ");
 	if (c & 0x80)
 		switch (c) {
 		case 0x80:
-			printf("Normal");
+			fprintf(stderr, "Normal");
 			break;
 		case 0xc0:
-			printf("Sensitive");
+			fprintf(stderr, "Sensitive");
 			break;
 		default:
-			printf("Unknown class(%02x)", c);
+			fprintf(stderr, "Unknown class(%02x)", c);
 			break;
 		}
 	else
-		printf("Unknown class(%02x)", c);
+		fprintf(stderr, "Unknown class(%02x)", c);
 
-	printf("\n");
-	printf("\t");
+	fprintf(stderr, "\n");
+	//fprintf(stderr, "\t");
 	pub_algs(Getc());
-	printf("\t");
+	//fprintf(stderr, "\t");
 	fingerprint();
 }
 
 public void
 issuer_key_ID(int len)
 {
-	// printf("\t");
+	if (gpg_dbg) fprintf(stderr, "\t");
 	key_id();
 }
 
@@ -1610,7 +1932,7 @@ preferred_hash_algorithms(int len)
 {
 	int i;
 	for (i = 0; i < len; i++) {
-		// printf("\t");
+		if (gpg_dbg) fprintf(stderr, "\t");
 		hash_algs(Getc());
 	}
 }
@@ -1620,7 +1942,7 @@ preferred_compression_algorithms(int len)
 {
 	int i;
 	for (i = 0; i < len; i++) {
-		// printf("\t");
+		if (gpg_dbg) fprintf(stderr, "\t");
 		comp_algs(Getc());
 	}
 }
@@ -1649,30 +1971,38 @@ key_server_preferences(int len)
 public void
 preferred_key_server(int len)
 {
-	// printf("\t\tURL - ");
-	// pdump(len);
-	skip(len);
-	// printf("\n");
+	if (gpg_dbg) fprintf(stderr, "\t\tURL - ");
+	if (gpg_dbg)
+		pdump(len);
+	else
+		skip(len);
+	if (gpg_dbg) fprintf(stderr, "\n");
 }
 
 public void
 primary_user_id(int len)
 {
-	// printf("\t\tPrimary - ");
-	if (Getc() == 0);
-		// printf("No");
-	else;
-		// printf("Yes");
-	// printf("\n");
+#if DEBUG
+	printf("\t\tPrimary - ");
+	if (Getc() == 0)
+		printf("No");
+	else
+		printf("Yes");
+	printf("\n");
+#else
+	Getc();
+#endif
 }
 
 public void
 policy_URL(int len)
 {
-	// printf("\t\tURL - ");
-	// pdump(len);
-	skip(len);
-	// printf("\n");
+	if (gpg_dbg) fprintf(stderr, "\t\tURL - ");
+	if (gpg_dbg)
+		pdump(len);
+	else
+		skip(len);
+	if (gpg_dbg) fprintf(stderr, "\n");
 }
 
 public void
@@ -1700,7 +2030,7 @@ key_flags(int len)
 public void
 signer_user_id(int len)
 {
-	// printf("\t");
+	if (gpg_dbg) fprintf(stderr, "\t");
 	User_ID_Packet(len);
 }
 
@@ -1708,54 +2038,56 @@ public void
 reason_for_revocation(int len)
 {
 	int c = Getc();
-	printf("\t\tReason - ");
+	fprintf(stderr, "\t\tReason - ");
 	switch (c) {
 	case 0:
-		printf("No reason specified");
+		fprintf(stderr, "No reason specified");
 		break;
 	case 1:
-		printf("Key is superceded");
+		fprintf(stderr, "Key is superceded");
 		break;
 	case 2:
-		printf("Key material has been compromised");
+		fprintf(stderr, "Key material has been compromised");
 		break;
 	case 3:
-		printf("Key is retired and no longer used");
+		fprintf(stderr, "Key is retired and no longer used");
 		break;
 	case 32:
-		printf("User ID information is no longer valid");
+		fprintf(stderr, "User ID information is no longer valid");
 		break;
 	default:
-		printf("Unknown reason(%2d)", c);
+		fprintf(stderr, "Unknown reason(%2d)", c);
 		break;
 	}
-	printf("\n");
-	printf("\t\tComment - ");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "\t\tComment - ");
 	pdump(len - 1);
-	printf("\n");
+	fprintf(stderr, "\n");
 }
 
 public void
 features(int len)
 {
+#if DEBUG
 	int c = Getc();
 	if (c & 0x01)
-		// printf("\t\tFlag - Modification detection (packets 18 and 19)\n");
-		;
+		printf("\t\tFlag - Modification detection (packets 18 and 19)\n");
 	if ((c & ~0xfe) == 0)
-		// printf("\t\tFlag - undefined\n");
-		;
+		printf("\t\tFlag - undefined\n");
+#else
+	Getc();
+#endif
 	skip(len - 1);
 }
 
 public void
 signature_target(int len)
 {
-	// printf("\t");
+	if (gpg_dbg) fprintf(stderr, "\t");
 	pub_algs(Getc());
-	// printf("\t");
+	if (gpg_dbg) fprintf(stderr, "\t");
 	hash_algs(Getc());
-	// printf("\t\tTarget signature digest(%d bytes)\n", len - 2);
+	if (gpg_dbg) fprintf(stderr, "\t\tTarget signature digest(%d bytes)\n", len - 2);
 	skip(len - 2);
 }
 
@@ -1779,9 +2111,9 @@ private void old_Signature_Packet(int);
 private void
 hash2(void)
 {
-	// printf("\tHash left 2 bytes - ");
+	if (gpg_dbg) fprintf(stderr, "\tHash left 2 bytes - ");
 	skip(2);
-	// printf("\n");
+	if (gpg_dbg) fprintf(stderr, "\n");
 }
 
 private void
@@ -1792,7 +2124,7 @@ signature_multi_precision_integer(int pub, int len)
 	case 2:
 	case 3:
 		skip_multi_precision_integer("RSA m^d mod n");
-		// printf("\t\t-> PKCS-1\n");
+		if (gpg_dbg) fprintf(stderr, "\t\t-> PKCS-1\n");
 		break;
 	case 16:
 	case 20:
@@ -1803,10 +2135,10 @@ signature_multi_precision_integer(int pub, int len)
 		m_algorithm = pub;
 		skip_multi_precision_integer("DSA r");
 		skip_multi_precision_integer("DSA s");
-		// printf("\t\t-> hash(DSA q bits)\n");
+		if (gpg_dbg) fprintf(stderr, "\t\t-> hash(DSA q bits)\n");
 		break;
 	default:
-		// printf("\tUnknown signature(pub %d)\n", pub);
+		if (gpg_dbg) fprintf(stderr, "\tUnknown signature(pub %d)\n", pub);
 		skip(len);
 		break;
 	}
@@ -1877,12 +2209,12 @@ One_Pass_Signature_Packet(int len)
 	hash_algs(Getc());
 	pub_algs(Getc());
 	key_id();
-	printf("\tNext packet - ");
+	fprintf(stderr, "\tNext packet - ");
 	if (Getc() == 0)
-		printf("another one pass signature");
+		fprintf(stderr, "another one pass signature");
 	else
-		printf("other than one pass signature");
-	printf("\n");
+		fprintf(stderr, "other than one pass signature");
+	fprintf(stderr, "\n");
 }
 
 public void
@@ -1891,19 +2223,19 @@ Signature_Packet(int len)
 	int ver;
 
 	ver = Getc();
-	// printf("\tVer %d - ", ver);
+	if (gpg_dbg) fprintf(stderr, "\tVer %d - ", ver);
 	switch (ver) {
 	case 2:
 	case 3:
-		// printf("old\n");
+		if (gpg_dbg) fprintf(stderr, "old\n");
 		old_Signature_Packet(len - 1);
 		break;
 	case 4:
-		// printf("new\n");
+		if (gpg_dbg) fprintf(stderr, "new\n");
 		new_Signature_Packet(len - 1);
 		break;
 	default:
-		// printf("unknown\n");
+		if (gpg_dbg) fprintf(stderr, "unknown\n");
 		skip(len - 1);
 		break;
 	}
@@ -1914,12 +2246,14 @@ old_Signature_Packet(int len)
 {
 	int pub;
 
-	printf("\tHash material(%d bytes):\n", Getc());
-	// printf("\t");
+	fprintf(stderr, "\tHash material(%d bytes):\n", Getc());
+	if (gpg_dbg) fprintf(stderr, "\t");
 	signature_type(Getc());
-	// printf("\t");
-	// time4("Creation time");
-	skip(4);
+	if (gpg_dbg) fprintf(stderr, "\t");
+	if (gpg_dbg)
+		time4("Creation time");
+	else
+		skip(4);
 	key_id();
 	pub = Getc();
 	pub_algs(pub);
@@ -1970,15 +2304,15 @@ public void
 Public_Key_Packet(int len)
 {
 	VERSION = Getc();
-	// printf("\tVer %d - ", VERSION);
+	if (gpg_dbg) fprintf(stderr, "\tVer %d - ", VERSION);
 	switch (VERSION) {
 	case 2:
 	case 3:
-		// printf("old\n");
+		if (gpg_dbg) fprintf(stderr, "old\n");
 		old_Public_Key_Packet();
 		break;
 	case 4:
-		// printf("new\n");
+		if (gpg_dbg) fprintf(stderr, "new\n");
 		new_Public_Key_Packet(len - 1);
 		break;
 	default:
@@ -1991,24 +2325,28 @@ private void
 old_Public_Key_Packet(void)
 {
 	int days;
-	// time4("Public key creation time");
-	skip(4);
+	if (gpg_dbg)
+		time4("Public key creation time");
+	else
+		skip(4);
 	days = Getc() * 256;
 	days += Getc();
-	// printf("\tValid days - %d[0 is forever]\n", days);
+	if (gpg_dbg) fprintf(stderr, "\tValid days - %d[0 is forever]\n", days);
 	PUBLIC = Getc();
 	pub_algs(PUBLIC); /* PUBLIC should be 1 */
 	// skip_multi_precision_integer("RSA n");
 	// skip_multi_precision_integer("RSA e");
-	give_multi_precision_integer(n, &n_bits);
-	give_multi_precision_integer(e, &e_bits);
+	give_multi_precision_integer(n, sizeof(n), &n_bits);
+	give_multi_precision_integer(e, sizeof(e), &e_bits);
 }
 
 private void
 new_Public_Key_Packet(int len)
 {
-	// key_creation_time4("Public key creation time");
-	skip(4);
+	if (gpg_dbg)
+		key_creation_time4("Public key creation time");
+	else
+		skip(4);
 
 	PUBLIC = Getc();
 	pub_algs(PUBLIC);
@@ -2016,25 +2354,25 @@ new_Public_Key_Packet(int len)
 	case 1:
 	case 2:
 	case 3:
-		give_multi_precision_integer(n, &n_bits);  // RSA n
-		give_multi_precision_integer(e, &e_bits);  // RSA e
+		give_multi_precision_integer(n, sizeof(n), &n_bits);  // RSA n
+		give_multi_precision_integer(e, sizeof(e), &e_bits);  // RSA e
 		break;
 	case 16:
 	case 20:
 		// ElGamal
-		give_multi_precision_integer(p, &p_bits);
-		give_multi_precision_integer(g, &g_bits);
-		give_multi_precision_integer(y, &y_bits);
+		give_multi_precision_integer(p, sizeof(p), &p_bits);
+		give_multi_precision_integer(g, sizeof(g), &g_bits);
+		give_multi_precision_integer(y, sizeof(y), &y_bits);
 		break;
 	case 17:
 		// multi_precision_integer("DSA p");
-		give_multi_precision_integer(p, &key_bits);
-		give_multi_precision_integer(q, &q_bits);
-		give_multi_precision_integer(g, &g_bits);
-		give_multi_precision_integer(y, &y_bits);
+		give_multi_precision_integer(p, sizeof(p), &key_bits);
+		give_multi_precision_integer(q, sizeof(q), &q_bits);
+		give_multi_precision_integer(g, sizeof(g), &g_bits);
+		give_multi_precision_integer(y, sizeof(y), &y_bits);
 		break;
 	default:
-		printf("\tUnknown public key(pub %d)\n", PUBLIC);
+		fprintf(stderr, "\tUnknown public key(pub %d)\n", PUBLIC);
 		skip(len - 5);
 		break;
 	}
@@ -2043,17 +2381,21 @@ new_Public_Key_Packet(int len)
 private void
 IV(unsigned int len)
 {
-	// printf("\tIV - ");
-	give(len, iv);
+	if (gpg_dbg) fprintf(stderr, "\tIV - ");
+	if (gpg_dbg)
+		dump(len);
+	else
+		give(len, iv, sizeof(iv));
 	bs = len;
-	// dump(len);
-	// printf("\n");
+	if (gpg_dbg) fprintf(stderr, "\n");
 }
 
 public void
 Secret_Subkey_Packet(int len)
 {
+	is_subkey = 1;
 	Secret_Key_Packet(len);
+	is_subkey = 0;
 }
 
 public void
@@ -2090,18 +2432,11 @@ Secret_Key_Packet(int len)
 		sym = s2k;
 		m_usage = s2k;
 		sym_algs(sym);
-		// printf("\tSimple string-to-key for IDEA\n"); // XXX
+		if (gpg_dbg) fprintf(stderr, "\tSimple string-to-key for IDEA\n");
 		IV(iv_len(sym));
 		encrypted_Secret_Key(len - Getc_getlen(), NO);
 		break;
 	}
-}
-
-static void print_hex(unsigned char *str, int len)
-{
-	int i;
-	for (i = 0; i < len; ++i)
-		printf("%02x", str[i]);
 }
 
 private void
@@ -2109,7 +2444,7 @@ plain_Secret_Key(int len)
 {
 	static char path[8192];
 	char *base;
-	strncpy(path, filename, sizeof(path));
+	strnzcpy(path, filename, sizeof(path));
 	base = basename(path);
 
 	switch (VERSION) {
@@ -2121,15 +2456,17 @@ plain_Secret_Key(int len)
 		// multi_precision_integer("RSA p");
 		// multi_precision_integer("RSA q");
 		// multi_precision_integer("RSA u");
-		give_multi_precision_integer(d, &d_bits);
-		give_multi_precision_integer(p, &p_bits);
-		give_multi_precision_integer(q, &q_bits);
-		give_multi_precision_integer(u, &u_bits);
+		give_multi_precision_integer(d, sizeof(d), &d_bits);
+		give_multi_precision_integer(p, sizeof(p), &p_bits);
+		give_multi_precision_integer(q, sizeof(q), &q_bits);
+		give_multi_precision_integer(u, sizeof(u), &u_bits);
 		fprintf(stderr, "%s contains plain RSA secret key packet!\n", base);
-		// printf("\tChecksum - ");
-		skip(2);
-		// dump(2);
-		// printf("\n");
+		if (gpg_dbg) fprintf(stderr, "\tChecksum - ");
+		if (gpg_dbg)
+			dump(2);
+		else
+			skip(2);
+		if (gpg_dbg) fprintf(stderr, "\n");
 		break;
 	case 4:
 		switch (PUBLIC) {
@@ -2140,10 +2477,10 @@ plain_Secret_Key(int len)
 			// multi_precision_integer("RSA p");
 			// multi_precision_integer("RSA q");
 			// multi_precision_integer("RSA u");
-			give_multi_precision_integer(d, &d_bits);
-			give_multi_precision_integer(p, &p_bits);
-			give_multi_precision_integer(q, &q_bits);
-			give_multi_precision_integer(u, &u_bits);
+			give_multi_precision_integer(d, sizeof(d), &d_bits);
+			give_multi_precision_integer(p, sizeof(p), &p_bits);
+			give_multi_precision_integer(q, sizeof(q), &q_bits);
+			give_multi_precision_integer(u, sizeof(u), &u_bits);
 			fprintf(stderr, "%s contains plain RSA secret key packet!\n", base);
 			break;
 		case 16:
@@ -2156,17 +2493,19 @@ plain_Secret_Key(int len)
 			fprintf(stderr, "%s contains plain DSA secret key packet!\n", base);
 			break;
 		default:
-			printf("\tUnknown secret key(pub %d)\n", PUBLIC);
+			fprintf(stderr, "\tUnknown secret key(pub %d)\n", PUBLIC);
 			skip(len - 2);
 			break;
 		}
-		// printf("\tChecksum - ");
-		// dump(2);
-		skip(2);
-		// printf("\n");
+		if (gpg_dbg) fprintf(stderr, "\tChecksum - ");
+		if (gpg_dbg)
+			dump(2);
+		else
+			skip(2);
+		if (gpg_dbg) fprintf(stderr, "\n");
 		break;
 	default:
-		printf("\tunknown version (%d)\n", VERSION);
+		fprintf(stderr, "\tunknown version (%d)\n", VERSION);
 		skip(len);
 		break;
 	}
@@ -2181,15 +2520,19 @@ encrypted_Secret_Key(int len, int sha1)
 	char *gecos_remains = gecos;
 	const char *ext[] = {".gpg", ".pgp"};
 
+	if (len < 0)
+		warn_exit("Bad parameter: encrypted_Secret_Key(len=%d, sha1=%d), len can not be negative.",
+			len, sha1);
+
 	/* Use base of filename as login as last resort */
 	/* /path/johndoe.gpg -> johndoe */
 	if (!gecos[0]) {
 		cp = strip_suffixes(jtr_basename(filename), ext, 2);
-		strncpy(gecos, cp, sizeof(gecos));
+		strnzcpy(gecos, cp, sizeof(gecos));
 	}
 
 	/* login field is Real Name part of user data */
-	strncpy(login, gecos, sizeof(login));
+	strnzcpy(login, gecos, sizeof(login));
 
 	if ((cp = strchr(login, '(')))
 		memset(cp, 0, 1);
@@ -2204,7 +2547,7 @@ encrypted_Secret_Key(int len, int sha1)
 	while (cp > login && *cp == ' ')
 		*cp-- = 0;
 
-	// printf("Version is %d\n", VERSION);
+	if (gpg_dbg) fprintf(stderr, "Version is %d\n", VERSION);
 	switch (VERSION) {
 	case 2:
 	case 3:
@@ -2214,21 +2557,39 @@ encrypted_Secret_Key(int len, int sha1)
 		// give_multi_precision_integer(p, &p_bits);
 		// give_multi_precision_integer(q, &p_bits);
 		// give_multi_precision_integer(u, &u_bits);
-		give(len, m_data); // we can't break down the "data" further into fields
+		if (give(len, m_data, sizeof(m_data)) != len) // we can't break down the "data" further into fields
+			return;
 		used += len;
 
 		m_algorithm = PUBLIC;
-		printf("%s:$gpg$*%d*%d*%d*", login, m_algorithm, len, n_bits);
-		print_hex(m_data, len);
-		printf("*%d*%d*%d*%d*%d*", m_spec, m_usage, m_hashAlgorithm, m_cipherAlgorithm, bs);
-		print_hex(iv, bs);
-		printf("*%d*", m_count);
-		print_hex(m_salt, 8);
-		if (m_usage == 1) { /* handle 2 byte checksum */
-			printf("*%d*", (n_bits + 7) / 8);
-			print_hex(n, (n_bits + 7) / 8);
+		if (last_hash && *last_hash) {
+			printf("%s:%s:::%s::%s\n", login, last_hash, gecos, filename);
+			MEM_FREE(last_hash);
 		}
-		printf(":::%s::%s\n", gecos, filename);
+		if (dump_subkeys || !is_subkey) {
+			MEM_FREE(last_hash);
+			last_hash = mem_alloc(len*2 + 512 + (n_bits + 7) / 4);
+			cp = last_hash;
+			if (m_usage == 1) {
+				puts("[ERROR] We don't support 'Simple string-to-key for IDEA' S2K type yet.");
+				return;
+			}
+			cp += sprintf(cp, "$gpg$*%d*%d*%d*", m_algorithm, len, n_bits);
+			cp += print_hex(m_data, len, cp);
+			cp += sprintf(cp, "*%d*%d*%d*%d*%d*", m_spec, m_usage, m_hashAlgorithm, m_cipherAlgorithm, bs);
+			cp += print_hex(iv, bs, cp);
+			cp += sprintf(cp, "*%d*", m_count);
+			cp += print_hex(m_salt, 8, cp);
+			if (m_usage == 1) { /* handle 2 byte checksum */
+				cp += sprintf(cp, "*%d*", (n_bits + 7) / 8);
+				cp += print_hex(n, (n_bits + 7) / 8, cp);
+			}
+			*cp = 0;
+			hash_generated = 1;
+			if (gpg_dbg)
+				fprintf(stderr, "  Key being dumped: encrypted_Secret_Key (VERSION=%d/algo=%d/spec=%d).   hashAlgo=%s cipherAlgo=%s\n", VERSION, m_algorithm, m_spec, hash_algs(m_hashAlgorithm), sym_algs2(m_cipherAlgorithm));
+
+		}
 		break;
 	case 4:
 		switch (PUBLIC) {
@@ -2236,80 +2597,119 @@ encrypted_Secret_Key(int len, int sha1)
 		case 2:
 		case 3:
 			/* Encrypted RSA stuff */
-			give(len, m_data); // we can't break down the "data" further into fields
+			if (give(len, m_data, sizeof(m_data)) != len)   // we can't break down the "data" further into fields
+				return;
 			used += len;
 			m_algorithm = PUBLIC;  // Encrypted RSA
-			printf("%s:$gpg$*%d*%d*%d*", login, m_algorithm, len, n_bits);
-			print_hex(m_data, len);
-			printf("*%d*%d*%d*%d*%d*", m_spec, m_usage, m_hashAlgorithm, m_cipherAlgorithm, bs);
-			print_hex(iv, bs);
-			printf("*%d*", m_count);
-			print_hex(m_salt, 8);
-			if (m_usage == 255) { /* handle 2 byte checksum */
-				// gpg --homedir . --s2k-mode 0 --simple-sk-checksum --s2k-cipher-algo IDEA --gen-key
-				printf("*%d*", (n_bits + 7) / 8);
-				print_hex(n, (n_bits + 7) / 8);
+			if (last_hash && *last_hash) {
+				printf("%s:%s:::%s::%s\n", login, last_hash, gecos, filename);
+				MEM_FREE(last_hash);
 			}
-			printf(":::%s::%s\n",gecos_remains, filename);
+			if (dump_subkeys || !is_subkey) {
+				MEM_FREE(last_hash);
+				last_hash = mem_alloc(len*2 + 512 + (n_bits + 7) / 4 );
+				cp = last_hash;
+				cp += sprintf(cp, "$gpg$*%d*%d*%d*", m_algorithm, len, n_bits);
+				cp += print_hex(m_data, len, cp);
+				cp += sprintf(cp, "*%d*%d*%d*%d*%d*", m_spec, m_usage, m_hashAlgorithm, m_cipherAlgorithm, bs);
+				cp += print_hex(iv, bs, cp);
+				cp += sprintf(cp, "*%d*", m_count);
+				cp += print_hex(m_salt, 8, cp);
+				if (m_usage == 255) { /* handle 2 byte checksum */
+					// gpg --homedir . --s2k-mode 0 --simple-sk-checksum --s2k-cipher-algo IDEA --gen-key
+					cp += sprintf(cp, "*%d*", (n_bits + 7) / 8);
+					cp += print_hex(n, (n_bits + 7) / 8, cp);
+				}
+				*cp = 0;
+				hash_generated = 1;
+				if (gpg_dbg)
+					fprintf(stderr, "  Key being dumped: encrypted_Secret_Key-RSA (VERSION=%d/algo=%d/spec=%d).   hashAlgo=%s cipherAlgo=%s\n", VERSION, m_algorithm, m_spec, hash_algs(m_hashAlgorithm), sym_algs2(m_cipherAlgorithm));
+			}
 			break;
 		case 16:
 		case 20:
 			m_algorithm = PUBLIC;  // Encrypted ElGamal
-			give(len, m_data);
+			if (give(len, m_data, sizeof(m_data)) != len)
+				return;
 			used += len;
-			printf("%s:$gpg$*%d*%d*%d*", login, m_algorithm, len, key_bits);
-			print_hex(m_data, len);
-			printf("*%d*%d*%d*%d*%d*", m_spec, m_usage, m_hashAlgorithm, m_cipherAlgorithm, bs);
-			print_hex(iv, bs);
-			printf("*%d*", m_count);
-			print_hex(m_salt, 8);
-			if (m_usage == 255) { /* handle 2 byte checksum */
-				printf("*%d*", (p_bits + 7) / 8);
-				print_hex(p, (p_bits + 7) / 8);
-				printf("*%d*", (g_bits + 7) / 8);
-				print_hex(g, (g_bits + 7) / 8);
-				printf("*%d*", (y_bits + 7) / 8);
-				print_hex(y, (y_bits + 7) / 8);
+			if (last_hash && *last_hash) {
+				printf("%s:%s:::%s::%s\n", login, last_hash, gecos, filename);
+				MEM_FREE(last_hash);
 			}
-			printf(":::%s::%s\n",gecos_remains, filename);
+			if (dump_subkeys || !is_subkey) {
+				MEM_FREE(last_hash);
+				last_hash = mem_alloc(len*2 + 512 + (p_bits+g_bits+y_bits) / 4);
+				cp = last_hash;
+				cp += sprintf(cp, "$gpg$*%d*%d*%d*", m_algorithm, len, key_bits);
+				cp += print_hex(m_data, len, cp);
+				cp += sprintf(cp, "*%d*%d*%d*%d*%d*", m_spec, m_usage, m_hashAlgorithm, m_cipherAlgorithm, bs);
+				cp += print_hex(iv, bs, cp);
+				cp += sprintf(cp, "*%d*", m_count);
+				cp += print_hex(m_salt, 8, cp);
+				if (m_usage == 255) { /* handle 2 byte checksum */
+					cp += sprintf(cp, "*%d*", (p_bits + 7) / 8);
+					cp += print_hex(p, (p_bits + 7) / 8, cp);
+					cp += sprintf(cp, "*%d*", (g_bits + 7) / 8);
+					cp += print_hex(g, (g_bits + 7) / 8, cp);
+					cp += sprintf(cp, "*%d*", (y_bits + 7) / 8);
+					cp += print_hex(y, (y_bits + 7) / 8, cp);
+				}
+				*cp = 0;
+				hash_generated = 1;
+				if (gpg_dbg)
+					fprintf(stderr, "  Key being dumped: encrypted_Secret_Key-ElGam (VERSION=%d/algo=%d/spec=%d).   hashAlgo=%s cipherAlgo=%s\n", VERSION, m_algorithm, m_spec, hash_algs(m_hashAlgorithm), sym_algs2(m_cipherAlgorithm));
+			}
 			break;
 		case 17:
 			m_algorithm = PUBLIC;  // Encrypted DSA
-			give(len, m_data);
+			if (give(len, m_data, sizeof(m_data)) != len)
+				return;
 			used += len;
-			printf("%s:$gpg$*%d*%d*%d*", login, m_algorithm, len, key_bits);
-			print_hex(m_data, len);
-			printf("*%d*%d*%d*%d*%d*", m_spec, m_usage, m_hashAlgorithm, m_cipherAlgorithm, bs);
-			print_hex(iv, bs);
-			printf("*%d*", m_count);
-			print_hex(m_salt, 8);
-			if (m_usage == 255) { /* handle 2 byte checksum */
-				printf("*%d*", (key_bits + 7) / 8);
-				print_hex(p, (key_bits + 7) / 8);
-				printf("*%d*", (q_bits + 7) / 8);
-				print_hex(q, (q_bits + 7) / 8);
-				printf("*%d*", (g_bits + 7) / 8);
-				print_hex(g, (g_bits + 7) / 8);
-				printf("*%d*", (y_bits + 7) / 8);
-				print_hex(y, (y_bits + 7) / 8);
+			if (last_hash && *last_hash) {
+				printf("%s:%s:::%s::%s\n", login, last_hash, gecos, filename);
+				MEM_FREE(last_hash);
 			}
-			printf(":::%s::%s\n",gecos_remains, filename);
+			if (dump_subkeys || !is_subkey) {
+				MEM_FREE(last_hash);
+				last_hash = mem_alloc(len*2 + 512 + (key_bits+q_bits+g_bits+y_bits) / 4);
+				cp = last_hash;
+				cp += sprintf(cp, "$gpg$*%d*%d*%d*", m_algorithm, len, key_bits);
+				cp += print_hex(m_data, len, cp);
+				cp += sprintf(cp, "*%d*%d*%d*%d*%d*", m_spec, m_usage, m_hashAlgorithm, m_cipherAlgorithm, bs);
+				cp += print_hex(iv, bs, cp);
+				cp += sprintf(cp, "*%d*", m_count);
+				cp += print_hex(m_salt, 8, cp);
+				if (m_usage == 255) { /* handle 2 byte checksum */
+					cp += sprintf(cp, "*%d*", (key_bits + 7) / 8);
+					cp += print_hex(p, (key_bits + 7) / 8, cp);
+					cp += sprintf(cp, "*%d*", (q_bits + 7) / 8);
+					cp += print_hex(q, (q_bits + 7) / 8, cp);
+					cp += sprintf(cp, "*%d*", (g_bits + 7) / 8);
+					cp += print_hex(g, (g_bits + 7) / 8, cp);
+					cp += sprintf(cp, "*%d*", (y_bits + 7) / 8);
+					cp += print_hex(y, (y_bits + 7) / 8, cp);
+				}
+				*cp = 0;
+				hash_generated = 1;
+				if (gpg_dbg)
+					fprintf(stderr, "  Key being dumped: encrypted_Secret_Key-DSA (VERSION=%d/algo=%d/spec=%d).   hashAlgo=%s cipherAlgo=%s\n", VERSION, m_algorithm, m_spec, hash_algs(m_hashAlgorithm), sym_algs2(m_cipherAlgorithm));
+			}
 			break;
 		default:
-			printf("\tUnknown encrypted key(pub %d)\n", PUBLIC);
+			fprintf(stderr, "\tUnknown encrypted key(pub %d)\n", PUBLIC);
 			break;
 		}
+#if DEBUG
 		if (sha1 == YES)
-			// printf("\tEncrypted SHA1 hash\n");
-			;
+			printf("\tEncrypted SHA1 hash\n");
 		else
-			// printf("\tEncrypted checksum\n");
-			;
+			printf("\tEncrypted checksum\n");
+#endif
 		skip(len - used);
 		break;
 	default:
-		printf("\tunknown version (%d)\n", VERSION);
-		//skip(len);
+		fprintf(stderr, "\tunknown version (%d)\n", VERSION);
+		if (gpg_dbg)skip(len);
 		break;
 	}
 }
@@ -2343,7 +2743,9 @@ private int (*d_func3)(byte *, unsigned int);
 
 private byte tmpbuf[BUFSIZ];
 private byte d_buf1[BUFSIZ];
+#if HAVE_LIBZ || HAVE_LIBBZ2
 private byte d_buf2[BUFSIZ];
+#endif
 private byte d_buf3[BUFSIZ];
 
 private signed char
@@ -2386,13 +2788,12 @@ read_binary(byte *p, unsigned int max)
 private int
 read_radix64(byte *p, unsigned int max)
 {
-	static int done = NO, found = NO;
 	int c, d, out = 0, lf = 0, cr = 0;
 	byte *lim = p + max;
 
-	if (done == YES) return 0;
+	if (done_rr == YES) return 0;
 
-	if (found == NO) {
+	if (found_rr == NO) {
 
 	again:
 		do {
@@ -2407,15 +2808,19 @@ read_radix64(byte *p, unsigned int max)
 			if (fgets((cast_t)tmpbuf, BUFSIZ, stdin) == NULL)
 				warn_exit("can't find PGP armor.");
 		} while (line_not_blank(tmpbuf) == YES);
-		found = YES;
+		found_rr = YES;
 	}
 
 	while (p < lim) {
 		c = getchar();
 		if (c == EOF) {
-			done = YES;
+			done_rr = YES;
 			return out;
 		}
+
+		if (sizeof(base256) <= c)
+			warn_exit("illegal radix64 character.");
+
 		d = base256[c];
 		switch (d) {
 		case OOB:
@@ -2438,47 +2843,45 @@ read_radix64(byte *p, unsigned int max)
 	return out;
  skiptail:
 	while (getchar() != EOF);
-	done = YES;
+	done_rr = YES;
 	return out;
 }
+
 
 private int
 decode_radix64(byte *p, unsigned int max)
 {
-	static int done = NO;
-	static unsigned int avail = 0;
-	static byte *q;
 	unsigned int i, size, out = 0;
 	byte c1, c2, c3, c4, *r, *lim = p + max;
 
-	if (done == YES) return 0;
+	if (done_dr == YES) return 0;
 
 	while (p + 3 < lim) {
-		if (avail < 4) {
-			r = q;
-			q = d_buf1;
-			for (i = 0; i < avail; i++)
-				*q++ = *r++;
-			size = (*d_func1)(q, sizeof(d_buf1) - avail);
-			q = d_buf1;
-			avail += size;
+		if (avail_dr < 4) {
+			r = qdr;
+			qdr = d_buf1;
+			for (i = 0; i < avail_dr; i++)
+				*qdr++ = *r++;
+			size = (*d_func1)(qdr, sizeof(d_buf1) - avail_dr);
+			qdr = d_buf1;
+			avail_dr += size;
 			if (size == 0) {
-				done = YES;
-				switch (avail) {
+				done_dr = YES;
+				switch (avail_dr) {
 				case 0:
 					return out;
 				case 1:
 					warning("illegal radix64 length.");
 					return out; /* anyway */
 				case 2:
-					c1 = *q++;
-					c2 = *q++;
+					c1 = *qdr++;
+					c2 = *qdr++;
 					*p++ = (c1 << 2) | ((c2 & 0x30) >> 4);
 					return out + 1;
 				case 3:
-					c1 = *q++;
-					c2 = *q++;
-					c3 = *q++;
+					c1 = *qdr++;
+					c2 = *qdr++;
+					c3 = *qdr++;
 					*p++ = (c1 << 2) | ((c2 & 0x30) >> 4);
 					*p++ = ((c2 & 0x0f) << 4) |
 						((c3 & 0x3c) >> 2);
@@ -2487,22 +2890,22 @@ decode_radix64(byte *p, unsigned int max)
 			}
 		}
 
-		if (avail >= 4) {
-			c1 = *q++;
-			c2 = *q++;
-			c3 = *q++;
-			c4 = *q++;
+		if (avail_dr >= 4) {
+			c1 = *qdr++;
+			c2 = *qdr++;
+			c3 = *qdr++;
+			c4 = *qdr++;
 			*p++ = (c1 << 2) | ((c2 & 0x30) >> 4);
 			*p++ = ((c2 & 0x0f) << 4) | ((c3 & 0x3c) >> 2);
 			*p++ = ((c3 & 0x03) << 6) | c4;
-			avail -= 4;
+			avail_dr -= 4;
 			out += 3;
 		}
 	}
 	return out;
 }
 
-#ifdef HAVE_LIBZ
+#if HAVE_LIBZ
 private int
 inflate_gzip(byte *p, unsigned int max)
 {
@@ -2519,6 +2922,8 @@ inflate_gzip(byte *p, unsigned int max)
 			size = (*d_func2)(d_buf2, sizeof(d_buf2));
 			z.next_in  = d_buf2;
 			z.avail_in = size;
+			if (z.avail_in == 0)
+				warn_exit("zlib error, truncated file?");
 		}
 
 		old = z.avail_out;
@@ -2530,7 +2935,7 @@ inflate_gzip(byte *p, unsigned int max)
 		inflated = max - z.avail_out;
 
 		if (old == z.avail_out && z.avail_in != 0)
-			break;
+			break;	// is this return valid ?
 
 		if (err == Z_STREAM_END) {
 			done = YES;
@@ -2545,7 +2950,7 @@ inflate_gzip(byte *p, unsigned int max)
 }
 #endif /* HAVE_LIBZ */
 
-#ifdef HAVE_LIBBZ2
+#if HAVE_LIBBZ2
 private int
 inflate_bzip2(byte *p, unsigned int max)
 {
@@ -2562,6 +2967,8 @@ inflate_bzip2(byte *p, unsigned int max)
 			size = (*d_func2)(d_buf2, sizeof(d_buf2));
 			bz.next_in  = (cast_t)d_buf2;
 			bz.avail_in = size;
+			if (bz.avail_in == 0)
+				warn_exit("bzip2 error, truncated file?");
 		}
 
 		old = bz.avail_out;
@@ -2573,7 +2980,7 @@ inflate_bzip2(byte *p, unsigned int max)
 		inflated = max - bz.avail_out;
 
 		if (old == bz.avail_out && bz.avail_in != 0)
-			break;
+			break; // is this return 'valid' ?
 
 		if (err == BZ_STREAM_END) {
 			done = YES;
@@ -2604,6 +3011,7 @@ Getc1(void)
 	MAGIC_COUNT++;
 	c = *NEXT_IN;
 	NEXT_IN++;
+	offset++;
 	return c;
 }
 
@@ -2651,19 +3059,19 @@ set_binary(void)
 public void
 Compressed_Data_Packet(int len)
 {
-#if defined(HAVE_LIBZ) || defined(HAVE_LIBBZ2)
+#if HAVE_LIBZ || HAVE_LIBBZ2
 	unsigned int alg = Getc();
-	int err = Z_OK;
+	int err = 0; // both Z_OK and BZ_OK are 0
 	private int (*func)(byte *, unsigned int);
 
 	comp_algs(alg);
 
-#ifdef HAVE_LIBZ
+#if HAVE_LIBZ
 	z.zalloc = (alloc_func)0;
 	z.zfree = (free_func)0;
 	z.opaque = (voidpf)0;
 #endif /* HAVE_LIBZ */
-#ifdef HAVE_LIBBZ2
+#if HAVE_LIBBZ2
 	bz.bzalloc = (void *)0;
 	bz.bzfree = (void *)0;
 	bz.opaque = (void *)0;
@@ -2681,7 +3089,7 @@ Compressed_Data_Packet(int len)
 	switch (alg) {
 	case 0:
 		return;
-#ifdef HAVE_LIBZ
+#if HAVE_LIBZ
 	case 1:
 		err = inflateInit2(&z, -13);
 		if (err != Z_OK) warn_exit("zlib inflateInit error.");
@@ -2693,7 +3101,7 @@ Compressed_Data_Packet(int len)
 		func = inflate_gzip;
 		break;
 #endif /* HAVE_LIBZ */
-#ifdef HAVE_LIBBZ2
+#if HAVE_LIBBZ2
 	case 3:
 		err = BZ2_bzDecompressInit(&bz, 0, 0);
 		if (err != BZ_OK) warn_exit("bzip2 BZ2_bzDecompressInit error.");
@@ -2704,13 +3112,13 @@ Compressed_Data_Packet(int len)
 		warn_exit("unknown compress algorithm.");
 	}
 
-#ifdef HAVE_LIBZ
+#if HAVE_LIBZ
 	z.next_in  = d_buf2;
 	z.avail_in = AVAIL_COUNT;
 	z.next_out = 0;
 	z.avail_out = sizeof(d_buf2);
 #endif /* HAVE_LIBZ */
-#ifdef HAVE_LIBBZ2
+#if HAVE_LIBBZ2
 	bz.next_in  = (cast_t)d_buf2;
 	bz.avail_in = AVAIL_COUNT;
 	bz.next_out = 0;
@@ -2729,10 +3137,10 @@ Compressed_Data_Packet(int len)
 		d_func2 = decode_radix64;
 		d_func3 = func;
 	}
-#else /* defined(HAVE_LIBZ) || defined(HAVE_LIBBZ2) */
+#else /* HAVE_LIBZ || HAVE_LIBBZ2 */
 	comp_algs(Getc());
 	warn_exit("can't uncompress without zlib/bzip2.");
-#endif /* defined(HAVE_LIBZ) || defined(HAVE_LIBBZ2) */
+#endif /* HAVE_LIBZ || HAVE_LIBBZ2 */
 }
 
 /*
@@ -2750,14 +3158,14 @@ image_attribute(int len)
 	hver = Getc();
 	if (hver == 1) {
 		int enc = Getc();
-		printf("\t\tImage encoding - %s(enc %d)\n",
+		fprintf(stderr, "\t\tImage encoding - %s(enc %d)\n",
 			enc == 1 ? "JPEG" : "Unknown",
 			enc);
-		printf("\t\tImage data(%d bytes)\n", len - hlen);
+		fprintf(stderr, "\t\tImage data(%d bytes)\n", len - hlen);
 		skip(len - 4);
 	} else {
-		printf("\t\tUnknown header version(ver %d)\n", hver);
-		printf("\t\tUnknown data(%d bytes)\n", len - hlen);
+		fprintf(stderr, "\t\tUnknown header version(ver %d)\n", hver);
+		fprintf(stderr, "\t\tUnknown data(%d bytes)\n", len - hlen);
 		skip(len - 3);
 	}
 }

@@ -1,5 +1,5 @@
 /*
- * Define functions to encode/deocde SYSUAF password information as a
+ * Define functions to encode/decode SYSUAF password information as a
  * printable string suitable for use in a UNIX-style passwd file (i.e. no
  * colons)
  *
@@ -11,7 +11,9 @@
 #ifndef _JOHN_UAF_ENCODE_H
 #define _JOHN_UAF_ENCODE_H
 #define UAF_ENCODE_SIZE 30
+#if !AC_BUILT || HAVE_LIMITS_H
 #include <limits.h>
+#endif
 #if UINT_MAX == ULONG_MAX
 typedef unsigned long uaf_lword;
 #else

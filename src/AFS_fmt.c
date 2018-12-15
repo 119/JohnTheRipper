@@ -1,6 +1,6 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 1996-2001,2012 by Solar Designer
+ * Copyright (c) 1996-2001,2012,2015,2017 by Solar Designer
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted.
@@ -8,6 +8,7 @@
  * There's ABSOLUTELY NO WARRANTY, express or implied.
  */
 
+#include <stdint.h>
 #include <string.h>
 
 #include "arch.h"
@@ -20,6 +21,8 @@
 
 #define FORMAT_LABEL			"AFS"
 #define FORMAT_NAME			"Kerberos AFS"
+#define FORMAT_TAG			"$K4$"
+#define FORMAT_TAG_LEN			(sizeof(FORMAT_TAG)-1)
 
 #define BENCHMARK_COMMENT		""
 #define BENCHMARK_LENGTH		8
@@ -100,9 +103,9 @@ static DES_binary AFS_long_IV_binary;
 
 static void init(struct fmt_main *self)
 {
-	ARCH_WORD_32 block[2];
+	uint32_t block[2];
 #if !ARCH_LITTLE_ENDIAN
-	ARCH_WORD_32 tmp;
+	uint32_t tmp;
 #endif
 
 	DES_std_init();
@@ -127,13 +130,13 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	int index, count;
 	unsigned int value;
 
-	if (strncmp(ciphertext, "$K4$", 4)) return 0;
+	if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN)) return 0;
 
-	for (pos = &ciphertext[4]; atoi16[ARCH_INDEX(*pos)] != 0x7F; pos++);
+	for (pos = &ciphertext[FORMAT_TAG_LEN]; atoi16l[ARCH_INDEX(*pos)] != 0x7F; pos++);
 	if (*pos != ',' || pos - ciphertext != CIPHERTEXT_LENGTH) return 0;
 
 	for (index = 0; index < 16; index += 2) {
-		value = (int)atoi16[ARCH_INDEX(ciphertext[index + 4])] << 4;
+		value = atoi16[ARCH_INDEX(ciphertext[index + 4])] << 4;
 		value |= atoi16[ARCH_INDEX(ciphertext[index + 5])];
 
 		count = 0;
@@ -159,10 +162,11 @@ static void *get_binary(char *ciphertext)
 	out[0] = out[1] = 0;
 	strcpy(base64, AFS_SALT);
 	known_long = 0;
+	ciphertext += FORMAT_TAG_LEN;
 
 	for (index = 0; index < 16; index += 2) {
-		value = (int)atoi16[ARCH_INDEX(ciphertext[index + 4])] << 4;
-		value |= atoi16[ARCH_INDEX(ciphertext[index + 5])];
+		value = atoi16[ARCH_INDEX(ciphertext[index])] << 4;
+		value |= atoi16[ARCH_INDEX(ciphertext[index+1])];
 
 		out[index >> 3] |= (value | 1) << ((index << 2) & 0x18);
 
@@ -193,7 +197,7 @@ static void *salt(char *ciphertext)
 static int binary_hash_0(void *binary)
 {
 	if (((ARCH_WORD *)binary)[2] == ~(ARCH_WORD)0)
-		return *(ARCH_WORD *)binary & 0xF;
+		return *(ARCH_WORD *)binary & PH_MASK_0;
 
 	return DES_STD_HASH_0(((ARCH_WORD *)binary)[2]);
 }
@@ -201,17 +205,9 @@ static int binary_hash_0(void *binary)
 static int binary_hash_1(void *binary)
 {
 	if (((ARCH_WORD *)binary)[2] == ~(ARCH_WORD)0)
-		return *(ARCH_WORD *)binary & 0xFF;
+		return *(ARCH_WORD *)binary & PH_MASK_1;
 
 	return DES_STD_HASH_1(((ARCH_WORD *)binary)[2]);
-}
-
-static int binary_hash_2(void *binary)
-{
-	if (((ARCH_WORD *)binary)[2] == ~(ARCH_WORD)0)
-		return *(ARCH_WORD *)binary & 0xFFF;
-
-	return DES_STD_HASH_2(((ARCH_WORD *)binary)[2]);
 }
 
 static ARCH_WORD to_short_hash(int index)
@@ -241,7 +237,7 @@ static int get_hash_0(int index)
 
 	if (buffer[index].is_long) {
 		if ((binary = to_short_hash(index)) == ~(ARCH_WORD)0)
-			return buffer[index].aligned.binary[0] & 0xF;
+			return buffer[index].aligned.binary[0] & PH_MASK_0;
 	} else
 		binary = buffer[index].aligned.binary[0] & AFS_BINARY_MASK;
 	return DES_STD_HASH_0(binary);
@@ -253,22 +249,10 @@ static int get_hash_1(int index)
 
 	if (buffer[index].is_long) {
 		if ((binary = to_short_hash(index)) == ~(ARCH_WORD)0)
-			return buffer[index].aligned.binary[0] & 0xFF;
+			return buffer[index].aligned.binary[0] & PH_MASK_1;
 	} else
 		binary = buffer[index].aligned.binary[0] & AFS_BINARY_MASK;
 	return DES_STD_HASH_1(binary);
-}
-
-static int get_hash_2(int index)
-{
-	ARCH_WORD binary;
-
-	if (buffer[index].is_long) {
-		if ((binary = to_short_hash(index)) == ~(ARCH_WORD)0)
-			return buffer[index].aligned.binary[0] & 0xFFF;
-	} else
-		binary = buffer[index].aligned.binary[0] & AFS_BINARY_MASK;
-	return DES_STD_HASH_2(binary);
 }
 
 static void set_salt(void *salt)
@@ -279,7 +263,7 @@ static void set_salt(void *salt)
 
 static void set_key(char *key, int index)
 {
-	strnzcpy(buffer[index].key, key, PLAINTEXT_LENGTH + 1);
+	strnzcpy(buffer[index].key, key, sizeof(buffer[0].key));
 }
 
 static char *get_key(int index)
@@ -289,11 +273,11 @@ static char *get_key(int index)
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
+	const int count = *pcount;
 	int index, pos, length;
 	char xor[8];
-	ARCH_WORD_32 space[(PLAINTEXT_LENGTH + SALT_SIZE + 8) / 4 + 1];
-	ARCH_WORD_32 *ptr;
+	uint32_t space[(PLAINTEXT_LENGTH + SALT_SIZE + 8) / 4 + 1];
+	uint32_t *ptr;
 	ARCH_WORD space_binary[(PLAINTEXT_LENGTH + SALT_SIZE + 8) / 2 + 1];
 	ARCH_WORD *ptr_binary;
 	unsigned ARCH_WORD block[2];
@@ -301,9 +285,9 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		double dummy;
 		DES_binary data;
 	} binary;
-	ARCH_WORD_32 key[2];
+	uint32_t key[2];
 #if !ARCH_LITTLE_ENDIAN
-	ARCH_WORD_32 tmp;
+	uint32_t tmp;
 #endif
 
 	DES_std_set_salt(AFS_salt_binary);
@@ -447,6 +431,7 @@ struct fmt_main fmt_AFS = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
 		BINARY_ALIGN,
@@ -455,9 +440,8 @@ struct fmt_main fmt_AFS = {
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
+		{ FORMAT_TAG },
 		tests
 	}, {
 		init,
@@ -468,20 +452,19 @@ struct fmt_main fmt_AFS = {
 		fmt_default_split,
 		get_binary,
 		salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			binary_hash_0,
 			binary_hash_1,
-			binary_hash_2,
+			NULL,
 			NULL,
 			NULL,
 			NULL,
 			NULL
 		},
 		fmt_default_salt_hash,
+		NULL,
 		set_salt,
 		set_key,
 		get_key,
@@ -490,7 +473,7 @@ struct fmt_main fmt_AFS = {
 		{
 			get_hash_0,
 			get_hash_1,
-			get_hash_2,
+			NULL,
 			NULL,
 			NULL,
 			NULL,

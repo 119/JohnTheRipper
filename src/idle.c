@@ -10,11 +10,13 @@
  * There's ABSOLUTELY NO WARRANTY, express or implied.
  */
 
+#ifndef _XOPEN_SOURCE
 #define _XOPEN_SOURCE /* for nice(2) */
+#endif
 
 #include "os.h"
 
-#if HAVE_UNISTD_H
+#if (!AC_BUILT || HAVE_UNISTD_H) && !_MSC_VER
 #include <unistd.h>
 #endif
 #include <stdio.h>
@@ -31,11 +33,11 @@ static int use_yield = 0;
 #include <windows.h>
 #endif
 
-#ifdef __CYGWIN32__
+#ifdef __CYGWIN__
 extern int nice(int);
 #endif
 
-#ifdef __BEOS__
+#if defined(__BEOS__) || defined(__HAIKU__)
 #include <OS.h>
 #endif
 
@@ -60,6 +62,12 @@ int idle_requested(struct fmt_main *format)
 	if ((format->params.flags & FMT_OMP) && omp_get_max_threads() > 1)
 		return 0;
 #endif
+#ifdef HAVE_OPENCL
+	if (strstr(format->params.label, "-opencl"))
+		return 0;
+#endif
+	if (strstr(format->params.label, "-ztex"))
+		return 0;
 
 	return 1;
 }
@@ -78,7 +86,7 @@ void idle_init(struct fmt_main *format)
 #if defined(__MINGW32__) || defined (_MSC_VER)
 	SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
-#elif defined(__BEOS__)
+#elif defined(__BEOS__) || defined(__HAIKU__)
 	set_thread_priority(getpid(), 1);
 #else
 /*

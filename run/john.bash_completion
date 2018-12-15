@@ -92,7 +92,7 @@
 _john()
 {
 	local first cur options valopts compreplya compreplyb encodings formats format_classes
-	local subformats list dir cmd cmd2 i ver ver1 ver2 ver3 prev words prefix option
+	local primitives subformats list dir cmd cmd2 i ver ver1 ver2 ver3 prev words prefix option
 
 	# Without LC_ALL=C, [A-Z] match [a-z] (case "${cur}" in ... esac)
 	LC_ALL=C
@@ -151,7 +151,7 @@ _john()
 #	with --list=hidden-options.
 #
 #	All options:
-	options="`{ ${first} 2>/dev/null|sed -n -e 's#^ *\(--[a-z-]*\(\[\)\?=\?\(LIST\)\?\).*$#\1#' -e '/^--/ p'; echo --stdin; ${first} --list=hidden-options 2>/dev/null|sed -n -e 's#^\(--[a-z-]*\(\[\)\?=\?\).*$#\1#' -e '/--/ p'; } | sort -u`"
+	options="`{ ${first} 2>/dev/null|sed -n -e 's#^ *\(--[a-z-]*\(\[\)\?=\?\(LIST\)\?\).*$#\1#' -e '/^--/ p'; echo --stdin; ${first} --list=hidden-options 2>/dev/null|sed -n -e 's#^\(--[a-z-]*\(\[\)\?=\?\).*$#\1#' -e '/--/ p'; } | sort -u|grep -v -- '--show='`"
 
 	if [[ "_${options}" == "_--stdin" && "_${__john_binary}" != "_" ]] ; then
 		# No options and hidden options with ${first}, but a previous
@@ -241,7 +241,14 @@ _john()
 	# slower than the current approach
 
 	# Check if completion is requested for a valid option
-	if [[ "${cur}" == --* ]] ; then
+	# --prince= is a hack for now, should be made generic:
+	if [[ "${cur}" == --prince[=:]* || "${cur}" == -prince[=:]* ]]; then
+		COMPREPLY=("--prince")
+	# The same hack is needed for --fuzz as well, because we have
+	# --fuzz[=something] and --fuzz-dump[=something]
+	elif [[ "${cur}" == --fuzz[=:]* || "${cur}" == -fuzz[=:]* ]]; then
+		COMPREPLY=("--fuzz")
+	elif [[ "${cur}" == --* ]] ; then
 		COMPREPLY=( $(compgen -W "${options}" -- "${cur%%[=:]*}") )
 	else
 		COMPREPLY=( $(compgen -W "${options}" -- "-${cur%%[=:]*}") )
@@ -303,13 +310,45 @@ _john()
 	fi
 	COMPREPLY=()
 
+	# Drop any input files from the command to run for enumeration
+	COMP_LINE=`echo ${COMP_LINE}|sed -r "s# [^\-][^ ]+##g"`
+
 	# We do not check the token specified on the command line.
 	# Instead, we check a modified token (abbreviated option name
 	# has already been replaced with the complete option name).
 	# Also, some simple cases have already been taken care of in the
 	# previous if ... fi.
+
 	case "${option}" in
-		--format=dynamic*)
+		--format=dynamic)
+			cur=${cur#*[=:]}
+			COMPREPLY=( $(compgen -W "dynamic_ dynamic=" -- ${cur}) )
+			return 0
+			;;
+## work in progress: attempt to suggest completions for --format=dynamic=gost\( etc.
+#		--format=dynamic=*[\(])
+#			cur=${cur#*[=:]}
+#			cur=${cur#*[=:]}
+#			primitives=`${first} 2>/dev/null --list=subformats | awk '{print $7}' |  cut -d\( -f1 | sort -u|sed "s#^\(.*\)#${cur}\1\x5c\x5c\x5c\x5c(#"|sed "s#\x5c\(.\)#\x5c\x5c\x5c\x5c\1#g"`
+#			if [[ "_${primitives}" == "_" ]] ; then
+#				return 0
+#			fi
+#			COMPREPLY=( $(compgen -W "${primitives}" -- ${cur}) )
+#			 compopt -o nospace
+#			return 0
+#			;;
+		--format=dynamic=*)
+			primitives=`${first} 2>/dev/null --list=subformats | awk '{print $7}' |  cut -d\( -f1 | sort -u|sed "s#^\(.*\)#\1\x5c\x5c\x5c\x5c(#"`
+			if [[ "_${primitives}" == "_" ]] ; then
+				return 0
+			fi
+			cur=${cur#*[=:]}
+			cur=${cur#*[=:]}
+			COMPREPLY=( $(compgen -W "${primitives}" -- ${cur}) )
+			compopt -o nospace
+			return 0
+			;;
+		--format=dynamic_*)
 			subformats=`${first} 2>/dev/null --list=subformats|sed 's#^\(User\)\?Format = \(dynamic_[0-9]*\).*$#\2#'`
 			if [[ "_${subformats}" != _dynamic_0* ]] ; then
 				subformats=`${first} 2>/dev/null --subformat=LIST|sed 's#^\(User\)\?Format = \(dynamic_[0-9]*\).*$#\2#'`
@@ -323,17 +362,20 @@ _john()
 			;;
 		--format=*)
 			cur=`echo ${cur#*[=:]} | tr A-Z a-z`
-			# Looks like b is not a good enough replacement for q (which is a GNU extension).
-			# For now this works, because no other option after --format=NAME needs more than
-			# one line of text.
-			formats=`${first} |sed -n -e '/^--format/,$ {' -e 's#^--format=[ A-Za-z]*:##' -e '/^--/ b' -e 's#^ *##' -e 's#\<dynamic_n\>#dynamic#' -e 's#^\(.*\)$#\1#' -e 's#/# #g' -e 'p }' | tr A-Z a-z`
-			# Looks like b is not a good enough replacement for q (which is a GNU extension).
-			# Ugly workaround for now: skip lines that end with '.'.
-			# This breaks as soon as someone changes the line
-			# "always treat bare hashes as valid." into
-			# "always treat bare hashes as valid"
-			# or adds another option with more than one line of text...
-			format_classes=`${first} --list=hidden-options  2>/dev/null|sed -n -e '/^--format/,$ {' -e 's#^--format=[ A-Za-z]*:##' -e '/^--/ b' -e '/\.$/ b' -e 's#^ *##' -e 's#\<dynamic\>##' -e 's#^\(.*\)$#\1#' -e 's#,# #g' -e 'p }' | tr A-Z a-z`
+			# john (jumbo version) changed to not contain format names on normal usage.
+			# Use --list=formats output if available.
+			formats=`${first} 2>/dev/null --list=formats|sed -n -e 's#,##g' -e 's#\<dynamic_n\>#dynamic#' -e 'p' | tr A-Z a-z`
+			if [[ "x${formats}" == x ]] ; then
+				# --list=formats not available, use usage output as fallback
+				#
+				# Looks like sed's b is not a good enough replacement for q (which is a GNU extension).
+				# For now this works, because no other option after --format=NAME needs more than
+				#  one line of text
+				formats=`${first} |sed -n -e '/^--format/,$ {' -e 's#^--format=[ A-Za-z]*:##' -e '/^--/ b' -e 's#^ *##' -e 's#\<dynamic_n\>#dynamic#' -e 's#^\(.*\)$#\1#' -e 's#/# #g' -e 'p }' | tr A-Z a-z`
+			fi
+			# Meanwhile, there are other hidden options using more than one line of text.
+			# But for now, all the format classes fit into a single line.
+			format_classes=`${first} --list=hidden-options  2>/dev/null|sed -n -e 's#,##g ; s#^--format=[ A-Za-z]*:## p'`
 			COMPREPLY=( $(compgen -W "${formats} ${format_classes}" -- ${cur}) )
 			if [[ "${COMPREPLY[0]}_" == dynamic_ ]] ; then
 				compopt -o nospace
@@ -346,7 +388,7 @@ _john()
 			#if [[ $i -gt 1 ]] ; then
 				# This would add matching file names (raw2dyna) in addition to raw*
 				#COMPREPLY=( $(compgen -W "${formats} ${format_classes} ${cur}*" -- ${cur}) )
-				
+
 				# This would not complete raw to raw- first, before adding raw-* in the next step.
 				# It will just add raw* to all the raw-<something> formats.
 				# (I need to find the common substring first, because I don't like the generic
@@ -377,13 +419,20 @@ _john()
 			for (( i=0; i < ${#COMPREPLY[@]}; i++)); do
 				# Do I have to add the trailing / for
 				# directories? Apparently not!
-				COMPREPLY[$i]="${COMPREPLY[$i]%*.rec}"
+				if [[ ${COMPREPLY[$i]} =~ ^(.*)[.]rec$ ]] ; then
+					COMPREPLY[$i]=${BASH_REMATCH[1]}
+					# after removing the .rec, drop any
+					# "session names" of forked processes.
+					if [[ ${COMPREPLY[$i]} =~ ^(.*)[.][1-9][0-9]*$ ]] ; then
+						COMPREPLY[$i]=""
+					fi
+				fi
 			done
 			return 0
 			;;
-		--wordlist=*|--mkv-stats=*)
+		--wordlist=*|--mkv-stats=*|--prince=*|--fuzz=*|--fuzz-dump=*|--single-wordlist=*)
 			# as long as Markov stats files can have any name,
-			# I can just reuse the --wordlist= logig for --mkv-stats=*
+			# I can just reuse the --wordlist= logic for --mkv-stats=*
 			cur=${cur#*[=:]}
 			 __expand_tilde_by_ref cur 2>/dev/null
 			_filedir
@@ -416,6 +465,20 @@ _john()
 				cur=${cur#*[=:]}
 				COMPREPLY=( $(compgen -W "NT single wordlist" -- ${cur}) )
 			fi
+			return 0
+			;;
+		--regex=alpha[:=]*)
+			cmd=`echo ${COMP_LINE}|sed "s# ${cur}# --list=sections #"`
+			cur=${cur#*[=:]}
+			cur=${cur#*[=:]}
+			list=`${cmd} 2>/dev/null|LC_ALL=C grep "^list\.rexgen\.alpha:"|cut -d: -f 2-`
+			COMPREPLY=( $(compgen -W "${list}" -- ${cur}) )
+			return 0
+			;;
+		--regex=?(a|al|alp|alph|alpha))
+			cur=${cur#*[=:]}
+			COMPREPLY=( $(compgen -W "alpha:" -- ${cur}) )
+			compopt -o nospace
 			return 0
 			;;
 		--external=*)
@@ -515,7 +578,6 @@ _john()
 		--markov)
 			# completion if __john_completion != 2
 			#
-			# Should I mention [MIN_LEVEL-] and [MIN_LENGTH-]?
 			# I think not all jumbo versions support these.
 			# How to find out whether --markov=MODE is supported?
 			# Assume it is supported if at least one section
@@ -524,11 +586,11 @@ _john()
 			# OTOH, here the bash completion logic is used just
 			# as a reminder for the --markov syntax, not for
 			# actual completion.
-			COMPREPLY=( $(compgen -W "--markov --markov=LEVEL[:START[:END[:LENGTH]]] --markov=MODE --markov=MODE:LEVEL[:START[:END[:LENGTH]]]" -- ${cur}) )
+			COMPREPLY=( $(compgen -W "--markov --markov=[MINLEVEL-]LEVEL[:START[:END]] --markov=MODE --markov=MODE:[MINLEVEL-]LEVEL[:START[:END]]" -- ${cur}) )
 			return 0
 			;;
 		--markov=*)
-			# Ignore the --markov=[MINLVL-]LEVEL...?
+			# Ignore the --markov=LEVEL...?
 			# Just try completion for --markov=MODE
 			# for all [Markov:...] sections?
 			if [[ "${valopts}" == *--list=* ]] ; then
@@ -538,7 +600,7 @@ _john()
 				# just '-' and digits
 				list=`${cmd} 2>/dev/null | sed 's#^.*:.*$##' | sed 's#^[-0-9]*$##'`
 				cur=`echo ${cur#*[=:]} | tr A-Z a-z`
-				COMPREPLY=( $(compgen -W "${list} LEVEL[:START[:END[:LENGTH]]] MODE MODE:LEVEL[:START[:END[:LENGTH]]]" -- ${cur}) )
+				COMPREPLY=( $(compgen -W "${list} [MINLEVEL-]LEVEL[:START[:END]] MODE MODE:[MINLEVEL-]LEVEL[:START[:END]]" -- ${cur}) )
 				# no trailing space, just in case
 				# the user wants to add :LEVEL...
 				compopt -o nospace
@@ -550,12 +612,12 @@ _john()
 			return 0
 			;;
 		--show)
-			COMPREPLY=( $(compgen -W "--show --show=LEFT" -- ${cur}) )
+			COMPREPLY=( $(compgen -W "--show --show=" -- ${cur}) )
 			return 0
 			;;
-		--show=?([Ll]|[Ll][Ee]|[Ll][Ee][Ff]|[Ll][Ee][Ff][Tt]))
-			cur=`echo ${cur#*[=:]} | tr a-z A-Z`
-			COMPREPLY=( $(compgen -W "LEFT" -- ${cur}) )
+		--show=?(*))
+			cur=`echo ${cur#*[=:]} | tr A-Z a-z`
+			COMPREPLY=( $(compgen -W "left types types-json invalid" -- ${cur}) )
 			return 0
 			;;
 		--users=?(-)+(L|U)*|--groups=+(-|G)*|--shells=+(-|S)*|--salts=+(-|C)*)
@@ -581,7 +643,8 @@ _john()
 			COMPREPLY=( $(compgen -W "COUNT -COUNT" -- ${cur}) )
 			return 0
 			;;
-		--encoding=*|--intermediate-enc=*|--target-encoding=*)
+		--encoding=*|--intermediate-enc=*|--internal-codepage=*|--internal-encoding=*|--target-encoding=*|--input-encoding=*)
+			cur=${cur#*[=:]}
 			# --encoding=LIST wrote to stderr in the past
 			list=`${first} --list=\? 2>/dev/null|sed 's#\(,\)\?\( or\)\?[ ]*[<].*$##; s#,##g'`
 			if [[ "_${list}" == *encoding* ]] ; then
@@ -589,8 +652,31 @@ _john()
 			else
 				cmd="${first} --encoding=LIST"
 			fi
-			encodings=`${cmd} 2>&1|grep -v 'Supported encodings'|sed 's#[,)]##g'|sed 's#(or ##g'`
-			cur=${cur#*[=:]}
+			encodings=`${cmd} 2>&1|grep -v 'Supported encodings'|sed 's#[,()]##g; s#\bor ##g'|tr A-Z a-z`
+
+			if [[ "_${cur}" != "_" ]] ; then
+				# may be I should replace --encoding=8 with --encoding=iso-8 and try to complete that
+				# instead of allowing ro complete this to --encoding=8859- etc.
+				case "${cur}" in
+					8*)
+						encodings=`echo "${encodings}" | sed 's#iso-8#8#g'`
+						;;
+					iso8*|ISO8*)
+						encodings=`echo "${encodings}" | sed 's#iso-8#iso8#g'`
+						;;
+					utf8|UTF8)
+						encodings=`echo "${encodings}" | sed 's#utf-8#utf8#'`
+						;;
+					koi8|KOI8|koi8-|KOI8-)
+						;;
+					koi8*|KOI8*)
+						encodings=`echo "${encodings}" echo "$encodings" | sed 's#koi8-#koi8#'`
+						;;
+				esac
+
+				encodings=`echo "$encodings" ; echo "$encodings" | tr a-z A-Z`
+			fi
+
 			if [[ ${COMP_CWORD} -eq 2 || ${COMP_CWORD} -eq 3 && "_${cur}" != "_" ]] ; then
 				# Don't add LIST if --list=encodings
 				# is supported

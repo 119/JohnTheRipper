@@ -1,16 +1,17 @@
+@SET_MAKE@
 CC = @CC@
 CXX = @CXX@
 AS = @CC@
 LD = @CC@
 CPP = @CC@
-CFLAGS = @CFLAGS@
+CFLAGS = @CFLAGS@ @CFLAGS_EXTRA@ @OPENSSL_CFLAGS@
 ASFLAGS = @ASFLAGS@ -c @EXTRA_AS_FLAGS@
-LDFLAGS = @LDFLAGS@
+LDFLAGS = @LDFLAGS@ @OPENSSL_LIBS@
 YASM = @YASM@
 AR = @AR@
 FIND = @FIND@
 RM = /bin/rm -f
-GCCV44 := $(shell expr `gcc -dumpversion` \>= 4.4)
+GCCV44 := $(shell expr `$(CC) -dumpversion` \>= 4.4)
 USE_AESNI = @AESNI_OS@
 
 AESIN = aes.o openssl/ossl_aes.o
@@ -21,13 +22,13 @@ ifeq "$(GCCV44)" "1"
 			ifdef AESNI_ARCH
 				AESIN += aesni/*.o
 				SUBDIRS += aesni
-				AESNI_DEC = -DAESNI_IN_USE=1
+				AESNI_DEC = -DAESNI_IN_USE
 			endif
 		endif
 	endif
 endif
 
-aes.o: aes.c aes.h aes_func.h
+aes.o: aes.c ../aes.h aes_func.h
 	$(CC) $(CFLAGS) $(AESNI_DEC) -c aes.c -o aes.o
 
 .PHONY: subdirs $(SUBDIRS)
@@ -38,14 +39,14 @@ $(SUBDIRS):
 	$(MAKE) -C $@ all
 
 aes.a: $(SUBDIRS) aes.o
-	$(AR) -r $@ $(AESIN)
+	$(AR) -rs $@ $(AESIN)
 
 default: aes.a
 all: aes.a
 
 clean:
-	$(FIND) . -name \*.a -exec rm {} \;
-	$(FIND) . -name \*.o -exec rm {} \;
+	$(FIND) . -name \*.a -exec $(RM) {} \;
+	$(FIND) . -name \*.o -exec $(RM) {} \;
 
 distclean: clean
 	$(RM) Makefile

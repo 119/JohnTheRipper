@@ -23,23 +23,20 @@
  * Copyright (c) 2005 David Luyer <david at luyer.net>
  */
 
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_PO;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_PO);
+#else
+
 #include <string.h>
 
 #include "arch.h"
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
-#include "md5_go.h"
+#include "md5.h"
 #include "memdbg.h"
-
-typedef ARCH_WORD_32 MD5_word;
-typedef MD5_word MD5_binary[4];
-#if ARCH_LITTLE_ENDIAN
-#define MD5_out MD5_out_go
-#else
-#define MD5_out MD5_bitswapped_out_go
-#endif
-extern MD5_binary MD5_out;
 
 #define FORMAT_LABEL			"po"
 #define FORMAT_NAME			"Post.Office"
@@ -69,7 +66,8 @@ static struct fmt_tests tests[] = {
 
 static char saved_key[PLAINTEXT_LENGTH + 1];
 static int saved_key_len;
-static char po_buf[SALT_SIZE * 2 + 2 + PLAINTEXT_LENGTH + 128 /* MD5 scratch space */];
+static unsigned char po_buf[SALT_SIZE * 2 + 2 + PLAINTEXT_LENGTH + 128 /* MD5 scratch space */];
+static uint32_t MD5_out[4];
 
 static void po_init(struct fmt_main *self) {
 	/* Do nothing */
@@ -78,46 +76,14 @@ static void po_init(struct fmt_main *self) {
 static int valid(char *ciphertext, struct fmt_main *self)
 {
 	if (strlen(ciphertext) == 64 &&
-	    strspn(ciphertext, "0123456789abcdef") == 64) {
+	    strspn(ciphertext, HEXCHARS_lc) == 64) {
 		return 1;
 	}
 	return 0;
 }
 
-static int get_hash_0(int index)
-{
-	return MD5_out[0] & 0xF;
-}
-
-static int get_hash_1(int index)
-{
-	return MD5_out[0] & 0xFF;
-}
-
-static int get_hash_2(int index)
-{
-	return MD5_out[0] & 0xFFF;
-}
-
-static int get_hash_3(int index)
-{
-	return MD5_out[0] & 0xFFFF;
-}
-
-static int get_hash_4(int index)
-{
-	return MD5_out[0] & 0xFFFFF;
-}
-
-static int get_hash_5(int index)
-{
-	return MD5_out[0] & 0xFFFFFF;
-}
-
-static int get_hash_6(int index)
-{
-	return MD5_out[0] & 0x7FFFFFF;
-}
+#define COMMON_GET_HASH_VAR MD5_out
+#include "common-get-hash.h"
 
 static int salt_hash(void *salt)
 {
@@ -128,8 +94,7 @@ static int salt_hash(void *salt)
 
 static void set_key(char *key, int index)
 {
-	strnfcpy(saved_key, key, PLAINTEXT_LENGTH);
-	saved_key_len = strlen(saved_key);
+	saved_key_len = strnzcpyn(saved_key, key, sizeof(saved_key));
 }
 
 static char *get_key(int index)
@@ -138,10 +103,14 @@ static char *get_key(int index)
 	return saved_key;
 }
 
-static int cmp_all(void *binary, int index)
+static int cmp_all(void *binary, int count)
 {
-	/* also used for cmp_one */
-	return *(MD5_word *)binary == MD5_out[0];
+	return *(uint32_t *)binary == MD5_out[0];
+}
+
+static int cmp_one(void *binary, int index)
+{
+	return 1;
 }
 
 static int cmp_exact(char *source, int index)
@@ -149,11 +118,11 @@ static int cmp_exact(char *source, int index)
         static char fullmd5[16];
         int i;
 
-        for(i=0;i<16;i++)
+        for (i=0;i<16;i++)
         {
                 fullmd5[i] = atoi16[ARCH_INDEX(source[i*2])]*16 + atoi16[ARCH_INDEX(source[i*2+1])];
         }
-	return !memcmp(fullmd5, MD5_out, sizeof(MD5_binary));
+	return !memcmp(fullmd5, MD5_out, sizeof(fullmd5));
 }
 
 static void *get_binary(char *ciphertext)
@@ -163,7 +132,7 @@ static void *get_binary(char *ciphertext)
 
 	if (!binarycipher) binarycipher = mem_alloc_tiny(BINARY_SIZE, MEM_ALIGN_WORD);
 
-        for(i=0;i<BINARY_SIZE;i++)
+        for (i=0;i<BINARY_SIZE;i++)
         {
                 binarycipher[i] = atoi16[ARCH_INDEX(ciphertext[i*2])]*16 + atoi16[ARCH_INDEX(ciphertext[i*2+1])];
         }
@@ -185,11 +154,15 @@ static void set_salt(char *salt)
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
+	MD5_CTX ctx;
+
 	po_buf[32] = 'Y';
 	memcpy(po_buf + 33, saved_key, saved_key_len);
 	po_buf[saved_key_len + 33] = 247;
 	memcpy(po_buf + saved_key_len + 34, po_buf, 32);
-	MD5_Go((unsigned char *)po_buf, saved_key_len + 66);
+	MD5_Init(&ctx);
+	MD5_Update(&ctx, po_buf, saved_key_len+66);
+	MD5_Final((unsigned char*)MD5_out, &ctx);
 
 	return *pcount;
 }
@@ -201,6 +174,7 @@ struct fmt_main fmt_PO = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
 		BINARY_ALIGN,
@@ -209,9 +183,8 @@ struct fmt_main fmt_PO = {
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
+		{ NULL },
 		tests
 	}, {
 		po_init,
@@ -222,9 +195,7 @@ struct fmt_main fmt_PO = {
 		fmt_default_split,
 		get_binary,
 		(void *(*)(char *))get_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash_0,
@@ -236,22 +207,20 @@ struct fmt_main fmt_PO = {
 			fmt_default_binary_hash_6
 		},
 		salt_hash,
+		NULL,
 		(void (*)(void *))set_salt,
 		set_key,
 		get_key,
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
-		cmp_all,
+		cmp_one,
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

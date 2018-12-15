@@ -1,41 +1,58 @@
-/* Cracker for both MongoDB system and sniffed network hashes. Hacked together
+/*
+ * Cracker for both MongoDB system and sniffed network hashes. Hacked together
  * during November of 2012 by Dhiru Kholia <dhiru at openwall.com>.
  *
  * Based on https://github.com/cyberpunkych/attacking_mongodb
  *
- * Hash format for MongoDB system hashes: user:$mongodb$0$hash
- * Hash format for MongoDB network hashes: user:$mongodb$1$salt$hash
+ * Hash format for MongoDB system hashes: user:$mongodb$0$user$hash
+ * Hash format for MongoDB network hashes: user:$mongodb$1$user$salt$hash
  *
  * This software is Copyright (c) 2012, Dhiru Kholia <dhiru.kholia at gmail.com>,
  * and it is hereby released to the general public under the following terms:
  * Redistribution and use in source and binary forms, with or without modification,
- * are permitted. */
+ * are permitted.
+ */
+
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_mongodb;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_mongodb);
+#else
+
+#include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "md5.h"
-#include <string.h>
 #include "arch.h"
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
 #include "params.h"
 #include "options.h"
-#ifdef _OPENMP
-static int omp_t = 1;
-#include <omp.h>
-#define OMP_SCALE               64
-#endif
 #include "memdbg.h"
 
-#define FORMAT_LABEL		"MongoDB"
-#define FORMAT_NAME		"system / network"
-#define ALGORITHM_NAME		"MD5 32/" ARCH_BITS_STR
-#define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	-1
-#define PLAINTEXT_LENGTH	32
-#define BINARY_SIZE		16
-#define SALT_SIZE		sizeof(struct custom_salt)
-#define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	1
+#define FORMAT_LABEL            "MongoDB"
+#define FORMAT_NAME             "system / network"
+#define FORMAT_TAG              "$mongodb$"
+#define FORMAT_TAG_LEN          (sizeof(FORMAT_TAG)-1)
+
+#define ALGORITHM_NAME          "MD5 32/" ARCH_BITS_STR
+#define BENCHMARK_COMMENT       ""
+#define BENCHMARK_LENGTH        -1
+#define PLAINTEXT_LENGTH        32
+#define BINARY_SIZE             16
+#define SALT_SIZE               sizeof(struct custom_salt)
+#define BINARY_ALIGN            sizeof(uint32_t)
+#define SALT_ALIGN              sizeof(int)
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      512
+
+#ifndef OMP_SCALE
+#define OMP_SCALE               16 // Tuned w/ MKPC for core i7
+#endif
 
 static struct fmt_tests mongodb_tests[] = {
 	{"$mongodb$0$sa$75692b1d11c072c6c79332e248c4f699", "sa"},
@@ -46,11 +63,19 @@ static struct fmt_tests mongodb_tests[] = {
 	/* Ettercap fixed salt MiTM attack generated test vectors */
 	{"$mongodb$1$longusername$0000000000000000$53257e018399a241849cb04c70ba8daa", "longpassword"},
 	{"$mongodb$1$longusername$0000000000000000$10290925d16d81e50db242c9f3572d91", "longpassword@12345678"},
+	{"$mongodb$1$eight18_characters$8c82aec197929775$5c414259f7f7a42f8c4d1b6ffb37913a", "123"},
+	{"$mongodb$1$Herman$9b90cf265f3194d7$a5ca2c517c06fdfb773144d53fb26f56", "123456789"},
+	{"$mongodb$1$sz110$be8fa52f0e64c250$441d6ece7356c67dcc69dd26e7e0501f", "passWOrd"},
+	{"$mongodb$1$jack$304b81adddfb4d6f$c95e106f1d9952c88044a0b21a6bd3fd", ""},
+	// https://jira.mongodb.org/browse/SERVER-9476
+	{"$mongodb$1$z$ce88504553b16752$6deb79af26ebcdd2b2c40438008cb7b0", "g"},
+	// https://github.com/mongodb/specifications/blob/master/source/auth/auth.rst
+	{"$mongodb$1$user$2375531c32080ae8$21742f26431831d5cfca035a08c5bdf6", "pencil"},
 	{NULL}
 };
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE / sizeof(uint32_t)];
 
 static struct custom_salt {
 	int type;
@@ -60,58 +85,56 @@ static struct custom_salt {
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
-	saved_key = mem_calloc_tiny(sizeof(*saved_key) *
-			self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	crypt_out = mem_calloc_tiny(sizeof(*crypt_out) * self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
+	omp_autotune(self, OMP_SCALE);
+
+	saved_key = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*saved_key));
+	crypt_out = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*crypt_out));
 }
 
-static int ishex(char *q)
+static void done(void)
 {
-	while (atoi16[ARCH_INDEX(*q)] != 0x7F)
-		q++;
-	return !*q;
+	MEM_FREE(crypt_out);
+	MEM_FREE(saved_key);
 }
 
 static int valid(char *ciphertext, struct fmt_main *self)
 {
 	char *ptr, *ctcopy, *keeptr;
-	int type;
+	int type, extra;
 
-	if (strncmp(ciphertext, "$mongodb$", 9))
+	if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN))
 		return 0;
 	if (!(ctcopy = strdup(ciphertext)))
 		return 0;
 	keeptr = ctcopy;
-	ctcopy += 9;
+	ctcopy += FORMAT_TAG_LEN;
 
-	if (!(ptr = strtok(ctcopy, "$"))) /* type */
+	if (!(ptr = strtokm(ctcopy, "$"))) /* type */
+		goto error;
+	if (!isdec(ptr))
 		goto error;
 	type = atoi(ptr);
 	if (type != 0 && type != 1)
 		goto error;
-	if (!(ptr = strtok(NULL, "$"))) /* username */
+	if (!(ptr = strtokm(NULL, "$"))) /* username */
 		goto error;
 	if (strlen(ptr) > 127)
 		goto error;
 	if (type == 0) {
-		if (!(ptr = strtok(NULL, "$"))) /* hash */
+		if (!(ptr = strtokm(NULL, "$"))) /* hash */
 			goto error;
-		if (strlen(ptr) != 32 || !ishex(ptr))
+		if (hexlenl(ptr, &extra) != 32 || extra)
 			goto error;
 	} else {
-		if (!(ptr = strtok(NULL, "$"))) /* salt */
+		if (!(ptr = strtokm(NULL, "$"))) /* salt */
 			goto error;
-		if (strlen(ptr) != 16 || !ishex(ptr))
+		if (hexlenl(ptr, &extra) != 16 || extra)
 			goto error;
-		if (!(ptr = strtok(NULL, "$"))) /* hash */
+		if (!(ptr = strtokm(NULL, "$"))) /* hash */
 			goto error;
-		if (strlen(ptr) != 32 || !ishex(ptr))
+		if (hexlenl(ptr, &extra) != 32 || extra)
 			goto error;
 	}
 
@@ -129,16 +152,19 @@ static void *get_salt(char *ciphertext)
 	char *keeptr = ctcopy;
 	char *p;
 	static struct custom_salt cs;
-	ctcopy += 9;	/* skip over "$mongodb$*" */
-	p = strtok(ctcopy, "$");
+
+	memset(&cs, 0, sizeof(cs));
+	ctcopy += FORMAT_TAG_LEN;	/* skip over "$mongodb$" */
+	p = strtokm(ctcopy, "$");
 	cs.type = atoi(p);
-	p = strtok(NULL, "$");
+	p = strtokm(NULL, "$");
 	strcpy((char*)cs.username, p);
 	if (cs.type == 1) {
-		p = strtok(NULL, "$");
+		p = strtokm(NULL, "$");
 		strcpy((char*)cs.salt, p);
 	}
 	MEM_FREE(keeptr);
+
 	return (void *)&cs;
 }
 
@@ -151,6 +177,7 @@ static void *get_binary(char *ciphertext)
 	unsigned char *out = buf.c;
 	char *p;
 	int i;
+
 	p = strrchr(ciphertext, '$') + 1;
 	for (i = 0; i < BINARY_SIZE; i++) {
 		out[i] =
@@ -162,22 +189,18 @@ static void *get_binary(char *ciphertext)
 	return out;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & 0xf; }
-static int get_hash_1(int index) { return crypt_out[index][0] & 0xff; }
-static int get_hash_2(int index) { return crypt_out[index][0] & 0xfff; }
-static int get_hash_3(int index) { return crypt_out[index][0] & 0xffff; }
-static int get_hash_4(int index) { return crypt_out[index][0] & 0xfffff; }
-static int get_hash_5(int index) { return crypt_out[index][0] & 0xffffff; }
-static int get_hash_6(int index) { return crypt_out[index][0] & 0x7ffffff; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static void set_salt(void *salt)
 {
 	cur_salt = (struct custom_salt *)salt;
 }
 
-static inline void hex_encode(unsigned char *str, int len, unsigned char *out)
+inline static void hex_encode(unsigned char *str, int len, unsigned char *out)
 {
 	int i;
+
 	for (i = 0; i < len; ++i) {
 		out[0] = itoa16[str[i]>>4];
 		out[1] = itoa16[str[i]&0xF];
@@ -187,13 +210,13 @@ static inline void hex_encode(unsigned char *str, int len, unsigned char *out)
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
-	int index = 0;
+	const int count = *pcount;
+	int index;
+
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		if (cur_salt->type == 0) {
 			MD5_CTX ctx;
 			MD5_Init(&ctx);
@@ -219,16 +242,16 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 			MD5_Final((unsigned char*)crypt_out[index], &ctx);
 		}
 	}
+
 	return count;
 }
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#ifdef _OPENMP
-	for (; index < count; index++)
-#endif
-		if (!memcmp(binary, crypt_out[index], BINARY_SIZE))
+	int index;
+
+	for (index = 0; index < count; index++)
+		if (!memcmp(binary, crypt_out[index], ARCH_SIZE))
 			return 1;
 	return 0;
 }
@@ -245,16 +268,22 @@ static int cmp_exact(char *source, int index)
 
 static void mongodb_set_key(char *key, int index)
 {
-	int saved_key_length = strlen(key);
-	if (saved_key_length > PLAINTEXT_LENGTH)
-		saved_key_length = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, saved_key_length);
-	saved_key[index][saved_key_length] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
 {
 	return saved_key[index];
+}
+
+/*
+ * Report salt type as first "tunable cost"
+ */
+static unsigned int mongodb_salt_type(void *salt)
+{
+	struct custom_salt *my_salt = salt;
+
+	return (unsigned int) my_salt->type;
 }
 
 struct fmt_main fmt_mongodb = {
@@ -264,30 +293,33 @@ struct fmt_main fmt_mongodb = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
-		DEFAULT_ALIGN,
+		BINARY_ALIGN,
 		SALT_SIZE,
-		DEFAULT_ALIGN,
+		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
-		{ NULL },
-#endif
+		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_OMP_BAD,
+		{
+			"salt type",
+			/* FIXME: report user name length as 2nd cost? */
+		},
+		{ FORMAT_TAG },
 		mongodb_tests
 	}, {
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		fmt_default_prepare,
 		valid,
 		fmt_default_split,
 		get_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
-		{ NULL },
-#endif
+		{
+			mongodb_salt_type,
+		},
 		fmt_default_source,
 		{
 			fmt_default_binary_hash_0,
@@ -299,22 +331,20 @@ struct fmt_main fmt_mongodb = {
 			fmt_default_binary_hash_6
 		},
 		fmt_default_salt_hash,
+		NULL,
 		set_salt,
 		mongodb_set_key,
 		get_key,
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

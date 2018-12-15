@@ -38,9 +38,14 @@ the salt into multiple fields (i.e. wrong).  A carriage return or line
 feed, will cause the line to split, and JtR to not read it right.
 NULL bytes are a problem in any C file, using normal 'string' functions.
 The \ char, is used as a quoting char within dynamic, and can cause issues.
+One other recently found issue, is if the salt ends in ' ' or '\t' (space
+or tab), then if the dyna hash is placed on a line by itself (i.e. without
+a user: prepended), then jtr will trim the whitespace off. This is a known
+issue, and this is just a bad side effect of a known wanted behavior where
+the raw hash files are cleaned up during processing.
 DUE to all of these problems, dynamic has been expanded to take this as
 the salt:    $dyanamic_#$base_16_hash$HEX$hex_bytes_of_salt.  In this
-format, if the salt was 1234, then $HEX$31323334 would be the equivelent
+format, if the salt was 1234, then $HEX$31323334 would be the equivalent
 value.  This allows salts such as $\x0:\r\nBadSalt to actually be encoded.
 This salt CAN be used, if you use the representation:
 $HEX$003a0a0d42616453616c74.
@@ -157,7 +162,9 @@ dynamic_34  | md5(md4($p))            | No    |
 dynamic_35  | sha1(uc($u).:.$p)       | Yes   | ManGOS
 dynamic_36  | sha1($u.:.$p)           | Yes   | ManGOS2
 dynamic_37  | sha1(lc($u).$p)         | Yes   | SMF
-dynamic_38  | sha1($s.sha1($s.sha1($p)))} YES | Wolt3BB
+dynamic_38  | sha1($s.sha1($s.sha1($p)))| Yes | Wolt3BB
+dynamic_39  | md5($s.pad_16($p))      | Yes   | Net-md5.  Long salt, passwords are 16 bytes, null padded for under 16 bytes
+dynamic_40  | sha1($s.pad_16($p))     | Yes   | Net-sha1.  Long salt, passwords are 16 bytes, null padded for under 16 bytes
 dynamic_50  | sha224($p)              | No    |
 dynamic_51  | sha224($s.$p)           | Yes   |
 dynamic_52  | sha224($p.$s)           | Yes   |
@@ -274,9 +281,9 @@ dynamic_1007  md5(md5($p).$s) (vBulletin)
 dynamic_1008  md5($p.$s) (joomla)
 # and many other newer items, added from user requests.
 dynamic_1010  md5($p null_padded_to_len_100) RAdmin v2.x MD5
-dynamic_1011  md5($p.md5($s)) (WebEdition CMS)
-dynamic_1012  md5($p.md5($s)) (WebEdition CMS)  (much faster)
-dynamic_1013  md5($p.PMD5(username)) (WebEdition CMS)  (fast speed, but user name is stored in md5 hash format)
+dynamic_1011  md5($p.md5($s)) (webEdition CMS)
+dynamic_1012  md5($p.md5($s)) (webEdition CMS)  (much faster)
+dynamic_1013  md5($p.PMD5(username)) (webEdition CMS)  (fast speed, but user name is stored in md5 hash format)
 dynamic_1014  md5($p.$s) (long salt)
 dynamic_1015  md5(md5($p.$u).$s)
 dynamic_1018  md5(sha1(sha1($pass)))
@@ -284,15 +291,15 @@ dynamic_1019  md5(sha1(sha1(md5($pass))))
 dynamic_1020  md5(sha1(md5($pass)))
 dynamic_1021  md5(sha1(md5(sha1($pass))))
 dynamic_1022  md5(sha1(md5(sha1(md5($pass)))))
-dynamic_1023  sha1($pass) (first 32 bytes)
-dynamic_1024  sha1(md5($pass)) (first 32 bytes)
-dynamic_1025  sha1(md5(md5($pass))) (first 32 bytes)
-dynamic_1026  sha1(sha1($pass))) (first 32 bytes)
-dynamic_1027  sha1(sha1(sha1($pass)))) (first 32 bytes)
-dynamic_1028  sha1(sha1_raw($pass)) (first 32 bytes)
-dynamic_1029  sha256($pass) (first 32 bytes)
-dynamic_1030  Whirlpool($pass) (first 32 bytes)
-dynamic_1031  GOST($pass) (first 32 bytes)
+dynamic_1023  sha1($pass) (hash truncated to length 32)
+dynamic_1024  sha1(md5($pass)) (hash truncated to length 32)
+dynamic_1025  sha1(md5(md5($pass))) (hash truncated to length 32)
+dynamic_1026  sha1(sha1($pass))) (hash truncated to length 32)
+dynamic_1027  sha1(sha1(sha1($pass)))) (hash truncated to length 32)
+dynamic_1028  sha1(sha1_raw($pass)) (hash truncated to length 32)
+dynamic_1029  sha256($pass) (hash truncated to length 32)
+dynamic_1030  Whirlpool($pass) (hash truncated to length 32)
+dynamic_1031  GOST($pass) (hash truncated to length 32)
 dynamic_1300  md5(md5_raw($pass))
 dynamic_1350  md5(md5($s.$p):$s)
 
@@ -330,7 +337,7 @@ examples (this whole list is also found in dynamic.conf).
 # fld0 to fld9 - data from fld1 to fld9 of the input file.
 #
 #   NOTE within the scratch work spaces (input1[] and input2[] arrays), we can only do things like append_keys
-#   append_salt or other things.  Thus, each work space keeps track of each array element (knowing it's contents),
+#   append_salt or other things.  Thus, each work space keeps track of each array element (knowing its contents),
 #   and keeps track of the length.  In the way the scripting works, we can clear them (sets lengths of all
 #   elements to 0, and 'might' clear out the actual memory).  We can append to them (keys, output conversions,
 #   salt, etc) or we can force set their length to 32 ('special' optimization used in conjunction with
@@ -480,23 +487,37 @@ examples (this whole list is also found in dynamic.conf).
 #     and placing the # of bits into the right locations, and the 0x80
 #     trailing byte also).  So this tells dyna to store the data and
 #     intermediate flat, but use the special SSE2 code for this format
-#     that loads from flat.  At the current time, only SHA2 formats
-#     behave like this.  But SHA1 'may' also in the near future. One
-#     REALLY nice thing about doing SSE2 this way, is we are not limited
-#     to a single limb.  All of the sha256 can be done in SSE now. All
-#     of the SHA512 also, with the exception of the final crypt of the
-#     type 87 (sha512(sha512(x).sha512(x))  The final crypt is of 256
-#     bytes. Our internal buffers are ONLY 256 bytes long. Thus, we
-#     can not properly expand them to do the SSE2 (we would need to have
-#     384 byte buffers to do so). So that last step is done using oSSL,
-#     on the 256 byte strings stored (which we CAN work with).
+#     that loads from flat.  Currently, all formats which has SIMD code
+#     have flat buffer behavior.  NOTE most (all except md5/md4 and some
+#     for sha1), ONLY have the flat buffer code.  These other 3 formats
+#     do have custom 'mixed' coding.
+#     One really nice thing about doing SIMD this way is the single limb
+#     limit has been removed.  The SIMD code is currently in MD4/5, SHA1,
+#     and 32 bit SHA2 (SHA224/SHA256). The SIMD code has not been done
+#     for the flat SHA384/SHA512 code yet.
 #
 #  Flag=MGF_INPBASE64
 #     If the hashes are in base-64 (such as phpass), then use this
 #     flag.  Note, the base 64 'format' used is that of phpass.  If there
 #     are other orderings, then this will not work.  I know of no formats
 #     in use, other than phpass (phpbb, wordpress, etc) which use base-64
-#     for md5.
+#     for md5.  This is actually the same format as CryptBS in base64conv
+#     utility.  This has been improved now. It should work for any standard
+#     length hash (from 16 bytes up to 64 bytes).  The only part of the
+#     hash that is base-64 decoded is within the binary hash value itself.
+#     dynamic does not handle base-64 decoding within any part of the salt.
+#
+#  Flag=MGF_INPBASE64b
+#     This is like the MGF_INPBASE64 flag, BUT the encoding is in BE format
+#     crypt.  This is the same as Crypt encoding in base64conv utility
+#
+#  Flag=MGF_INPBASE64m
+#     This is like the MGF_INPBASE64 flag, BUT the encoding is in MIME.
+#     This is the same as MIME encoding in base64conv utility. NOTE, the
+#     hash can end with optional '=' place holding characters. These will
+#     be stripped off, in the prepare/split functions, to canonicalize the
+#     value of the hash to be NON-equal padded.  But an input file can have
+#     the '=' padding or not (or even mixed) and still process properly.
 #
 #  Flag=MGF_INPBASE64_4x6
 #     If this flag is set, then the input will be base-64, where 4 bytes are
@@ -542,10 +563,6 @@ examples (this whole list is also found in dynamic.conf).
 #     conversion mode, so that any initial key loading will also be
 #     done to the using unicode conversions.
 #
-#  Flag=MGF_HDAA_SALT
-#     Special salt loading for the HDAA format dynamic_21.
-#     Not useful for anything else.
-#
 #  MGF_FLD0, MGF_FLD1, MGF_FLD2, ... ,MGF_FLD9
 #     If any of the fields of the file are part of the format (and
 #     used within the script), then they either must be part of
@@ -577,7 +594,7 @@ examples (this whole list is also found in dynamic.conf).
 #     The binary input hash data format of the FreeBSD_MD5 and Apache_MD5.
 #
 # MGF_UTF8
-#     This format 'allows' the --encoding=utf8 switch, and will perform
+#     This format 'allows' the --encoding=utf-8 switch, and will perform
 #     full UTF conversions, if the DynamicFunc__setmode_unicode()
 #     function has been issued (or one of the user name or preload
 #     password unicode flags were used).
@@ -615,6 +632,10 @@ examples (this whole list is also found in dynamic.conf).
 #
 #  DynamicFunc__append_keys
 #     append the array of keys to the array input1[]
+#
+#  DynamicFunc__append_keys_pad16
+#     append the array of keys to the array input1[], padding with nulls to 16 bytes, if input shorter.
+#     Needed for net-md5 and net-sha1 formats.
 #
 #  DynamicFunc__append_keys2
 #     append the array of keys to the array input2[]
@@ -827,15 +848,15 @@ examples (this whole list is also found in dynamic.conf).
 #    append_keys2, append_salt, append_salt2, overwrite_salt_to_input1_no_size_fix,
 #    overwrite_salt_to_input2_no_size_fix, append_2nd_salt, append_2nd_salt2,
 #    append_userid, append_userid2, append_input1_from_CONST1  (and ALL other const
-#    append functions)  If --encoding=utf8 switch is set, then a utf8-to-unicode
+#    append functions)  If --encoding=utf-8 switch is set, then a utf-8 to unicode
 #    conversion is done.  If that switch was not used on the command line, then a
-#    simple ascii-to-unicode (which is simply appending a null byte after each byte
-#    of string).  The --encoding=utf8 conversion is considerably slower, but is required for
-#    many Unicode or utf8 systems.  NOTE, to honor the --encoding=utf8 switch, the
+#    simple ascii to unicode (which is simply appending a null byte after each byte
+#    of string).  The --encoding=utf-8 conversion is considerably slower, but is required
+#    for many Unicode or UTF-8 systems.  NOTE, to honor the --encoding=utf-8 switch, the
 #    format MUST use the MGF_UTF8 flag.
 #
 #  DynamicFunc__setmode_normal
-#    This is the 'normal' run for john.  Back to ascii (or utf8, if --encoding=utf8
+#    This is the 'normal' run for john.  Back to ascii (or utf-8, if --encoding=utf-8
 #    command line switch was used).  But there will be NO Unicode conversions done.
 #
 #
@@ -921,7 +942,7 @@ examples (this whole list is also found in dynamic.conf).
 ####################
 #
 # These other large hash types, have been built like the SHA1 (listed above). They will have
-# the same 8 function primatives, and be named exactly the same as the SHA1, except they
+# the same 8 function primitives, and be named exactly the same as the SHA1, except they
 # will have the crypt in the function name.  The current hashes supported are:
 #     SHA224, SHA256, SHA384, SHA512, GOST, WHIRLPOOL.
 #     NOTE Whirlpool is ONLY supported in new versions of OpenSSL, so if the version of oSSL
@@ -950,7 +971,7 @@ examples (this whole list is also found in dynamic.conf).
 # Controlling the output of 'large' crypts.
 ####################
 #
-# All of the 'large' crypts, have simple function primatives. These will perform the
+# All of the 'large' crypts, have simple function primitives. These will perform the
 # crypt, and then write output to one of the 2 buffers. The output can be appeneded,
 # or overwritten.  The format this output is done in CAN be controlled. The output
 # formats are:  base-16  (0-9 and a-f), base-16 upcase (0-9 and A-F), base-64 (MIME)
@@ -1021,23 +1042,23 @@ examples (this whole list is also found in dynamic.conf).
 #    in certain situations.
 #
 #  TestU= allows placing a test case out, that will ONLY load if the encoding
-#    of utf8 is selected from command line.
+#    of utf-8 is selected from command line.
 #
 #  TestA= allows placing a test case will will NEVER be loaded if encoding of
-#    utf8 is selected at command line (ASCII test case).
+#    utf-8 is selected at command line (ASCII test case).
 #
 #  TestM= Allows placing a test case that will ONLY load if this is an MMX or
 #    SSE build.
 #
 #  TestD= Allows placing a test case that will ONLY load, if -DDEBUG build of
 #    JtR is done (for testing).  At this time, the REALLY long password hashes
-#    are being added with TestD=  so that the timing of the formats will not be 
+#    are being added with TestD=  so that the timing of the formats will not be
 #    impacted, but so that a debugging build can be done, and the extra long
 #    test strings will still be there and be tested.
 #
 #  TestF= Allows placing a test case that will NEVER be loaded if this was an
 #    MMX or SSE build (Only load for 'flat' builds, like oSSL only).
-#   
+#
 #################
 #
 # The testing line is simply of this format:
@@ -2636,41 +2657,6 @@ Test=$dynamic_1059$18a7e5f289730525111f7b65cb223506:thatsworking
 Test=$dynamic_1059$01a0359d0cabbf49a0b0a8a941c7f5ab:test3
 
 
-
-##############################################################################
-# digest authentication scheme :
-#  h1 = md5(user:realm:password)
-#  h2 = md5(method:digestURI)
-#  response = h3 = md5(h1:nonce:nonceCount:ClientNonce:qop:h2)
-#
-# the 'special' salt sets 32space:nonce:nonceCount:ClientNonce:qop:h2
-# Also, this salt sets the first 5 bytes to be a growing text number,
-# so that salt_hash works properly.
-##############################################################################
-[List.Generic:dynamic_1060]
-Expression=dynamic_1060: HDAA )
-Flag=MGF_HDAA_SALT
-Flag=MGF_FLD2
-Flag=MGF_FLD3
-Flag=MGF_FLD4
-Flag=MGF_USERNAME
-Func=DynamicFunc__clean_input
-Func=DynamicFunc__append_userid
-Func=DynamicFunc__append_input1_from_CONST1
-Func=DynamicFunc__append_fld2
-Func=DynamicFunc__append_input1_from_CONST1
-Func=DynamicFunc__append_keys
-Func=DynamicFunc__crypt_md5
-Func=DynamicFunc__SSEtoX86_switch_output1
-Func=DynamicFunc__clean_input_kwik
-Func=DynamicFunc__append_salt
-Func=DynamicFunc__overwrite_from_last_output_as_base16_no_size_fix
-Func=DynamicFunc__crypt_md5
-Test=$dynamic_1060$679066476e67b5c7c4e88f04be567f8b$8c12bd8f728afe56d45a0ce846b70e5a$$Uuser$$F2myrealm$$F3GET$/$$F400000001$4b61913cec32e2c9$auth:nocode
-Test=$dynamic_1060$faa6cb7d676e5b7c17fcbf966436aa0c$af32592775d27b1cd06356b3a0db9ddf$$Umoi$$F2myrealm$$F3GET$/$$F400000001$8e1d49754a25aea7$auth:kikou
-CONST1=:
-
-
 [List.Generic:dynamic_1090]
 Expression=md5(md5($p.$s).md5(md5($p).$s.md5($s.md5($s.$p))).md5(md5($s.$p.$p).$s.md5($p.md5($p.$s.$p))).$p.md5($s.$p.md5($s.$p.$s).$p.md5($s.$p.md5($p.$s.$s))))
 Flag=MGF_SALTED
@@ -2907,8 +2893,8 @@ Test=$dynamic_1070$55496ed9edcabdd2368e7cd22eaae633c6d6c40e$$UJOEBLOW:test3
 CONST1=:
 
 # this format is unicode raw-md5.  It shows the TestA= and TestU=. These will only
-# be loaded depending upon --encoding=utf8.  If that is not present, then the TestA=
-# lines are loaded.  If --encoding=utf8 IS set, then the TestU= lines are loaded.
+# be loaded depending upon --encoding=utf-8.  If that is not present, then the TestA=
+# lines are loaded.  If --encoding=utf-8 IS set, then the TestU= lines are loaded.
 # the Test= lines are always loaded.
 [List.Generic:dynamic_1100]
 Expression=md5(unicode($p))  [rawmd5-unicode utf-8 input)]

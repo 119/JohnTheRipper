@@ -1,4 +1,5 @@
-/* PostgreSQL MD5 challenge-response cracker patch for JtR. Hacked together
+/*
+ * PostgreSQL MD5 challenge-response cracker patch for JtR. Hacked together
  * during October of 2012 by Dhiru Kholia <dhiru.kholia at gmail.com>.
  *
  * Use Ettercap to get PostgreSQL MD5 challenge-response pairs in JtR format.
@@ -8,21 +9,27 @@
  * $postgres$user*salt*hash
  *
  * This software is Copyright (c) 2012, Dhiru Kholia <dhiru.kholia at gmail.com>
- * and Copyright magnum 2013,
- * and it is hereby released to the general public under the following terms:
+ * and Copyright magnum 2013, and it is hereby released to the general public
+ * under the following terms:
+ *
  * Redistribution and use in source and binary forms, with or without modification,
- * are permitted. */
+ * are permitted.
+ */
+
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_postgres;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_postgres);
+#else
 
 #include <string.h>
-#include <errno.h>
+
 #ifdef _OPENMP
-static int omp_t = 1;
 #include <omp.h>
-#define OMP_SCALE               64
 #endif
 
-#include "md5.h"
 #include "arch.h"
+#include "md5.h"
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
@@ -32,6 +39,10 @@ static int omp_t = 1;
 
 #define FORMAT_LABEL            "postgres"
 #define FORMAT_NAME             "PostgreSQL C/R"
+#define FORMAT_TAG              "$postgres$"
+#define FORMAT_TAG_LEN          (sizeof(FORMAT_TAG)-1)
+#define FORMAT_TAG2             "$postgre$"
+#define FORMAT_TAG2_LEN         (sizeof(FORMAT_TAG2)-1)
 #define ALGORITHM_NAME          "MD5 32/" ARCH_BITS_STR
 #define BENCHMARK_COMMENT       ""
 #define BENCHMARK_LENGTH        -1
@@ -42,8 +53,11 @@ static int omp_t = 1;
 #define SALT_ALIGN              MEM_ALIGN_NONE
 #define MAX_USERNAME_LEN        64
 #define MIN_KEYS_PER_CRYPT      1
-#define MAX_KEYS_PER_CRYPT      1
-#define HEX                     "0123456789abcdefABCDEF"
+#define MAX_KEYS_PER_CRYPT      128
+
+#ifndef OMP_SCALE
+#define OMP_SCALE               4 // Tuned w/ MKPC for core i7
+#endif
 
 static struct fmt_tests postgres_tests[] = {
 	{"$postgres$postgres*f063f05d*1d586cc8d137e5f1733f234d224393e8",
@@ -53,11 +67,22 @@ static struct fmt_tests postgres_tests[] = {
 	/* $postgre$ is supported but deprecated */
 	{"$postgre$postgres*684697c8*bf2a64f35feba7bf1b633d60393c1356",
 	 "openwall"},
+	/* $postgres$ with longer user name */
+	{"$postgres$Twelve_chars*55393156*c01df9affa7573ef32ec143759f3e005",
+	"HookFish__2"},
+	{"$postgres$postgres*65687433*b782eca219ad84b58f26d25e19a1bbc9",
+	 "thisisalongstring"},
+	{"$postgres$postgres*33374273*77e0016f1b92cdea7291ab0ed21798b8",
+	 "string with space"},
+	{"$postgres$postgres*6f734f37*d5451e93f6ac9a0d30336ec106e91cf5",
+	 "123456789"},
+	{"$postgres$postgres*3348654b*0f0f46a3dfebf45f4320d2edeabc318f",
+	 ""},
 	{NULL}
 };
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE / sizeof(uint32_t)];
 
 static struct custom_salt {
 	unsigned char user[MAX_USERNAME_LEN + 1];
@@ -66,42 +91,43 @@ static struct custom_salt {
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
-	saved_key = mem_calloc_tiny(sizeof(*saved_key) *
-	                            self->params.max_keys_per_crypt,
-	                            MEM_ALIGN_WORD);
-	crypt_out = mem_calloc_tiny(sizeof(*crypt_out) *
-	                            self->params.max_keys_per_crypt,
-	                            MEM_ALIGN_WORD);
+	omp_autotune(self, OMP_SCALE);
+
+	saved_key = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*saved_key));
+	crypt_out = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*crypt_out));
+}
+
+static void done(void)
+{
+	MEM_FREE(crypt_out);
+	MEM_FREE(saved_key);
 }
 
 static int valid(char *ciphertext, struct fmt_main *self)
 {
 	const char *p;
+	int extra;
 
-	if (strncmp(ciphertext, "$postgres$", 10))
+	if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN))
 		return 0;
 
 	/* Check hash */
 	if (!(p = strrchr(ciphertext, '*')))
 		return 0;
-	if (strspn(&p[1], HEX) != 2*BINARY_SIZE)
+	if (hexlenl(&p[1], &extra) != 2*BINARY_SIZE || extra)
 		return 0;
 
 	/* Check salt */
 	p -= 9;
 	if (*p != '*')
 		return 0;
-	if (strspn(&p[1], HEX) != 8)
+	if (hexlenl(&p[1], 0) != 8)
 		return 0;
 
 	/* Check username length */
-	if (p - ciphertext - 10 > MAX_USERNAME_LEN)
+	if (p - ciphertext - FORMAT_TAG_LEN > MAX_USERNAME_LEN)
 		return 0;
 
 	return 1;
@@ -109,12 +135,12 @@ static int valid(char *ciphertext, struct fmt_main *self)
 
 static char *prepare(char *split_fields[10], struct fmt_main *self)
 {
-	static char out[10 + sizeof(struct custom_salt) + 2*BINARY_SIZE +2+1];
+	static char out[FORMAT_TAG_LEN + sizeof(struct custom_salt) + 2*BINARY_SIZE +2+1];
 
 	/* Replace deprecated tag */
-	if (*split_fields[1] && !strncmp(split_fields[1], "$postgre$", 9)) {
+	if (*split_fields[1] && !strncmp(split_fields[1], FORMAT_TAG2, FORMAT_TAG2_LEN)) {
 		snprintf(out, sizeof(out), "%s%s",
-		         "$postgres$", &split_fields[1][9]);
+		         FORMAT_TAG, &split_fields[1][FORMAT_TAG2_LEN]);
 		if (valid(out, self))
 			return out;
 	}
@@ -129,10 +155,11 @@ static void *get_salt(char *ciphertext)
 	int i;
 	static struct custom_salt cs;
 
-	ctcopy += 10;   /* skip over "$postgres$" */
-	p = strtok(ctcopy, "*");
+	ctcopy += FORMAT_TAG_LEN;   /* skip over "$postgres$" */
+	p = strtokm(ctcopy, "*");
+	memset(&cs, 0, sizeof(cs));
 	strnzcpy((char*)cs.user, p, MAX_USERNAME_LEN + 1);
-	p = strtok(NULL, "*");
+	p = strtokm(NULL, "*");
 	for (i = 0; i < 4; i++)
 		cs.salt[i] = atoi16[ARCH_INDEX(p[i * 2])] * 16
 			+ atoi16[ARCH_INDEX(p[i * 2 + 1])];
@@ -159,20 +186,15 @@ static void *get_binary(char *ciphertext)
 	return out;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & 0xf; }
-static int get_hash_1(int index) { return crypt_out[index][0] & 0xff; }
-static int get_hash_2(int index) { return crypt_out[index][0] & 0xfff; }
-static int get_hash_3(int index) { return crypt_out[index][0] & 0xffff; }
-static int get_hash_4(int index) { return crypt_out[index][0] & 0xfffff; }
-static int get_hash_5(int index) { return crypt_out[index][0] & 0xffffff; }
-static int get_hash_6(int index) { return crypt_out[index][0] & 0x7ffffff; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static void set_salt(void *salt)
 {
 	cur_salt = (struct custom_salt *)salt;
 }
 
-static inline void hex_encode(unsigned char *str, int len, unsigned char *out)
+inline static void hex_encode(unsigned char *str, int len, unsigned char *out)
 {
 	int i;
 
@@ -185,16 +207,13 @@ static inline void hex_encode(unsigned char *str, int len, unsigned char *out)
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
-	int index = 0;
+	const int count = *pcount;
+	int index;
 
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-#if defined(_OPENMP) || MAX_KEYS_PER_CRYPT > 1
-	for (index = 0; index < count; index++)
-#endif
-	{
+	for (index = 0; index < count; index++) {
 		MD5_CTX ctx;
 		unsigned char out[32];
 
@@ -215,12 +234,10 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
+	int index;
 
-#if defined(_OPENMP) || MAX_KEYS_PER_CRYPT > 1
-	for (; index < count; index++)
-#endif
-		if (!memcmp(binary, crypt_out[index], BINARY_SIZE))
+	for (index = 0; index < count; index++)
+		if (!memcmp(binary, crypt_out[index], ARCH_SIZE))
 			return 1;
 	return 0;
 }
@@ -237,12 +254,7 @@ static int cmp_exact(char *source, int index)
 
 static void postgres_set_key(char *key, int index)
 {
-	int saved_key_length = strlen(key);
-
-	if (saved_key_length > PLAINTEXT_LENGTH)
-		saved_key_length = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, saved_key_length);
-	saved_key[index][saved_key_length] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -257,6 +269,7 @@ struct fmt_main fmt_postgres = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
 		BINARY_ALIGN,
@@ -264,23 +277,20 @@ struct fmt_main fmt_postgres = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
+		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_OMP_BAD,
 		{ NULL },
-#endif
+		{ FORMAT_TAG, FORMAT_TAG2 },
 		postgres_tests
 	}, {
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		prepare,
 		valid,
 		fmt_default_split,
 		get_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash_0,
@@ -292,22 +302,20 @@ struct fmt_main fmt_postgres = {
 			fmt_default_binary_hash_6
 		},
 		fmt_default_salt_hash,
+		NULL,
 		set_salt,
 		postgres_set_key,
 		get_key,
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

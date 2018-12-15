@@ -1,6 +1,6 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 1996-98,2010-2013 by Solar Designer
+ * Copyright (c) 1996-98,2010-2013,2015 by Solar Designer
  *
  * ...with changes in the jumbo patch, by various authors
  */
@@ -12,6 +12,7 @@
 #ifndef _JOHN_LOADER_H
 #define _JOHN_LOADER_H
 
+#include <stdint.h>
 #include "params.h"
 #ifndef BENCH_BUILD
 #include "list.h"
@@ -25,13 +26,13 @@ struct db_password {
 /* Pointer to next password hash with the same salt */
 	struct db_password *next;
 
+/* Hot portion of or full binary ciphertext for fast comparison (aligned) */
+	void *binary;
+
 /* After loading is completed: pointer to next password hash with the same salt
  * and hash-of-hash.
  * While loading: pointer to next password hash with the same hash-of-hash. */
 	struct db_password *next_hash;
-
-/* Hot portion of or full binary ciphertext for fast comparison (aligned) */
-	void *binary;
 
 /* ASCII ciphertext for exact comparison and saving with cracked passwords.
  * Alternatively, when the source() method is non-default this field is either
@@ -42,6 +43,9 @@ struct db_password {
  * ciphertext was split into two parts. */
 	char *login;
 
+/* uid field from the password file */
+	char *uid;
+
 /* Words from the GECOS field (loaded for "single crack" mode only) */
 	struct list_main *words;
 };
@@ -51,10 +55,10 @@ struct db_password {
  */
 struct db_keys_hash_entry {
 /* Index of next key with the same hash, or -1 if none */
-	short next;
+	SINGLE_KEYS_TYPE next;
 
 /* Byte offset of this key in the buffer */
-	unsigned short offset;
+	SINGLE_KEYS_UTYPE offset;
 };
 
 /*
@@ -62,7 +66,7 @@ struct db_keys_hash_entry {
  */
 struct db_keys_hash {
 /* The hash table, maps to indices for the list below; -1 means empty bucket */
-	short hash[SINGLE_HASH_SIZE];
+	SINGLE_KEYS_TYPE hash[SINGLE_HASH_SIZE];
 
 /* List of keys with the same hash, allocated as min_keys_per_crypt entries */
 	struct db_keys_hash_entry list[1];
@@ -93,6 +97,9 @@ struct db_keys {
 /* Number of last processed rule */
 	int rule;
 
+/* Number of last processed stacked rule */
+	//int rule2;
+
 /* Number of recursive calls for this salt */
 	int lock;
 
@@ -109,6 +116,9 @@ struct db_salt {
 
 /* Salt in internal representation */
 	void *salt;
+
+/* md5 of the salt 'data'. Used to find the salt in resume session logic */
+	uint32_t salt_md5[4];
 
 /* Bitmap indicating whether a computed hash is potentially present in the list
  * and hash table below.  Normally, the bitmap is large enough that most of its
@@ -132,11 +142,14 @@ struct db_salt {
 /* Number of passwords with this salt */
 	int count;
 
-/* Sequential id for a given salt. Sequential id does not change even if some
- * salts are removed during cracking */
+/*
+ * Sequential id for a given salt. Sequential id does not change even if some
+ * salts are removed during cracking (except possibly if a FMT_REMOVE format
+ * renumbers the salts while re-iterating them).
+ */
 	int sequential_id;
 
-#if FMT_MAIN_VERSION > 11
+#ifndef BENCH_BUILD
 /* Tunable costs */
 	unsigned int cost[FMT_TUNABLE_COSTS];
 #endif
@@ -168,6 +181,8 @@ struct db_cracked {
 #define DB_SPLIT			0x00000010
 /* Duplicate hashes were seen and excluded */
 #define DB_NODUP			0x00000020
+/* Some entries are marked for removal */
+#define DB_NEED_REMOVAL			0x00000080
 /* Cracked passwords only (ciphertext, plaintext) */
 #define DB_CRACKED			0x00000100
 /* Cracked plaintexts list */
@@ -186,7 +201,7 @@ struct db_options {
 /* Requested passwords per salt */
 	int min_pps, max_pps;
 
-#if FMT_MAIN_VERSION > 11
+#ifndef BENCH_BUILD
 /* Requested cost values */
 	unsigned int min_cost[FMT_TUNABLE_COSTS];
 	unsigned int max_cost[FMT_TUNABLE_COSTS];
@@ -194,6 +209,15 @@ struct db_options {
 
 /* if --show=left is used, john dumps the non-cracked hashes */
 	int showuncracked;
+
+/* if --show=types is used, john shows all hashes in machine readable form */
+	int showtypes;
+
+/* if --show=types-json is used, show all hashes in JSON form */
+	int showtypes_json;
+
+/* if --show=invalid is used, john shows all hashes which fail valid() */
+	int showinvalid;
 
 /* Field separator (normally ':') */
 	char field_sep_char;
@@ -208,6 +232,10 @@ struct db_options {
 struct db_main {
 /* Are hashed passwords loaded into this database? */
 	int loaded;
+
+/* Base allocation sizes for "struct db_password" and "struct db_salt" as
+ * possibly adjusted by ldr_init_database() given options->flags and such. */
+	size_t pw_size, salt_size;
 
 /* Options */
 	struct db_options *options;
@@ -231,7 +259,7 @@ struct db_main {
 /* Number of salts, passwords and guesses */
 	int salt_count, password_count, guess_count;
 
-#if FMT_MAIN_VERSION > 11
+#ifndef BENCH_BUILD
 /* min. and max. tunable costs */
 	unsigned int min_cost[FMT_TUNABLE_COSTS];
 	unsigned int max_cost[FMT_TUNABLE_COSTS];
@@ -239,6 +267,12 @@ struct db_main {
 
 /* Ciphertext format */
 	struct fmt_main *format;
+
+/*
+ * Pointer to real db. NULL if there is none. If this db *is* the real db
+ * this points back to ourself (db->real == db).
+ */
+	struct db_main *real;
 };
 
 /* Non-zero while the loader is processing the pot file */
@@ -248,6 +282,13 @@ extern int ldr_in_pot;
  * Initializes the database before loading.
  */
 extern void ldr_init_database(struct db_main *db, struct db_options *options);
+
+#ifdef HAVE_FUZZ
+/*
+ * Loads a line into the database.
+ */
+extern void ldr_load_pw_line(struct db_main *db, char *line);
+#endif
 
 /*
  * Loads a password file into the database.
@@ -265,6 +306,18 @@ extern void ldr_load_pot_file(struct db_main *db, char *name);
 extern void ldr_fix_database(struct db_main *db);
 
 /*
+ * Create a fake database from a format's test vectors and return a pointer
+ * to it.
+ */
+extern struct db_main *ldr_init_test_db(struct fmt_main *format,
+                                        struct db_main *real);
+
+/*
+ * Destroy a fake database.
+ */
+extern void ldr_free_test_db(struct db_main *db);
+
+/*
  * Loads cracked passwords into the database.
  */
 extern void ldr_show_pot_file(struct db_main *db, char *name);
@@ -273,5 +326,23 @@ extern void ldr_show_pot_file(struct db_main *db, char *name);
  * Shows cracked passwords.
  */
 extern void ldr_show_pw_file(struct db_main *db, char *name);
+
+/* Compare a possibly truncated pot source with a full one */
+extern int ldr_pot_source_cmp(const char *pot_entry, const char *full_source);
+
+/*
+ * This returns the line to write to a .pot file. It may be shorter than the
+ * original source (with some extra tags added).
+ */
+extern const char *ldr_pot_source(const char *full_source,
+                                  char buffer[LINE_BUFFER_SIZE+1]);
+
+/*
+ * this function simply returns true of false if this is a chopped pot line
+ */
+extern int ldr_isa_pot_source(const char *ciphertext);
+
+/* Common code for determining valid when loading a chopped .pot line */
+extern int ldr_trunc_valid(char *ciphertext, struct fmt_main *format);
 
 #endif

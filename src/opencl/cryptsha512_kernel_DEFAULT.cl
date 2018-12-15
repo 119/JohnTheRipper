@@ -1,9 +1,9 @@
 /*
- * Developed by Claudio André <claudio.andre at correios.net.br> in 2012
+ * Developed by Claudio André <claudioandre.br at gmail.com> in 2012
  *
  * More information at http://openwall.info/wiki/john/OpenCL-SHA-512
  *
- * Copyright (c) 2012 Claudio André <claudio.andre at correios.net.br>
+ * Copyright (c) 2012-2015 Claudio André <claudioandre.br at gmail.com>
  * This program comes with ABSOLUTELY NO WARRANTY; express or implied.
  *
  * This is free software, and you are welcome to redistribute it
@@ -11,9 +11,9 @@
  * http://www.gnu.org/licenses/gpl-2.0.html
  */
 
-#include "opencl_cryptsha512.h"
+#include "opencl_sha512crypt.h"
 
-#if cpu(DEVICE_INFO)
+#if __CPU__
     #define UNROLL
     #define FAST
 #endif
@@ -82,7 +82,7 @@ inline void sha512_block(sha512_ctx * ctx) {
     uint64_t f = ctx->H[5];
     uint64_t g = ctx->H[6];
     uint64_t h = ctx->H[7];
-    uint64_t t1, t2;
+    uint64_t t;
     uint64_t w[16];
 
 #ifdef UNROLL
@@ -91,40 +91,9 @@ inline void sha512_block(sha512_ctx * ctx) {
     for (int i = 0; i < 16; i++)
         w[i] = SWAP64(ctx->buffer[i].mem_64[0]);
 
-#ifdef UNROLL
-    #pragma unroll
-#endif
-    for (int i = 0; i < 16; i++) {
-        t1 = k[i] + w[i] + h + Sigma1(e) + Ch(e, f, g);
-        t2 = Maj(a, b, c) + Sigma0(a);
+    /* Do the job. */
+    SHA512()
 
-        h = g;
-        g = f;
-        f = e;
-        e = d + t1;
-        d = c;
-        c = b;
-        b = a;
-        a = t1 + t2;
-    }
-
-#ifdef UNROLL
-    #pragma unroll
-#endif
-    for (int i = 16; i < 80; i++) {
-        w[i & 15] = sigma1(w[(i - 2) & 15]) + sigma0(w[(i - 15) & 15]) + w[(i - 16) & 15] + w[(i - 7) & 15];
-        t1 = k[i] + w[i & 15] + h + Sigma1(e) + Ch(e, f, g);
-        t2 = Maj(a, b, c) + Sigma0(a);
-
-        h = g;
-        g = f;
-        f = e;
-        e = d + t1;
-        d = c;
-        c = b;
-        b = a;
-        a = t1 + t2;
-    }
     /* Put checksum in context given as argument. */
     ctx->H[0] += a;
     ctx->H[1] += b;
@@ -381,10 +350,34 @@ inline void sha512_crypt(sha512_buffers  * fast_buffers,
 #undef ctx
 
 __kernel
-void kernel_crypt(__constant sha512_salt     * salt,
+void kernel_crypt_full(__constant sha512_salt     * salt,
                   __global   sha512_password * keys_buffer,
                   __global   sha512_hash     * out_buffer) {
 
+    //Compute buffers (on CPU, better private)
+    sha512_buffers fast_buffers;
+    sha512_ctx     ctx;
+
+    //Get the task to be done
+    size_t gid = get_global_id(0);
+
+    //Do the job
+    sha512_prepare(salt, &keys_buffer[gid], &fast_buffers, &ctx);
+    sha512_crypt(&fast_buffers, &ctx,
+                 salt->length, keys_buffer[gid].length, salt->rounds);
+
+    //Send results to the host.
+#ifdef UNROLL
+    #pragma unroll
+#endif
+    for (int i = 0; i < 8; i++)
+        out_buffer[gid].v[i] = fast_buffers.alt_result[i].mem_64[0];
+}
+
+__kernel
+void kernel_crypt_fast(__constant sha512_salt     * salt,
+                  __global   sha512_password * keys_buffer,
+                  __global   sha512_hash     * out_buffer) {
     //Compute buffers (on CPU, better private)
     sha512_buffers fast_buffers;
     sha512_ctx     ctx;

@@ -1,15 +1,20 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 1996-2001,2003,2010-2013 by Solar Designer
+ * Copyright (c) 1996-2001,2003,2010-2013,2015 by Solar Designer
  *
  * Addition of single DES encryption with no salt by
  * Deepika Dutta Mishra <dipikadutta at gmail.com> in 2012, no
  * rights reserved.
  */
 
+#ifdef _MSC_VER
+#undef _OPENMP
+#endif
+
 #include "arch.h"
 #include "common.h"
 #include "DES_bs.h"
+#include "memdbg.h"
 
 #if DES_BS_ASM && defined(_OPENMP) && defined(__GNUC__)
 #warning Assembly code and OpenMP are both requested - will provide the former, but not the latter (for DES-based hashes).  This may likely be corrected by enabling SIMD intrinsics with the C compiler (try adding -msse2 to OMPFLAGS).
@@ -26,7 +31,7 @@
 
 #define DES_BS_VECTOR_LOOPS 0
 
-#if defined(__ARM_NEON__) && DES_BS_DEPTH == 64
+#if defined(__ARM_NEON) && DES_BS_DEPTH == 64
 #include <arm_neon.h>
 
 typedef uint32x2_t vtype;
@@ -57,7 +62,7 @@ typedef uint32x2_t vtype;
 #define vshr(dst, src, shift) \
 	(dst) = vshr_n_u32((src), (shift))
 
-#elif defined(__ARM_NEON__) && ARCH_BITS == 32 && DES_BS_DEPTH == 96
+#elif defined(__ARM_NEON) && ARCH_BITS == 32 && DES_BS_DEPTH == 96
 #include <arm_neon.h>
 
 typedef struct {
@@ -91,7 +96,7 @@ typedef struct {
 	(dst).f = vbsl_u32((c).f, (b).f, (a).f); \
 	(dst).g = (((a).g & ~(c).g) ^ ((b).g & (c).g))
 
-#elif defined(__ARM_NEON__) && DES_BS_DEPTH == 128 && defined(DES_BS_2X64)
+#elif defined(__ARM_NEON) && DES_BS_DEPTH == 128 && defined(DES_BS_2X64)
 #include <arm_neon.h>
 
 typedef struct {
@@ -126,7 +131,7 @@ typedef struct {
 	(dst).f = vbsl_u32((c).f, (b).f, (a).f); \
 	(dst).g = vbsl_u32((c).g, (b).g, (a).g)
 
-#elif defined(__ARM_NEON__) && DES_BS_DEPTH == 128
+#elif defined(__ARM_NEON) && DES_BS_DEPTH == 128
 #include <arm_neon.h>
 
 typedef uint32x4_t vtype;
@@ -157,7 +162,7 @@ typedef uint32x4_t vtype;
 #define vshr(dst, src, shift) \
 	(dst) = vshrq_n_u32((src), (shift))
 
-#elif defined(__ARM_NEON__) && \
+#elif defined(__ARM_NEON) && \
     ((ARCH_BITS == 64 && DES_BS_DEPTH == 192) || \
     (ARCH_BITS == 32 && DES_BS_DEPTH == 160))
 #include <arm_neon.h>
@@ -193,7 +198,7 @@ typedef struct {
 	(dst).f = vbslq_u32((c).f, (b).f, (a).f); \
 	(dst).g = (((a).g & ~(c).g) ^ ((b).g & (c).g))
 
-#elif defined(__ARM_NEON__) && DES_BS_DEPTH == 256
+#elif defined(__ARM_NEON) && DES_BS_DEPTH == 256
 #include <arm_neon.h>
 
 typedef struct {
@@ -236,7 +241,7 @@ typedef struct {
 typedef vector signed int vtype;
 
 #define vst(dst, ofs, src) \
-	vec_st((src), (ofs) * sizeof(DES_bs_vector), (dst))
+	vec_st((src), (ofs) * sizeof(DES_bs_vector), (vtype *)(dst))
 
 #define vxorf(a, b) \
 	vec_xor((a), (b))
@@ -321,46 +326,61 @@ typedef struct {
 	(dst).f = vec_sel((a).f, (b).f, (vector bool int)(c).f); \
 	(dst).g = vec_sel((a).g, (b).g, (vector bool int)(c).g)
 
+#elif (defined(__MIC__) || defined(__AVX512F__)) && DES_BS_DEPTH == 512
+#include <immintrin.h>
+
+typedef __m512i vtype;
+
+#define vst(dst, ofs, src) \
+	_mm512_store_epi32((vtype *)((DES_bs_vector *)&(dst) + (ofs)), (src))
+
+#define vxorf(a, b) \
+	_mm512_xor_epi32((a), (b))
+
+#define vand(dst, a, b) \
+	(dst) = _mm512_and_epi32((a), (b))
+#define vor(dst, a, b) \
+	(dst) = _mm512_or_epi32((a), (b))
+#define vandn(dst, a, b) \
+	(dst) = _mm512_andnot_epi32((b), (a))
+
+#define vshl1(dst, src) \
+	(dst) = _mm512_add_epi32((src), (src))
+#define vshl(dst, src, shift) \
+	(dst) = _mm512_slli_epi32((src), (shift))
+#define vshr(dst, src, shift) \
+	(dst) = _mm512_srli_epi32((src), (shift))
+
 #elif defined(__AVX__) && DES_BS_DEPTH == 256 && !defined(DES_BS_NO_AVX256)
 #include <immintrin.h>
 
-/* Not __m256i because bitwise ops are "floating-point" with AVX */
-typedef __m256 vtype;
+typedef __m256i vtype;
 
 #define vst(dst, ofs, src) \
-	_mm256_store_ps((float *)((DES_bs_vector *)&(dst) + (ofs)), (src))
+	_mm256_store_si256((vtype *)((DES_bs_vector *)&(dst) + (ofs)), (src))
 
 #define vxorf(a, b) \
-	_mm256_xor_ps((a), (b))
+	_mm256_xor_si256((a), (b))
 
 #define vand(dst, a, b) \
-	(dst) = _mm256_and_ps((a), (b))
+	(dst) = _mm256_and_si256((a), (b))
 #define vor(dst, a, b) \
-	(dst) = _mm256_or_ps((a), (b))
+	(dst) = _mm256_or_si256((a), (b))
 #define vandn(dst, a, b) \
-	(dst) = _mm256_andnot_ps((b), (a))
+	(dst) = _mm256_andnot_si256((b), (a))
 
 #ifdef __XOP__
-/* This could be _mm256_cmov_ps(), but it does not exist (yet?) */
+/* This could be _mm256_cmov_si256(), but it does not exist (yet?) */
 #define vsel(dst, a, b, c) \
 	(dst) = __builtin_ia32_vpcmov_v8sf256((b), (a), (c))
 #endif
 
-/*
- * We should be able to do 256-bit shifts with one instruction with AVX2, but
- * for plain AVX let's use pairs of 128-bit instructions (and likely incur
- * extra memory stores/loads because the rest of our AVX code is 256-bit). :-(
- */
+#define vshl1(dst, src) \
+	(dst) = _mm256_add_epi8((src), (src))
 #define vshl(dst, src, shift) \
-	((__m128i *)&(dst))[0] = \
-	    _mm_slli_epi64(((__m128i *)&(src))[0], (shift)); \
-	((__m128i *)&(dst))[1] = \
-	    _mm_slli_epi64(((__m128i *)&(src))[1], (shift))
+	(dst) = _mm256_slli_epi64((src), (shift))
 #define vshr(dst, src, shift) \
-	((__m128i *)&(dst))[0] = \
-	    _mm_srli_epi64(((__m128i *)&(src))[0], (shift)); \
-	((__m128i *)&(dst))[1] = \
-	    _mm_srli_epi64(((__m128i *)&(src))[1], (shift))
+	(dst) = _mm256_srli_epi64((src), (shift))
 
 #elif defined(__AVX__) && DES_BS_DEPTH == 384 && !defined(DES_BS_NO_AVX128)
 #include <immintrin.h>
@@ -369,30 +389,28 @@ typedef __m256 vtype;
 #endif
 
 typedef struct {
-/* Not __m256i because bitwise ops are "floating-point" with AVX */
-	__m256 f;
+	__m256i f;
 	__m128i g;
 } vtype;
 
 #define vst(dst, ofs, src) \
-	_mm256_store_ps( \
-	    (float *)&((vtype *)((DES_bs_vector *)&(dst) + (ofs)))->f, \
+	_mm256_store_si256(&((vtype *)((DES_bs_vector *)&(dst) + (ofs)))->f, \
 	    (src).f); \
 	_mm_store_si128(&((vtype *)((DES_bs_vector *)&(dst) + (ofs)))->g, \
 	    (src).g)
 
 #define vxor(dst, a, b) \
-	(dst).f = _mm256_xor_ps((a).f, (b).f); \
+	(dst).f = _mm256_xor_si256((a).f, (b).f); \
 	(dst).g = _mm_xor_si128((a).g, (b).g)
 
 #define vand(dst, a, b) \
-	(dst).f = _mm256_and_ps((a).f, (b).f); \
+	(dst).f = _mm256_and_si256((a).f, (b).f); \
 	(dst).g = _mm_and_si128((a).g, (b).g)
 #define vor(dst, a, b) \
-	(dst).f = _mm256_or_ps((a).f, (b).f); \
+	(dst).f = _mm256_or_si256((a).f, (b).f); \
 	(dst).g = _mm_or_si128((a).g, (b).g)
 #define vandn(dst, a, b) \
-	(dst).f = _mm256_andnot_ps((b).f, (a).f); \
+	(dst).f = _mm256_andnot_si256((b).f, (a).f); \
 	(dst).g = _mm_andnot_si128((b).g, (a).g)
 
 #ifdef __XOP__
@@ -403,47 +421,38 @@ typedef struct {
 #endif
 
 #define vshl(dst, src, shift) \
-	((__m128i *)&(dst).f)[0] = \
-	    _mm_slli_epi64(((__m128i *)&(src).f)[0], (shift)); \
-	((__m128i *)&(dst).f)[1] = \
-	    _mm_slli_epi64(((__m128i *)&(src).f)[1], (shift)); \
+	(dst).f = _mm256_slli_epi64((src).f, (shift)); \
 	(dst).g = _mm_slli_epi64((src).g, (shift))
 #define vshr(dst, src, shift) \
-	((__m128i *)&(dst).f)[0] = \
-	    _mm_srli_epi64(((__m128i *)&(src).f)[0], (shift)); \
-	((__m128i *)&(dst).f)[1] = \
-	    _mm_srli_epi64(((__m128i *)&(src).f)[1], (shift)); \
+	(dst).f = _mm256_srli_epi64((src).f, (shift)); \
 	(dst).g = _mm_srli_epi64((src).g, (shift))
 
 #elif defined(__AVX__) && DES_BS_DEPTH == 512
 #include <immintrin.h>
 
 typedef struct {
-/* Not __m256i because bitwise ops are "floating-point" with AVX */
-	__m256 f, g;
+	__m256i f, g;
 } vtype;
 
 #define vst(dst, ofs, src) \
-	_mm256_store_ps( \
-	    (float *)&((vtype *)((DES_bs_vector *)&(dst) + (ofs)))->f, \
+	_mm256_store_si256(&((vtype *)((DES_bs_vector *)&(dst) + (ofs)))->f, \
 	    (src).f); \
-	_mm256_store_ps( \
-	    (float *)&((vtype *)((DES_bs_vector *)&(dst) + (ofs)))->g, \
+	_mm256_store_si256(&((vtype *)((DES_bs_vector *)&(dst) + (ofs)))->g, \
 	    (src).g)
 
 #define vxor(dst, a, b) \
-	(dst).f = _mm256_xor_ps((a).f, (b).f); \
-	(dst).g = _mm256_xor_ps((a).g, (b).g)
+	(dst).f = _mm256_xor_si256((a).f, (b).f); \
+	(dst).g = _mm256_xor_si256((a).g, (b).g)
 
 #define vand(dst, a, b) \
-	(dst).f = _mm256_and_ps((a).f, (b).f); \
-	(dst).g = _mm256_and_ps((a).g, (b).g)
+	(dst).f = _mm256_and_si256((a).f, (b).f); \
+	(dst).g = _mm256_and_si256((a).g, (b).g)
 #define vor(dst, a, b) \
-	(dst).f = _mm256_or_ps((a).f, (b).f); \
-	(dst).g = _mm256_or_ps((a).g, (b).g)
+	(dst).f = _mm256_or_si256((a).f, (b).f); \
+	(dst).g = _mm256_or_si256((a).g, (b).g)
 #define vandn(dst, a, b) \
-	(dst).f = _mm256_andnot_ps((b).f, (a).f); \
-	(dst).g = _mm256_andnot_ps((b).g, (a).g)
+	(dst).f = _mm256_andnot_si256((b).f, (a).f); \
+	(dst).g = _mm256_andnot_si256((b).g, (a).g)
 
 #ifdef __XOP__
 /* This could be _mm256_cmov_ps(), but it does not exist (yet?) */
@@ -453,23 +462,11 @@ typedef struct {
 #endif
 
 #define vshl(dst, src, shift) \
-	((__m128i *)&(dst).f)[0] = \
-	    _mm_slli_epi64(((__m128i *)&(src).f)[0], (shift)); \
-	((__m128i *)&(dst).f)[1] = \
-	    _mm_slli_epi64(((__m128i *)&(src).f)[1], (shift)); \
-	((__m128i *)&(dst).g)[0] = \
-	    _mm_slli_epi64(((__m128i *)&(src).g)[0], (shift)); \
-	((__m128i *)&(dst).g)[1] = \
-	    _mm_slli_epi64(((__m128i *)&(src).g)[1], (shift))
+	(dst).f = _mm256_slli_epi64((src).f, (shift)); \
+	(dst).g = _mm256_slli_epi64((src).g, (shift))
 #define vshr(dst, src, shift) \
-	((__m128i *)&(dst).f)[0] = \
-	    _mm_srli_epi64(((__m128i *)&(src).f)[0], (shift)); \
-	((__m128i *)&(dst).f)[1] = \
-	    _mm_srli_epi64(((__m128i *)&(src).f)[1], (shift)); \
-	((__m128i *)&(dst).g)[0] = \
-	    _mm_srli_epi64(((__m128i *)&(src).g)[0], (shift)); \
-	((__m128i *)&(dst).g)[1] = \
-	    _mm_srli_epi64(((__m128i *)&(src).g)[1], (shift))
+	(dst).f = _mm256_srli_epi64((src).f, (shift)); \
+	(dst).g = _mm256_srli_epi64((src).g, (shift))
 
 #elif defined(__AVX__) && defined(__MMX__) && DES_BS_DEPTH == 320 && \
     !defined(DES_BS_NO_MMX)
@@ -477,42 +474,34 @@ typedef struct {
 #include <mmintrin.h>
 
 typedef struct {
-/* Not __m256i because bitwise ops are "floating-point" with AVX */
-	__m256 f;
+	__m256i f;
 	__m64 g;
 } vtype;
 
 #define vst(dst, ofs, src) \
-	_mm256_store_ps( \
-	    (float *)&((vtype *)((DES_bs_vector *)&(dst) + (ofs)))->f, \
+	_mm256_store_si256(&((vtype *)((DES_bs_vector *)&(dst) + (ofs)))->f, \
 	    (src).f); \
 	((vtype *)((DES_bs_vector *)&(dst) + (ofs)))->g = (src).g
 
 #define vxor(dst, a, b) \
-	(dst).f = _mm256_xor_ps((a).f, (b).f); \
+	(dst).f = _mm256_xor_si256((a).f, (b).f); \
 	(dst).g = _mm_xor_si64((a).g, (b).g)
 
 #define vand(dst, a, b) \
-	(dst).f = _mm256_and_ps((a).f, (b).f); \
+	(dst).f = _mm256_and_si256((a).f, (b).f); \
 	(dst).g = _mm_and_si64((a).g, (b).g)
 #define vor(dst, a, b) \
-	(dst).f = _mm256_or_ps((a).f, (b).f); \
+	(dst).f = _mm256_or_si256((a).f, (b).f); \
 	(dst).g = _mm_or_si64((a).g, (b).g)
 #define vandn(dst, a, b) \
-	(dst).f = _mm256_andnot_ps((b).f, (a).f); \
+	(dst).f = _mm256_andnot_si256((b).f, (a).f); \
 	(dst).g = _mm_andnot_si64((b).g, (a).g)
 
 #define vshl(dst, src, shift) \
-	((__m128i *)&(dst).f)[0] = \
-	    _mm_slli_epi64(((__m128i *)&(src).f)[0], (shift)); \
-	((__m128i *)&(dst).f)[1] = \
-	    _mm_slli_epi64(((__m128i *)&(src).f)[1], (shift)); \
+	(dst).f = _mm256_slli_epi64((src).f, (shift)); \
 	(dst).g = _mm_slli_si64((src).g, (shift))
 #define vshr(dst, src, shift) \
-	((__m128i *)&(dst).f)[0] = \
-	    _mm_srli_epi64(((__m128i *)&(src).f)[0], (shift)); \
-	((__m128i *)&(dst).f)[1] = \
-	    _mm_srli_epi64(((__m128i *)&(src).f)[1], (shift)); \
+	(dst).f = _mm256_srli_epi64((src).f, (shift)); \
 	(dst).g = _mm_srli_si64((src).g, (shift))
 
 #elif defined(__AVX__) && \
@@ -522,45 +511,37 @@ typedef struct {
 #include <mmintrin.h>
 
 typedef struct {
-/* Not __m256i because bitwise ops are "floating-point" with AVX */
-	__m256 f;
+	__m256i f;
 	unsigned ARCH_WORD g;
 } vtype;
 
 #define vst(dst, ofs, src) \
-	_mm256_store_ps( \
-	    (float *)&((vtype *)((DES_bs_vector *)&(dst) + (ofs)))->f, \
+	_mm256_store_si256(&((vtype *)((DES_bs_vector *)&(dst) + (ofs)))->f, \
 	    (src).f); \
 	((vtype *)((DES_bs_vector *)&(dst) + (ofs)))->g = (src).g
 
 #define vxor(dst, a, b) \
-	(dst).f = _mm256_xor_ps((a).f, (b).f); \
+	(dst).f = _mm256_xor_si256((a).f, (b).f); \
 	(dst).g = (a).g ^ (b).g
 
 #define vnot(dst, a) \
-	(dst).f = _mm256_xor_ps((a).f, vones.f); \
+	(dst).f = _mm256_xor_si256((a).f, vones.f); \
 	(dst).g = ~(a).g
 #define vand(dst, a, b) \
-	(dst).f = _mm256_and_ps((a).f, (b).f); \
+	(dst).f = _mm256_and_si256((a).f, (b).f); \
 	(dst).g = (a).g & (b).g
 #define vor(dst, a, b) \
-	(dst).f = _mm256_or_ps((a).f, (b).f); \
+	(dst).f = _mm256_or_si256((a).f, (b).f); \
 	(dst).g = (a).g | (b).g
 #define vandn(dst, a, b) \
-	(dst).f = _mm256_andnot_ps((b).f, (a).f); \
+	(dst).f = _mm256_andnot_si256((b).f, (a).f); \
 	(dst).g = (a).g & ~(b).g
 
 #define vshl(dst, src, shift) \
-	((__m128i *)&(dst).f)[0] = \
-	    _mm_slli_epi64(((__m128i *)&(src).f)[0], (shift)); \
-	((__m128i *)&(dst).f)[1] = \
-	    _mm_slli_epi64(((__m128i *)&(src).f)[1], (shift)); \
+	(dst).f = _mm256_slli_epi64((src).f, (shift)); \
 	(dst).g = (src).g << (shift)
 #define vshr(dst, src, shift) \
-	((__m128i *)&(dst).f)[0] = \
-	    _mm_srli_epi64(((__m128i *)&(src).f)[0], (shift)); \
-	((__m128i *)&(dst).f)[1] = \
-	    _mm_srli_epi64(((__m128i *)&(src).f)[1], (shift)); \
+	(dst).f = _mm256_srli_epi64((src).f, (shift)); \
 	(dst).g = (src).g >> (shift)
 
 #elif defined(__AVX__) && defined(__MMX__) && \
@@ -570,53 +551,45 @@ typedef struct {
 #include <mmintrin.h>
 
 typedef struct {
-/* Not __m256i because bitwise ops are "floating-point" with AVX */
-	__m256 f;
+	__m256i f;
 	__m64 g;
 	unsigned ARCH_WORD h;
 } vtype;
 
 #define vst(dst, ofs, src) \
-	_mm256_store_ps( \
-	    (float *)&((vtype *)((DES_bs_vector *)&(dst) + (ofs)))->f, \
+	_mm256_store_si256(&((vtype *)((DES_bs_vector *)&(dst) + (ofs)))->f, \
 	    (src).f); \
 	((vtype *)((DES_bs_vector *)&(dst) + (ofs)))->g = (src).g; \
 	((vtype *)((DES_bs_vector *)&(dst) + (ofs)))->h = (src).h
 
 #define vxor(dst, a, b) \
-	(dst).f = _mm256_xor_ps((a).f, (b).f); \
+	(dst).f = _mm256_xor_si256((a).f, (b).f); \
 	(dst).g = _mm_xor_si64((a).g, (b).g); \
 	(dst).h = (a).h ^ (b).h
 
 #define vnot(dst, a) \
-	(dst).f = _mm256_xor_ps((a).f, vones.f); \
+	(dst).f = _mm256_xor_si256((a).f, vones.f); \
 	(dst).g = _mm_xor_si64((a).g, vones.g); \
 	(dst).h = ~(a).h
 #define vand(dst, a, b) \
-	(dst).f = _mm256_and_ps((a).f, (b).f); \
+	(dst).f = _mm256_and_si256((a).f, (b).f); \
 	(dst).g = _mm_and_si64((a).g, (b).g); \
 	(dst).h = (a).h & (b).h
 #define vor(dst, a, b) \
-	(dst).f = _mm256_or_ps((a).f, (b).f); \
+	(dst).f = _mm256_or_si256((a).f, (b).f); \
 	(dst).g = _mm_or_si64((a).g, (b).g); \
 	(dst).h = (a).h | (b).h
 #define vandn(dst, a, b) \
-	(dst).f = _mm256_andnot_ps((b).f, (a).f); \
+	(dst).f = _mm256_andnot_si256((b).f, (a).f); \
 	(dst).g = _mm_andnot_si64((b).g, (a).g); \
 	(dst).h = (a).h & ~(b).h
 
 #define vshl(dst, src, shift) \
-	((__m128i *)&(dst).f)[0] = \
-	    _mm_slli_epi64(((__m128i *)&(src).f)[0], (shift)); \
-	((__m128i *)&(dst).f)[1] = \
-	    _mm_slli_epi64(((__m128i *)&(src).f)[1], (shift)); \
+	(dst).f = _mm256_slli_epi64((src).f, (shift)); \
 	(dst).g = _mm_slli_si64((src).g, (shift)); \
 	(dst).h = (src).h << (shift)
 #define vshr(dst, src, shift) \
-	((__m128i *)&(dst).f)[0] = \
-	    _mm_srli_epi64(((__m128i *)&(src).f)[0], (shift)); \
-	((__m128i *)&(dst).f)[1] = \
-	    _mm_srli_epi64(((__m128i *)&(src).f)[1], (shift)); \
+	(dst).f = _mm256_srli_epi64((src).f, (shift)); \
 	(dst).g = _mm_srli_si64((src).g, (shift)); \
 	(dst).h = (src).h >> (shift)
 
@@ -1835,10 +1808,10 @@ void DES_bs_crypt_plain(int keys_count)
 		int index;
 	#endif
 
-	for(i=0; i<64; i++)
+	for (i=0; i<64; i++)
 	{
 	#if DES_BS_VECTOR
-                for(index=0; index<DES_BS_VECTOR_SIZE; index++)
+                for (index=0; index<DES_BS_VECTOR_SIZE; index++)
 	#endif
 			DES_bs_all.B[i]INDX = DES_bs_P[i]INDX;
 	}
@@ -1944,10 +1917,10 @@ void DES_bs_generate_plaintext(unsigned char *plaintext)
 	/* Set same plaintext for all bit layers */
 	for (i = 0; i < 64; i++) {
 		j = (int) (plaintext[i/8] >> (7-(i%8))) & 0x01;
-		if(j==1)
+		if (j==1)
 				j = -1;
 #if DES_BS_VECTOR
-		for(k=0; k<DES_BS_VECTOR_SIZE; k++)
+		for (k=0; k<DES_BS_VECTOR_SIZE; k++)
 #endif
 			DES_bs_P[i]INDX = j;
 		}

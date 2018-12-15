@@ -2,7 +2,7 @@
  * This file is part of John the Ripper password cracker,
  * Copyright (c) 1996-2002,2009,2013 by Solar Designer
  *
- * ...with changes in the jumbo patch, by magnum
+ * ...with changes in the jumbo patch, by magnum and JimF
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted.
@@ -24,14 +24,28 @@
 #include "john.h"
 #include "logger.h"
 #include "external.h"
+#ifndef BENCH_BUILD
+#include "options.h"
+#endif
 #include "memdbg.h"
 
 char *cfg_name = NULL;
 static struct cfg_section *cfg_database = NULL;
 static int cfg_recursion;
-static int cfg_process_directive(char *line, int number);
+static int cfg_process_directive(char *line, int number, int in_hcmode);
+static int cfg_loading_john_local, cfg_loaded_john_local;
 
-static char *trim(char *s)
+/* we have exposed this to the dyna_parser file, so that it can easily
+ * walk the configuration list one time, to determine which dynamic formats
+ * are in the file.  Before we would walk the entire configuration list
+ * 4000 times. Now only 1 time. We return the pointer to this data in
+ * a const manner, telling the outside function to NOT make changes.
+ */
+const struct cfg_section *get_cfg_db() {
+	return cfg_database;
+}
+
+static char *trim(char *s, int force)
 {
 	char *e;
 
@@ -40,14 +54,79 @@ static char *trim(char *s)
 
 	e = s + strlen(s) - 1;
 	while (e >= s && (*e == ' ' || *e == '\t')) e--;
+	/*
+	 * NOTE, if there are trailing spaces, then leave 1 of them. There are
+	 * VALID rules, that need a trailing space like $   i.e. appends space
+	 */
+	if (!force && (*(e+1) == ' ' || *(e+1) =='\t'))
+		++e;
 	*++e = 0;
 	return s;
 }
 
+static int cfg_merge_local_section() {
+	struct cfg_section *parent;
+	struct cfg_param *p1, *p2;
+
+	if (!cfg_database) return 0;
+	if (strncmp(cfg_database->name, "local:", 6)) return 0;
+	if (!strncmp(cfg_database->name, "local:list.", 11)) return 0;
+	parent = cfg_get_section(&cfg_database->name[6], NULL);
+	if (!parent) return 0;
+	// now update the params in parent section
+	p1 = cfg_database->params;
+	while (p1) {
+		int found = 0;
+		p2 = parent->params;
+		while (p2) {
+			if (!strcmp(p1->name, p2->name)) {
+				found = 1;
+				p2->value = p1->value;
+				break;
+			}
+			p2 = p2->next;
+		}
+		if (!found) {
+			// add a new item. NOTE, fixes bug #767
+			// https://github.com/magnumripper/JohnTheRipper/issues/767
+#if ARCH_ALLOWS_UNALIGNED
+			struct cfg_param *p3 = (struct cfg_param*)mem_alloc_tiny(sizeof(struct cfg_param), 1);
+#else
+			struct cfg_param *p3 = (struct cfg_param*)mem_alloc_tiny(sizeof(struct cfg_param), MEM_ALIGN_WORD);
+#endif
+			p3->next = parent->params;
+			p3->name = p1->name;
+			p3->value = p1->value;
+			parent->params = p3;
+		}
+		p1 = p1->next;
+	}
+	return 1;
+}
 static void cfg_add_section(char *name)
 {
 	struct cfg_section *last;
+	int merged;
 
+	// if the last section was a 'Local:" section, then merge it.
+	merged = cfg_merge_local_section();
+	if (!merged && !strncmp(name, "list.", 5)) {
+		last = cfg_database;
+		while (last) {
+			if (!strcmp(last->name, name)) {
+				if (!cfg_loading_john_local) {
+					if (john_main_process)
+						fprintf(stderr, "Warning! john.conf section [%s] is multiple declared.\n", name);
+				}
+#ifndef BENCH_BUILD
+				else if (john_main_process && options.verbosity >= VERB_DEFAULT)
+					fprintf(stderr, "Warning! Section [%s] overridden by john-local.conf\n", name);
+#endif
+				break;
+			}
+			last = last->next;
+		}
+	}
 	last = cfg_database;
 	cfg_database = mem_alloc_tiny(
 		sizeof(struct cfg_section), MEM_ALIGN_WORD);
@@ -104,22 +183,33 @@ static void cfg_add_param(char *name, char *value)
 static int cfg_process_line(char *line, int number)
 {
 	char *p;
+	static int in_hc_mode;
 
-	line = trim(line);
+	line = trim(line, 0);
+	if (*line == '!' && line[1] == '!') {
+		if (!strcmp(line, "!! hashcat logic ON"))
+			in_hc_mode = 1;
+		else if (!strcmp(line, "!! hashcat logic OFF"))
+			in_hc_mode = 0;
+
+	}
 	if (!*line || *line == '#' || *line == ';')
 		return 0;
-	if (*line == '.')
-		return cfg_process_directive(line, number);
-	if (*line == '[') {
+	if (*line == '.') {
+		int ret = cfg_process_directive(line, number, in_hc_mode);
+		if (ret != -1)
+			return ret;
+	}
+	if (*line == '[' && !in_hc_mode) {
 		if ((p = strchr(line, ']'))) *p = 0; else return 1;
-		cfg_add_section(strlwr(trim(line + 1)));
+		cfg_add_section(strlwr(trim(line + 1, 1)));
 	} else
 	if (cfg_database && cfg_database->list) {
 		cfg_add_line(line, number);
 	} else
 	if (cfg_database && (p = strchr(line, '='))) {
 		*p++ = 0;
-		cfg_add_param(strlwr(trim(line)), trim(p));
+		cfg_add_param(strlwr(trim(line, 1)), trim(p, 1));
 	} else {
 		return 1;
 	}
@@ -161,6 +251,9 @@ void cfg_init(char *name, int allow_missing)
 	if (ferror(file)) pexit("fgets");
 
 	if (fclose(file)) pexit("fclose");
+
+	// merge final section (if it is a 'Local:" section)
+	cfg_merge_local_section();
 }
 
 struct cfg_section *cfg_get_section(char *section, char *subsection)
@@ -221,10 +314,10 @@ int cfg_print_section_params(char *section, char *subsection)
 	int param_count = 0;
 
 	if ((current = cfg_get_section(section, subsection))) {
-		if((param = current->params))
+		if ((param = current->params))
 		do {
 			value = cfg_get_param(section, subsection, param->name);
-			if(!strcmp(param->value, value)) {
+			if (!strcmp(param->value, value)) {
 				printf("%s = %s\n", param->name, param->value);
 				param_count++;
 			}
@@ -316,6 +409,32 @@ int cfg_get_int(char *section, char *subsection, char *param)
 	return -1;
 }
 
+void cfg_get_int_array(char *section, char *subsection, char *param,
+		int *array, int array_len)
+{
+	char *s_value, *error;
+	long l_value;
+	int i = 0;
+
+	s_value = cfg_get_param(section, subsection, param);
+	if (s_value) {
+		for (;;) {
+			if (!*s_value)
+				break;
+			l_value = strtol(s_value, &error, 10);
+			if (error == s_value || (l_value & ~0x3FFFFFFFL))
+				break;
+			array[i++] = (int)l_value;
+			if (!*error || i == array_len)
+				break;
+			s_value = error + 1;
+		}
+	}
+
+	for ( ; i < array_len; i++)
+		array[i] = -1;
+}
+
 int cfg_get_bool(char *section, char *subsection, char *param, int def)
 {
 	char *value;
@@ -343,14 +462,16 @@ static int cfg_process_directive_include_section(char *line, int number)
 	char *p2 = strchr(&p[1], ']');
 	char Section[256];
 	if (!p2) {
-		fprintf(stderr, "ERROR, invalid config include line:  %s\n", line);
+		if (john_main_process)
+			fprintf(stderr, "ERROR, invalid config include line:  %s\n", line);
 #ifndef BENCH_BUILD
 		log_event ("! Error, invalid config include line:  %s", line);
 #endif
 		return 1;
 	}
 	if (!cfg_database || !cfg_database->name) {
-		fprintf(stderr, "ERROR, invalid section include, when not in a section:  %s\n", line);
+		if (john_main_process)
+			fprintf(stderr, "ERROR, invalid section include, when not in a section:  %s\n", line);
 #ifndef BENCH_BUILD
 		log_event ("! ERROR, invalid section include, when not in a section:  %s", line);
 #endif
@@ -359,29 +480,37 @@ static int cfg_process_directive_include_section(char *line, int number)
 	*p2 = 0;
 	strlwr(p);
 	if (!strcmp(cfg_database->name, p)) {
-		fprintf(stderr, "ERROR, invalid to load the current section (recursive):  %s\n", line);
+		if (john_main_process)
+			fprintf(stderr, "ERROR, invalid to load the current section (recursive):  %s\n", line);
 #ifndef BENCH_BUILD
 		log_event ("! ERROR, invalid to load the current section (recursive):  %s", line);
 #endif
 		return 1;
 	}
-	p = strtok(p, ":");
-	p2 = strtok(NULL, "");
-	if (!p || !p2) {
-		fprintf(stderr, "ERROR, invalid .include line, can not find this section:  %s\n", line);
+	p = strtokm(p, ":");
+	p2 = strtokm(NULL, "");
+	if (!p) {
+		if (john_main_process)
+			fprintf(stderr, "ERROR, invalid .include line, can not find this section:  %s\n", line);
 #ifndef BENCH_BUILD
 		log_event("! ERROR, invalid .include line, can not find this section:  %s", line);
 #endif
 		return 1;
 	}
 	*Section = ':';
-	strnzcpy(&Section[1], p2, 254);
+	if (p2)
+		strnzcpy(&Section[1], p2, 254);
+	else
+		*Section = 0;
 	if ((newsection = cfg_get_section(p, Section))) {
 		if (newsection->list) {
-			struct cfg_line *pLine = newsection->list->head;
-			while (pLine) {
-				cfg_add_line(pLine->data, number);
-				pLine = pLine->next;
+			// Must check cfg_database->list before cfg_add_line()
+			if (NULL != cfg_database->list) {
+				struct cfg_line *pLine = newsection->list->head;
+				while (pLine) {
+					cfg_add_line(pLine->data, number);
+					pLine = pLine->next;
+				}
 			}
 			return 0;
 		}
@@ -394,26 +523,28 @@ static int cfg_process_directive_include_section(char *line, int number)
 			return 0;
 		}
 	}
-	fprintf(stderr, "ERROR, could not find include section:  %s%s]\n", line, Section);
+	if (john_main_process)
+		fprintf(stderr, "ERROR, could not find include section:  %s%s]\n", line, Section);
 #ifndef BENCH_BUILD
 	log_event("! ERROR, could not find include section:  %s%s]", line, Section);
 #endif
 	return 1;
 }
 
-// Handle a .include "file"   or a .include <file>
+// Handle a .include "file"   or a .include <file>   or a .include 'file'
 static int cfg_process_directive_include_config(char *line, int number)
 {
 	char *p, *p2, *saved_fname;
 	char Name[PATH_BUFFER_SIZE];
-	int allow_missing;
+	int allow_missing = 0;
 
 	// Ok, we are including a file.
 	if (!strncmp(line, ".include \"", 10)) {
 		p = &line[10];
 		p2 = strchr(&p[1], '\"');
 		if (!p2) {
-			fprintf(stderr, "ERROR, invalid config include line:  %s\n", line);
+			if (john_main_process)
+				fprintf(stderr, "ERROR, invalid config include line:  %s\n", line);
 #ifndef BENCH_BUILD
 			log_event("! ERROR, invalid config include line:  %s", line);
 #endif
@@ -421,12 +552,26 @@ static int cfg_process_directive_include_config(char *line, int number)
 		}
 		*p2 = 0;
 		strnzcpy(Name, p, PATH_BUFFER_SIZE);
-	}
-	else {
+	} else if (!strncmp(line, ".include '", 10)) {
+		p = &line[10];
+		p2 = strchr(&p[1], '\'');
+		if (!p2) {
+			if (john_main_process)
+				fprintf(stderr, "ERROR, invalid config include line:  %s\n", line);
+#ifndef BENCH_BUILD
+			log_event("! ERROR, invalid config include line:  %s", line);
+#endif
+			return 1;
+		}
+		*p2 = 0;
+		strnzcpy(Name, p, PATH_BUFFER_SIZE);
+		allow_missing = 1;
+	} else {
 		p = &line[10];
 		p2 = strchr(&p[1], '>');
 		if (!p2) {
-			fprintf(stderr, "ERROR, invalid config include line:  %s\n", line);
+			if (john_main_process)
+				fprintf(stderr, "ERROR, invalid config include line:  %s\n", line);
 #ifndef BENCH_BUILD
 			log_event("! ERROR, invalid config include line:  %s", line);
 #endif
@@ -437,32 +582,47 @@ static int cfg_process_directive_include_config(char *line, int number)
 		strnzcpy(&Name[6], p, PATH_BUFFER_SIZE - 6);
 	}
 	if (cfg_recursion == 20) {
-		fprintf(stderr, "ERROR, .include recursion too deep in john.ini processing file .include \"%s\"\n", p);
+		if (john_main_process)
+			fprintf(stderr, "ERROR, .include recursion too deep in john.ini processing file .include \"%s\"\n", p);
 #ifndef BENCH_BUILD
 		log_event("! ERROR, .include recursion too deep in john.ini processing file .include \"%s\"", p);
 #endif
 		return 1;
 	}
 
-	/* We silently allow a missing john.local.conf */
-	allow_missing = !strcmp(Name, "$JOHN/john.local.conf");
-
+	if (strstr(Name, "/john-local.conf")) {
+		if (!strcmp(Name, "$JOHN/john-local.conf") ||
+		    !strcmp(Name, "./john-local.conf")) {
+			if (!strcmp(path_expand("$JOHN/"), "./") &&
+			    cfg_loaded_john_local)
+				return 0;
+			else
+				cfg_loaded_john_local = 1;
+		}
+		cfg_loading_john_local = 1;
+	}
 	saved_fname = cfg_name;
 	cfg_recursion++;
 	cfg_init(Name, allow_missing);
 	cfg_recursion--;
 	cfg_name = saved_fname;
+	cfg_loading_john_local = 0;
 	return 0;
 }
 
-// Handle a .directive line.  Curently only .include syntax is handled.
-static int cfg_process_directive(char *line, int number)
+// Handle a .directive line.  Currently only .include syntax is handled.
+static int cfg_process_directive(char *line, int number, int in_hc_mode)
 {
-	if (!strncmp(line, ".include \"", 10) || !strncmp(line, ".include <", 10))
+	if (!strncmp(line, ".include \"", 10) || !strncmp(line, ".include <", 10) || !strncmp(line, ".include '", 10))
 		return cfg_process_directive_include_config(line, number);
 	if (!strncmp(line, ".include [", 10))
 		return cfg_process_directive_include_section(line, number);
-	fprintf (stderr, "Unknown directive in the .conf file:  '%s'\n", line);
+	if (in_hc_mode)
+		return -1;
+	if (!strncmp(line, ".log ", 5))
+		return -1;
+	if (john_main_process)
+		fprintf(stderr, "Unknown directive in the .conf file:  '%s'\n", line);
 #ifndef BENCH_BUILD
 	log_event("! Unknown directive in the .conf file:  %s", line);
 #endif

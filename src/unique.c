@@ -14,22 +14,29 @@
  * -ex_file_only=FNAME  uniq against extern file, and assumes current file is
  *                      already unique, so does not unique it.
  * -cut=len  Trims each line to len, prior to unique. Also, any -ex_file=
- *           file has it's lines trimmed (to properly compare).
+ *           file has its lines trimmed (to properly compare).
  * -cut=LM   Trim each line to 7 bytes, and grab the next (up to) 7 bytes
  *           and upcase each.  Warning, if using -ex_file= make sure these
  *           files are 'proper' LM format (7 char and upcase).  No auto
  *           trimming/upcasing is done.
  * -mem=num. A number that overrides the UNIQUE_HASH_LOG value from within
- *           params.h.  The default is 21.  valid range from 13 to 25.  25
- *           will use a 2GB memory buffer, and 33 entry million hash table
+ *           params.h.  The default is 24 or 25.  valid range from 13 to 25.
+ *           25 will use a 2GB memory buffer, and 33 entry million hash table
  *           Each number doubles size.
  */
 
+#if AC_BUILT
+#include "autoconfig.h"
+#else
 #define _POSIX_SOURCE /* for fdopen(3) */
+#endif
+
 #include <stdio.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#if !AC_BUILT || HAVE_FCNTL_H
 #include <fcntl.h>
+#endif
 #include <string.h>
 #ifdef _MSC_VER
 #include <io.h>
@@ -41,6 +48,7 @@
 #include "misc.h"
 #include "params.h"
 #include "memory.h"
+#include "jumbo.h"
 #include "memdbg.h"
 
 #define ENTRY_END_HASH			0xFFFFFFFF /* also hard-coded */
@@ -57,7 +65,7 @@ static FILE *output;
 static FILE *use_to_unique_but_not_add;
 static int do_not_unique_against_self=0;
 
-long long totLines=0,written_lines=0;
+uint64_t totLines=0, written_lines=0;
 int verbose=0, cut_len=0, LM=0;
 unsigned int vUNIQUE_HASH_LOG=UNIQUE_HASH_LOG, vUNIQUE_HASH_SIZE=UNIQUE_HASH_SIZE, vUNIQUE_BUFFER_SIZE=UNIQUE_BUFFER_SIZE;
 unsigned int vUNIQUE_HASH_MASK = UNIQUE_HASH_SIZE - 1;
@@ -348,11 +356,7 @@ static void unique_run(void)
 		write_buffer();
 
 		if (verbose)
-#ifdef __MINGW32__
-			printf ("\rTotal lines read %I64u Unique lines written %I64u\r", totLines, written_lines);
-#else
-			printf ("\rTotal lines read %llu Unique lines written %llu\r", totLines, written_lines);
-#endif
+			printf("\rTotal lines read %"PRIu64" Unique lines written %"PRIu64"\r", totLines, written_lines);
 	}
 }
 
@@ -400,11 +404,11 @@ int unique(int argc, char **argv)
 			int len;
 			sscanf(argv[1], "-mem=%d", &len);
 			if (len > 25) {
-				fprintf (stderr, "Warning, max memory usages reduced to 25\n");
+				fprintf(stderr, "Warning, max memory usages reduced to 25\n");
 				len = 25;
 			}
 			if (len < 13) {
-				fprintf (stderr, "Warning the min memory usage allowed is 13\n");
+				fprintf(stderr, "Warning the min memory usage allowed is 13\n");
 				len = 13;
 			}
 			--argc;
@@ -442,7 +446,7 @@ int unique(int argc, char **argv)
 #if defined (__MINGW32__)
 	    puts("");
 #endif
-		puts("Usage: unique [-v] [-inp=fname] [-cut=len] [-mem=num] OUTPUT-FILE [-ex_file=FNAME2] [-ex_file_only=FNAME2]\n\n"
+		printf("Usage: unique [-v] [-inp=fname] [-cut=len] [-mem=num] OUTPUT-FILE [-ex_file=FNAME2] [-ex_file_only=FNAME2]\n\n"
 			 "       reads from stdin 'normally', but can be overridden by optional -inp=\n"
 			 "       If -ex_file=XX is used, then data from file XX is also used to\n"
 			 "       unique the data, but nothing is ever written to XX. Thus, any data in\n"
@@ -451,11 +455,12 @@ int unique(int argc, char **argv)
 			 "       -cut=len  Will trim each input lines to 'len' bytes long, prior to running\n"
 			 "       the unique algorithm. The 'trimming' is done on any -ex_file[_only] file\n"
 			 "       -mem=num.  A number that overrides the UNIQUE_HASH_LOG value from within\n"
-			 "       params.h.  The default is 21.  This can be raised, up to 25 (memory usage\n"
+			 "       params.h.  The default is %u.  Valid range is from 13 to 25 (memory usage\n"
 			 "       doubles each number).  If you go TOO large, unique will swap and thrash and\n"
 			 "       work VERY slow\n"
 			 "\n"
-			 "       -v is for 'verbose' mode, outputs line counts during the run");
+			 "       -v is for 'verbose' mode, outputs line counts during the run\n",
+			UNIQUE_HASH_LOG);
 
 		if (argc <= 1)
 			return 0;
@@ -468,11 +473,7 @@ int unique(int argc, char **argv)
 	unique_init(argv[1]);
 	unique_run();
 	unique_done();
-#ifdef __MINGW32__
-    printf ("Total lines read %I64u Unique lines written %I64u\n", totLines, written_lines);
-#else
-    printf ("Total lines read %llu Unique lines written %llu\n", totLines, written_lines);
-#endif
+    printf("Total lines read %"PRIu64" Unique lines written %"PRIu64"\n", totLines, written_lines);
 
 	return 0;
 }

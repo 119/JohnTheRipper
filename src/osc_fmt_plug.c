@@ -20,6 +20,17 @@
  *
  */
 
+#if AC_BUILT
+#include "autoconfig.h"
+#endif
+#ifndef DYNAMIC_DISABLED
+
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_OSC;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_OSC);
+#else
+
 #include <string.h>
 
 #include "common.h"
@@ -39,14 +50,22 @@
 #define MD5_HEX_SIZE		(MD5_BINARY_SIZE * 2)
 
 #define BINARY_SIZE			MD5_BINARY_SIZE
+#define BINARY_ALIGN		MEM_ALIGN_WORD
 
 #define SALT_SIZE			2
+#define DYNA_SALT_SIZE		(sizeof(char*))
+#define SALT_ALIGN			MEM_ALIGN_WORD
 
-#define PLAINTEXT_LENGTH	32
+// set PLAINTEXT_LENGTH to 0, so dyna will set this
+#define PLAINTEXT_LENGTH	0
 #define CIPHERTEXT_LENGTH	(1 + 3 + 1 + SALT_SIZE * 2 + 1 + MD5_HEX_SIZE)
 
 static struct fmt_tests osc_tests[] = {
 	{"$OSC$2020$05de5c963ee6234dc7d52f7589a1922b", "welcome"},
+	{"$OSC$3132$c02e8eef3eaa1a813c2ff87c1780f9ed", "3456test1"},
+	// repeat the hashes in the same form that is used in john.pot
+	{"$dynamic_4$05de5c963ee6234dc7d52f7589a1922b$HEX$2020", "welcome"},
+	{"$dynamic_4$c02e8eef3eaa1a813c2ff87c1780f9ed$12", "3456test1"},
 	{NULL}
 };
 
@@ -86,7 +105,8 @@ static char *Convert(char *Buf, char *ciphertext)
 
 static char *our_split(char *ciphertext, int index, struct fmt_main *self)
 {
-	return Convert(Conv_Buf, ciphertext);
+	get_ptr();
+	return pDynamic_4->methods.split(Convert(Conv_Buf, ciphertext), index, self);
 }
 
 static char *our_prepare(char *split_fields[10], struct fmt_main *self)
@@ -98,11 +118,12 @@ static char *our_prepare(char *split_fields[10], struct fmt_main *self)
 static int osc_valid(char *ciphertext, struct fmt_main *self)
 {
 	int i;
-	if (!ciphertext ) // || strlen(ciphertext) < CIPHERTEXT_LENGTH)
+
+	if (!ciphertext )
 		return 0;
 
 	get_ptr();
-	i = strlen(ciphertext);
+	i = strnlen(ciphertext, CIPHERTEXT_LENGTH + 1);
 
 	if (i != CIPHERTEXT_LENGTH) {
 		return pDynamic_4->methods.valid(ciphertext, pDynamic_4);
@@ -133,6 +154,7 @@ static void * our_salt(char *ciphertext)
 }
 static void * our_binary(char *ciphertext)
 {
+	get_ptr();
 	return pDynamic_4->methods.binary(Convert(Conv_Buf, ciphertext));
 }
 
@@ -142,10 +164,9 @@ struct fmt_main fmt_OSC =
 		// setup the labeling and stuff. NOTE the max and min crypts are set to 1
 		// here, but will be reset within our init() function.
 		FORMAT_LABEL, FORMAT_NAME, ALGORITHM_NAME, BENCHMARK_COMMENT, BENCHMARK_LENGTH,
-		PLAINTEXT_LENGTH, BINARY_SIZE, DEFAULT_ALIGN, SALT_SIZE+1, DEFAULT_ALIGN, 1, 1, FMT_CASE | FMT_8_BIT,
-#if FMT_MAIN_VERSION > 11
+		0, PLAINTEXT_LENGTH, BINARY_SIZE, BINARY_ALIGN, DYNA_SALT_SIZE, SALT_ALIGN, 1, 1, FMT_CASE | FMT_8_BIT | FMT_DYNAMIC,
 		{ NULL },
-#endif
+		{ NULL },
 		osc_tests
 	},
 	{
@@ -155,19 +176,23 @@ struct fmt_main fmt_OSC =
 		fmt_default_done,
 		fmt_default_reset,
 		fmt_default_prepare,
-		osc_valid
+		osc_valid,
+		our_split
 	}
 };
+
+static void link_funcs() {
+	fmt_OSC.methods.salt   = our_salt;
+	fmt_OSC.methods.binary = our_binary;
+	fmt_OSC.methods.split = our_split;
+	fmt_OSC.methods.prepare = our_prepare;
+}
 
 static void osc_init(struct fmt_main *self)
 {
 	if (self->private.initialized == 0) {
-		pDynamic_4 = dynamic_THIN_FORMAT_LINK(&fmt_OSC, Convert(Conv_Buf, osc_tests[0].ciphertext), "osc", 1);
-		fmt_OSC.methods.salt   = our_salt;
-		fmt_OSC.methods.binary = our_binary;
-		fmt_OSC.methods.split = our_split;
-		fmt_OSC.methods.prepare = our_prepare;
-		fmt_OSC.params.algorithm_name = pDynamic_4->params.algorithm_name;
+		get_ptr();
+		pDynamic_4->methods.init(pDynamic_4);
 		self->private.initialized = 1;
 	}
 }
@@ -175,18 +200,10 @@ static void osc_init(struct fmt_main *self)
 static void get_ptr() {
 	if (!pDynamic_4) {
 		pDynamic_4 = dynamic_THIN_FORMAT_LINK(&fmt_OSC, Convert(Conv_Buf, osc_tests[0].ciphertext), "osc", 0);
-		fmt_OSC.methods.salt   = our_salt;
-		fmt_OSC.methods.binary = our_binary;
-		fmt_OSC.methods.split = our_split;
-		fmt_OSC.methods.prepare = our_prepare;
+		link_funcs();
 	}
 }
 
-/**
- * GNU Emacs settings: K&R with 1 tab indent.
- * Local Variables:
- * c-file-style: "k&r"
- * c-basic-offset: 8
- * indent-tabs-mode: t
- * End:
- */
+#endif /* plugin stanza */
+
+#endif /* DYNAMIC_DISABLED */

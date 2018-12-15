@@ -1,6 +1,6 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 1996-2001,2005,2010-2012 by Solar Designer
+ * Copyright (c) 1996-2001,2005,2010-2012,2017 by Solar Designer
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted.
@@ -8,6 +8,7 @@
  * There's ABSOLUTELY NO WARRANTY, express or implied.
  */
 
+#include <stdint.h>
 #include <string.h>
 
 #include "arch.h"
@@ -20,6 +21,8 @@
 
 #define FORMAT_LABEL			"LM"
 #define FORMAT_NAME			""
+#define FORMAT_TAG			"$LM$"
+#define FORMAT_TAG_LEN			(sizeof(FORMAT_TAG)-1)
 
 #define BENCHMARK_COMMENT		""
 #define BENCHMARK_LENGTH		-1
@@ -30,22 +33,24 @@
 #define LM_EMPTY			"aad3b435b51404ee"
 
 static struct fmt_tests tests[] = {
-	{"$LM$a9c604d244c4e99d", "AAAAAA"},
+	{"$LM$a9c604d244c4e99d", "aaaaaa"},
 	{"$LM$cbc501a4d2227783", "AAAAAAA"},
 	{"$LM$3466c2b0487fe39a", "CRACKPO"},
-	{"$LM$dbc5e5cba8028091", "IMPUNIT"},
+	{"$LM$dbc5e5cba8028091", "impunit"},
 	{LM_EMPTY LM_EMPTY, ""},
 	{"$LM$73cc402bd3e79175", "SCLEROS"},
 	{"$LM$5ecd9236d21095ce", "YOKOHAM"},
 	{"$LM$A5E6066DE61C3E35", "ZZZZZZZ"}, /* uppercase encoding */
 	{"$LM$1FB363feB834C12D", "ZZZZZZ"}, /* mixed case encoding */
+	{"$LM$fea4ab7d7b7d0452", "0688648"},
+
 	{NULL}
 };
 
 #define ALGORITHM_NAME			DES_BS_ALGORITHM_NAME
 
-#define BINARY_SIZE			(sizeof(ARCH_WORD_32) * 2)
-#define BINARY_ALIGN			sizeof(ARCH_WORD_32)
+#define BINARY_SIZE			(sizeof(uint32_t) * 2)
+#define BINARY_ALIGN			sizeof(uint32_t)
 #define SALT_SIZE			0
 #define SALT_ALIGN			1
 
@@ -87,9 +92,9 @@ static int valid(char *ciphertext, struct fmt_main *self)
 			return 1;
 	}
 
-	if (strncmp(ciphertext, "$LM$", 4)) return 0;
+	if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN)) return 0;
 
-	for (pos = &ciphertext[4]; atoi16[ARCH_INDEX(*pos)] != 0x7F; pos++);
+	for (pos = &ciphertext[FORMAT_TAG_LEN]; atoi16[ARCH_INDEX(*pos)] != 0x7F; pos++);
 	if (*pos || pos - ciphertext != 20) return 0;
 
 	return 1;
@@ -101,29 +106,24 @@ static char *split(char *ciphertext, int index, struct fmt_main *self)
 
 /* We don't just "return ciphertext" for already split hashes since we may
  * need to convert hashes stored by older versions of John to all-lowercase. */
-	if (!strncmp(ciphertext, "$LM$", 4))
-		ciphertext += 4;
+	if (!strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN))
+		ciphertext += FORMAT_TAG_LEN;
 
-	out[0] = '$';
-	out[1] = 'L';
-	out[2] = 'M';
-	out[3] = '$';
+	memcpy(out, FORMAT_TAG, FORMAT_TAG_LEN);
 
 	if (index)
-		memcpy(&out[4], &ciphertext[16], 16);
+		memcpylwr(&out[FORMAT_TAG_LEN], &ciphertext[16], 16);
 	else
-		memcpy(&out[4], ciphertext, 16);
+		memcpylwr(&out[FORMAT_TAG_LEN], ciphertext, 16);
 
 	out[20] = 0;
-
-	strlwr(&out[4]);
 
 	return out;
 }
 
 static void *binary(char *ciphertext)
 {
-	return DES_bs_get_binary_LM(ciphertext + 4);
+	return DES_bs_get_binary_LM(ciphertext + FORMAT_TAG_LEN);
 }
 
 static char *source(char *source, void *binary)
@@ -133,42 +133,42 @@ static char *source(char *source, void *binary)
 
 static int binary_hash_0(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & 0xF;
+	return *(uint32_t *)binary & PH_MASK_0;
 }
 
 static int binary_hash_1(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & 0xFF;
+	return *(uint32_t *)binary & PH_MASK_1;
 }
 
 static int binary_hash_2(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & 0xFFF;
+	return *(uint32_t *)binary & PH_MASK_2;
 }
 
 static int binary_hash_3(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & 0xFFFF;
+	return *(uint32_t *)binary & PH_MASK_3;
 }
 
 static int binary_hash_4(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & 0xFFFFF;
+	return *(uint32_t *)binary & PH_MASK_4;
 }
 
 static int binary_hash_5(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & 0xFFFFFF;
+	return *(uint32_t *)binary & PH_MASK_5;
 }
 
 static int binary_hash_6(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & 0x7FFFFFF;
+	return *(uint32_t *)binary & PH_MASK_6;
 }
 
 static int cmp_one(void *binary, int index)
 {
-	return DES_bs_cmp_one((ARCH_WORD_32 *)binary, 64, index);
+	return DES_bs_cmp_one((uint32_t *)binary, 64, index);
 }
 
 static int cmp_exact(char *source, int index)
@@ -202,6 +202,7 @@ struct fmt_main fmt_LM = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
 		BINARY_ALIGN,
@@ -209,13 +210,16 @@ struct fmt_main fmt_LM = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
+/*
+ * Do not add FAST_FORMATS_OMP checks to LM, because its use of OpenMP is in
+ * code shared with other formats.
+ */
 #if DES_bs_mt
 		FMT_OMP | FMT_OMP_BAD |
 #endif
-		FMT_8_BIT | FMT_BS | FMT_SPLIT_UNIFIES_CASE,
-#if FMT_MAIN_VERSION > 11
+		FMT_8_BIT | FMT_TRUNC | FMT_BS | FMT_SPLIT_UNIFIES_CASE,
 		{ NULL },
-#endif
+		{ FORMAT_TAG },
 		tests
 	}, {
 		init,
@@ -226,9 +230,7 @@ struct fmt_main fmt_LM = {
 		split,
 		binary,
 		fmt_default_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		source,
 		{
 			binary_hash_0,
@@ -240,6 +242,7 @@ struct fmt_main fmt_LM = {
 			binary_hash_6
 		},
 		fmt_default_salt_hash,
+		NULL,
 		fmt_default_set_salt,
 		DES_bs_set_key_LM,
 		get_key,

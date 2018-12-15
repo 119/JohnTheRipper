@@ -10,6 +10,7 @@
  * There's ABSOLUTELY NO WARRANTY, express or implied.
  */
 
+#include "arch.h"
 #if defined (__MINGW32__) || defined (_MSC_VER)
 #include <conio.h>
 #else
@@ -17,8 +18,12 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#if !AC_BUILT || HAVE_TERMIOS_H
 #include <termios.h>
+#endif
+#if (!AC_BUILT || HAVE_UNISTD_H) && !_MSC_VER
 #include <unistd.h>
+#endif
 #include <stdlib.h>
 #else
 #include <bios.h>
@@ -28,13 +33,9 @@
 #define O_NONBLOCK			O_NDELAY
 #endif
 
-#ifdef __CYGWIN32__
+#ifdef __CYGWIN__
 #include <string.h>
 #include <sys/socket.h>
-#ifndef __CYGWIN__
-extern int tcgetattr(int fd, struct termios *termios_p);
-extern int tcsetattr(int fd, int actions, struct termios *termios_p);
-#endif
 #endif
 #endif /* !defined __MINGW32__ */
 
@@ -46,7 +47,7 @@ static int tty_fd = -1;
 static struct termios saved_ti;
 #endif
 
-void tty_init(int stdin_mode)
+void tty_init(opt_flags stdin_mode)
 {
 #if !defined(__DJGPP__) && !defined(__MINGW32__) && !defined (_MSC_VER)
 	int fd;
@@ -65,11 +66,9 @@ void tty_init(int stdin_mode)
 
 	if ((fd = open("/dev/tty", O_RDONLY | O_NONBLOCK)) < 0) return;
 
-#ifndef __CYGWIN32__
 	if (tcgetpgrp(fd) != getpid()) {
 		close(fd); return;
 	}
-#endif
 
 	tcgetattr(fd, &ti);
 	saved_ti = ti;
@@ -88,13 +87,13 @@ int tty_getchar(void)
 {
 #if !defined(__DJGPP__) && !defined(__MINGW32__) && !defined (_MSC_VER)
 	int c;
-#if defined (__NOT_NEEDED_ANY_MORE___) && defined (__CYGWIN32__)
+#if defined (__NOT_NEEDED_ANY_MORE___) && defined (__CYGWIN__)
 	fd_set set;
 	struct timeval tv;
 #endif
 
 	if (tty_fd >= 0) {
-#if defined (__NOT_NEEDED_ANY_MORE___) && defined (__CYGWIN32__)
+#if defined (__NOT_NEEDED_ANY_MORE___) && defined (__CYGWIN__)
 #error "Should NOT get here"
 		FD_ZERO(&set); FD_SET(tty_fd, &set);
 		tv.tv_sec = 0; tv.tv_usec = 0;

@@ -1,6 +1,6 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 1996-2006,2010-2013 by Solar Designer
+ * Copyright (c) 1996-2006,2010-2013,2015 by Solar Designer
  *
  * ...with changes in the jumbo patch, by JoMo-Kun and magnum
  */
@@ -27,28 +27,28 @@
 #include "external.h"
 #include "cracker.h"
 #include "john.h"
-#include "options.h"
 #include "unicode.h"
+#include "mask.h"
+#include "regex.h"
 #include "memdbg.h"
 
 extern struct fmt_main fmt_LM;
-extern struct fmt_main fmt_NETLM;
-extern struct fmt_main fmt_NETHALFLM;
 
 static double cand;
 
 static double get_progress(void)
 {
-	double try;
+	uint64_t mask_mult = mask_tot_cand ? mask_tot_cand : 1;
+	uint64_t factors = crk_stacked_rule_count * mask_mult;
+	uint64_t keyspace = cand * factors;
+	uint64_t pos = status.cands;
 
 	emms();
 
 	if (!cand)
 		return -1;
 
-	try = ((unsigned long long)status.cands.hi << 32) + status.cands.lo;
-
-	return 100.0 * try / cand;
+	return 100.0 * pos / keyspace;
 }
 
 typedef char (*char2_table)
@@ -59,12 +59,21 @@ typedef char (*chars_table)
 static unsigned int rec_entry, rec_length;
 static unsigned char rec_numbers[CHARSET_LENGTH];
 
+static unsigned int hybrid_rec_entry, hybrid_rec_length;
+static unsigned char hybrid_rec_numbers[CHARSET_LENGTH];
+
 static unsigned int entry, length;
 static unsigned char numbers[CHARSET_LENGTH];
 static int counts[CHARSET_LENGTH][CHARSET_LENGTH];
 
 static unsigned int real_count, real_minc, real_min, real_max, real_size;
 static unsigned char real_chars[CHARSET_SIZE];
+
+#if HAVE_REXGEN
+static char *regex_alpha;
+static int regex_case;
+static char *regex;
+#endif
 
 static void save_state(FILE *file)
 {
@@ -101,9 +110,23 @@ static int restore_state(FILE *file)
 
 static void fix_state(void)
 {
+	if (hybrid_rec_entry || hybrid_rec_length) {
+		rec_entry = hybrid_rec_entry;
+		rec_length = hybrid_rec_length;
+		memcpy(rec_numbers, hybrid_rec_numbers, hybrid_rec_length);
+		hybrid_rec_entry = hybrid_rec_length = 0;
+		return;
+	}
 	rec_entry = entry;
 	rec_length = length;
 	memcpy(rec_numbers, numbers, length);
+}
+
+void inc_hybrid_fix_state(void)
+{
+	hybrid_rec_entry = entry;
+	hybrid_rec_length = length;
+	memcpy(hybrid_rec_numbers, numbers, length);
 }
 
 static void inc_format_error(char *charset)
@@ -134,6 +157,18 @@ static int is_mixedcase(char *chars)
 	return 0;
 }
 
+static int has_8bit(char *chars)
+{
+	char *ptr, c;
+
+	ptr = chars;
+	while ((c = *ptr++))
+		if (c & 0x80)
+			return 1;
+
+	return 0;
+}
+
 static void inc_new_length(unsigned int length,
 	struct charset_header *header, FILE *file, char *charset,
 	char *char1, char2_table char2, chars_table *chars)
@@ -143,7 +178,7 @@ static void inc_new_length(unsigned int length,
 	char *buffer;
 	int count;
 
-	if (options.verbosity > 2)
+	if (options.verbosity >= VERB_DEFAULT)
 	log_event("- Switching to length %d", length + 1);
 
 	char1[0] = 0;
@@ -285,7 +320,7 @@ static void inc_new_count(unsigned int length, int count, char *charset,
 	int size;
 	int error;
 
-	if (options.verbosity > 2)
+	if (options.verbosity >= VERB_DEFAULT)
 	log_event("- Expanding tables for length %d to character count %d",
 	    length + 1, count + 1);
 
@@ -322,7 +357,7 @@ static void inc_new_count(unsigned int length, int count, char *charset,
 		inc_format_error(charset);
 }
 
-static int inc_key_loop(int length, int fixed, int count,
+static int inc_key_loop(struct db_main *db, int length, int fixed, int count,
 	char *char1, char2_table char2, chars_table *chars)
 {
 	char key_i[PLAINTEXT_BUFFER_SIZE];
@@ -369,6 +404,23 @@ update_last:
 	}
 
 	key = key_i;
+#if HAVE_REXGEN
+	if (regex) {
+		if (do_regex_hybrid_crack(db, regex, key,
+		                          regex_case, regex_alpha))
+			return 1;
+		inc_hybrid_fix_state();
+	} else
+#endif
+	if (f_new) {
+		if (do_external_hybrid_crack(db, key))
+			return 1;
+		inc_hybrid_fix_state();
+	} else
+	if (options.mask) {
+		if (do_mask_crack(key))
+			return 1;
+	} else
 	if (!f_filter || ext_filter_body(key_i, key = key_e))
 		if (crk_process_key(key))
 			return 1;
@@ -413,6 +465,7 @@ void do_incremental_crack(struct db_main *db, char *mode)
 	unsigned int fixed, count;
 	int last_length, last_count;
 	int pos;
+	int our_fmt_len = db->format->params.plaintext_length;
 
 	if (!mode) {
 		if (db->format == &fmt_LM) {
@@ -420,12 +473,13 @@ void do_incremental_crack(struct db_main *db, char *mode)
 			                           "DefaultIncrementalLM")))
 				mode = "LM_ASCII";
 		} else if (db->format->params.label &&
-		           (!strcmp(db->format->params.label, "netlm") ||
-		            !strcmp(db->format->params.label, "nethalflm"))) {
+		           (!strcasecmp(db->format->params.label, "lm-opencl") ||
+		            !strcasecmp(db->format->params.label, "netlm") ||
+		            !strcasecmp(db->format->params.label, "nethalflm"))) {
 			if (!(mode = cfg_get_param(SECTION_OPTIONS, NULL,
 			                           "DefaultIncrementalLM")))
 				mode = "LM_ASCII";
-		} else if (pers_opts.target_enc == UTF_8) {
+		} else if (options.target_enc == UTF_8) {
 			if (!(mode = cfg_get_param(SECTION_OPTIONS, NULL,
 			                           "DefaultIncrementalUTF8")))
 				mode = "ASCII";
@@ -439,8 +493,20 @@ void do_incremental_crack(struct db_main *db, char *mode)
 
 	log_event("Proceeding with \"incremental\" mode: %.100s", mode);
 
+	if ((options.flags & FLG_BATCH_CHK || rec_restored) && john_main_process) {
+		fprintf(stderr, "Proceeding with incremental:%s", mode);
+		if (options.mask)
+			fprintf(stderr, ", hybrid mask:%s", options.mask);
+		if (options.rule_stack)
+			fprintf(stderr, ", rules-stack:%s", options.rule_stack);
+		if (options.req_minlength >= 0 || options.req_maxlength)
+			fprintf(stderr, ", lengths:%d-%d", options.eff_minlength,
+			        options.eff_maxlength);
+		fprintf(stderr, "\n");
+	}
+
 	if (!(charset = cfg_get_param(SECTION_INC, mode, "File"))) {
-		if(cfg_get_section(SECTION_INC, mode) == NULL) {
+		if (cfg_get_section(SECTION_INC, mode) == NULL) {
 			log_event("! Unknown incremental mode: %s", mode);
 			if (john_main_process)
 				fprintf(stderr, "Unknown incremental mode: %s\n",
@@ -462,24 +528,60 @@ void do_incremental_crack(struct db_main *db, char *mode)
 		min_length = 0;
 	if ((max_length = cfg_get_int(SECTION_INC, mode, "MaxLen")) < 0)
 		max_length = CHARSET_LENGTH;
-	max_count = cfg_get_int(SECTION_INC, mode, "CharCount");
+	max_count = options.charcount ?
+		options.charcount : cfg_get_int(SECTION_INC, mode, "CharCount");
 
-	/* Command-line can over-ride lengths from config file */
-	if (options.force_minlength >= 0)
-		min_length = options.force_minlength;
-	if (options.force_maxlength)
-		max_length = options.force_maxlength;
+	/* Hybrid mask */
+	our_fmt_len -= mask_add_len;
+	if (mask_num_qw > 1)
+		our_fmt_len /= mask_num_qw;
+
+#if HAVE_REXGEN
+	/* Hybrid regex */
+	if ((regex = prepare_regex(options.regex, &regex_case, &regex_alpha))) {
+		if (our_fmt_len)
+			our_fmt_len--;
+	}
+#endif
+
+	/* Format's min length or -min-len option can override config */
+	if (options.req_minlength >= 0 ||
+	    options.eff_minlength > min_length) {
+		min_length = options.eff_minlength;
+
+#if HAVE_REXGEN
+		if (regex)
+			min_length--;
+#endif
+		if (min_length < 0)
+			min_length = 0;
+	}
+
+	if (options.req_maxlength) {
+		max_length = options.eff_maxlength;
+#if HAVE_REXGEN
+		if (regex)
+			max_length--;
+#endif
+	}
+
+	if (options.req_minlength >= 0 && !options.req_maxlength &&
+	    min_length > max_length &&
+	    options.eff_minlength <= CHARSET_LENGTH) {
+		max_length = min_length;
+	}
 
 	if (min_length > max_length) {
 		log_event("! MinLen = %d exceeds MaxLen = %d",
 		    min_length, max_length);
 		if (john_main_process)
-			fprintf(stderr, "MinLen = %d exceeds MaxLen = %d\n",
-			    min_length, max_length);
+			fprintf(stderr, "MinLen = %d exceeds MaxLen = %d; "
+			    "MaxLen can be increased up to %d\n",
+			    min_length, max_length, CHARSET_LENGTH);
 		error();
 	}
 
-	if (min_length > db->format->params.plaintext_length) {
+	if (min_length > our_fmt_len) {
 		log_event("! MinLen = %d is too large for this hash type",
 		    min_length);
 		if (john_main_process)
@@ -490,14 +592,15 @@ void do_incremental_crack(struct db_main *db, char *mode)
 		error();
 	}
 
-	if (max_length > db->format->params.plaintext_length) {
+	if (max_length > our_fmt_len) {
 		log_event("! MaxLen = %d is too large for this hash type",
 		    max_length);
 		if (john_main_process)
 			fprintf(stderr, "Warning: MaxLen = %d is too large "
 			    "for the current hash type, reduced to %d\n",
-			    max_length, db->format->params.plaintext_length);
-		max_length = db->format->params.plaintext_length;
+			    max_length,
+			    our_fmt_len);
+		max_length = our_fmt_len;
 	}
 
 	if (max_length > CHARSET_LENGTH) {
@@ -613,7 +716,7 @@ void do_incremental_crack(struct db_main *db, char *mode)
 	}
 
 	for (pos = min_length; pos <= max_length; pos++)
-		cand += pow(real_count, pos);
+		cand += pow(MIN(real_count, max_count), pos);
 	if (options.node_count)
 		cand *= (double)(options.node_max - options.node_min + 1) /
 			options.node_count;
@@ -626,6 +729,14 @@ void do_incremental_crack(struct db_main *db, char *mode)
 			    "but the current hash type is case-insensitive;\n"
 			    "some candidate passwords may be unnecessarily "
 			    "tried more than once.\n");
+	}
+
+	if (!(db->format->params.flags & FMT_8_BIT) && has_8bit(allchars)) {
+		log_event("! 8-bit charset, but the hash type is 7-bit");
+		if (john_main_process)
+			fprintf(stderr, "Warning: 8-bit charset, but the current"
+			    " hash type is 7-bit;\n"
+			    "some candidate passwords may be redundant.\n");
 	}
 
 	char2 = NULL;
@@ -732,7 +843,26 @@ void do_incremental_crack(struct db_main *db, char *mode)
 
 		if (!length && !min_length) {
 			min_length = 1;
-			if (!skip && crk_process_key(""))
+#if HAVE_REXGEN
+			if (regex) {
+				if (!skip && do_regex_hybrid_crack(db, regex,
+				                                   fmt_null_key,
+				                                   regex_case,
+				                                   regex_alpha))
+					break;
+				inc_hybrid_fix_state();
+			} else
+#endif
+			if (f_new) {
+				if (!skip && do_external_hybrid_crack(db, fmt_null_key))
+					break;
+				inc_hybrid_fix_state();
+			} else
+			if (options.mask) {
+				if (!skip && do_mask_crack(fmt_null_key))
+					break;
+			} else
+			if (!skip && crk_process_key(fmt_null_key))
 				break;
 		}
 
@@ -750,18 +880,21 @@ void do_incremental_crack(struct db_main *db, char *mode)
 		if (skip)
 			continue;
 
-		if (options.verbosity > 2)
+		if (options.verbosity >= VERB_DEFAULT)
 		log_event("- Trying length %d, fixed @%d, character count %d",
 		    length + 1, fixed + 1, counts[length][fixed] + 1);
 
-		if (inc_key_loop(length, fixed, count, char1, char2, chars))
+		if (inc_key_loop(db, length, fixed, count, char1, char2, chars))
 			break;
 	}
 
 	// For reporting DONE despite poor node distribution
-	if (!event_abort)
-		cand = ((unsigned long long)status.cands.hi << 32) +
-			status.cands.lo;
+	if (!event_abort) {
+		unsigned long long mask_mult =
+			mask_tot_cand ? mask_tot_cand : 1;
+
+		cand = status.cands / mask_mult;
+	}
 
 	crk_done();
 	rec_done(event_abort);

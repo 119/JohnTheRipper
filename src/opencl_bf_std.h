@@ -8,24 +8,8 @@
 
 #include "arch.h"
 #include "common.h"
-#include "common-opencl.h"
-
-typedef unsigned int BF_word ;
-
-/*
- * Binary salt type, also keeps the number of rounds and hash sub-type.
- */
-typedef struct {
-	BF_word salt[4] ;
-	unsigned char rounds ;
-	char subtype ;
-} BF_salt ;
-
-/*
- * Binary ciphertext type.
- */
-typedef BF_word BF_binary[6] ;
-
+#include "opencl_common.h"
+#include "BF_common.h"
 
 /*
  * MULTIPLIER:      Increase keys per crypt using this parameter.
@@ -49,7 +33,7 @@ typedef BF_word BF_binary[6] ;
 #define NUM_CHANNELS                    1
 #define WAVEFRONT_SIZE                  1
 #define CHANNEL_INTERLEAVE              (WAVEFRONT_SIZE*NUM_CHANNELS)
-#define MULTIPLIER                      1024
+#define MULTIPLIER                      4096
 #define BF_N				(CHANNEL_INTERLEAVE*MULTIPLIER)
 #define MAX_DEVICES_PER_PLATFORM        8
 #define GWS_CONFIG		        "bf_GWS"
@@ -58,11 +42,6 @@ typedef BF_word BF_binary[6] ;
  * BF_std_crypt() output buffer.
  */
 extern BF_binary *opencl_BF_out ;
-
-/*
- * ASCII to binary conversion table, for use in BF_fmt.valid().
- */
-extern unsigned char opencl_BF_atoi64[0x80] ;
 
 /*
  * Sets a key for BF_std_crypt().
@@ -79,16 +58,6 @@ extern void opencl_BF_std_crypt(BF_salt *salt, int n) ;
  * Calculates the rest of BF_out, for exact comparison.
  */
 extern void opencl_BF_std_crypt_exact(int index) ;
-
-/*
- * Returns the salt for BF_std_crypt().
- */
-extern void *opencl_BF_std_get_salt(char *ciphertext) ;
-
-/*
- * Converts an ASCII ciphertext to binary.
- */
-extern void *opencl_BF_std_get_binary(char *ciphertext) ;
 
 /*
  * Select a device: BF_select_device(platform_id,device_id)

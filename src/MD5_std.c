@@ -17,6 +17,7 @@
 #include "arch.h"
 #include "common.h"
 #include "MD5_std.h"
+#include "md5crypt_common.h"
 
 #if MD5_std_mt
 #include <omp.h>
@@ -246,7 +247,8 @@ static const MD5_data MD5_data_init = {
  */
 #define F(x, y, z)			((z) ^ ((x) & ((y) ^ (z))))
 #define G(x, y, z)			((y) ^ ((z) & ((x) ^ (y))))
-#define H(x, y, z)			((x) ^ (y) ^ (z))
+#define H(x, y, z)			(((x) ^ (y)) ^ (z))
+#define H2(x, y, z)			((x) ^ ((y) ^ (z)))
 #define I(x, y, z)			((y) ^ ((x) | ~(z)))
 
 /*
@@ -272,6 +274,11 @@ static const MD5_data MD5_data_init = {
 
 #define HH(a, b, c, d, x, s, ac) \
 	(a) += H ((b), (c), (d)) + (x) + (ac); \
+	ROTATE_LEFT ((a), (s)); \
+	(a) += (b);
+
+#define HH2(a, b, c, d, x, s, ac) \
+	(a) += H2 ((b), (c), (d)) + (x) + (ac); \
 	ROTATE_LEFT ((a), (s)); \
 	(a) += (b);
 
@@ -411,11 +418,11 @@ void MD5_std_set_salt(char *salt)
 #endif
 
 	if (salt[8] == MD5_TYPE_STD) {
-		prefix = "$1$";
-		prelen = 3;
+		prefix = md5_salt_prefix;
+		prelen = md5_salt_prefix_len;
 	} else if (salt[8] == MD5_TYPE_APACHE) {
-		prefix = "$apr1$";
-		prelen = 6;
+		prefix = apr1_salt_prefix;
+		prelen = apr1_salt_prefix_len;
 	} else if (salt[8] == MD5_TYPE_AIX) {
 		prefix = "";
 		prelen = 0;
@@ -542,22 +549,22 @@ MAYBE_INLINE_BODY void MD5_body(MD5_word x[15], MD5_word out[4])
 
 /* Round 3 */
 	HH (a, b, c, d, x[ 5], S31, AC33);		/* 33 */
-	HH (d, a, b, c, x[ 8], S32, AC34);		/* 34 */
+	HH2 (d, a, b, c, x[ 8], S32, AC34);		/* 34 */
 	HH (c, d, a, b, x[11], S33, AC35);		/* 35 */
-	HH (b, c, d, a, x[14], S34, AC36);		/* 36 */
+	HH2 (b, c, d, a, x[14], S34, AC36);		/* 36 */
 	HH (a, b, c, d, x[ 1], S31, AC37);		/* 37 */
-	HH (d, a, b, c, x[ 4], S32, AC38);		/* 38 */
+	HH2 (d, a, b, c, x[ 4], S32, AC38);		/* 38 */
 	HH (c, d, a, b, x[ 7], S33, AC39);		/* 39 */
-	HH (b, c, d, a, x[10], S34, AC40);		/* 40 */
+	HH2 (b, c, d, a, x[10], S34, AC40);		/* 40 */
 	HH (a, b, c, d, x[13], S31, AC41);		/* 41 */
-	HH (d, a, b, c, x[ 0], S32, AC42);		/* 42 */
+	HH2 (d, a, b, c, x[ 0], S32, AC42);		/* 42 */
 	HH (c, d, a, b, x[ 3], S33, AC43);		/* 43 */
-	HH (b, c, d, a, x[ 6], S34, AC44);		/* 44 */
+	HH2 (b, c, d, a, x[ 6], S34, AC44);		/* 44 */
 	HH (a, b, c, d, x[ 9], S31, AC45);		/* 45 */
-	HH (d, a, b, c, x[12], S32, AC46);		/* 46 */
+	HH2 (d, a, b, c, x[12], S32, AC46);		/* 46 */
 	c += H (d, a, b) + AC47;
 	ROTATE_LEFT (c, S33); c += d;			/* 47 */
-	HH (b, c, d, a, x[ 2], S34, AC48);		/* 48 */
+	HH2 (b, c, d, a, x[ 2], S34, AC48);		/* 48 */
 
 /* Round 4 */
 	II (a, b, c, d, x[ 0], S41, AC49);		/* 49 */
@@ -986,16 +993,16 @@ char *MD5_std_get_salt(char *ciphertext)
 	char *p, *q;
 	int i;
 
-	if (!strncmp(ciphertext, "$apr1$", 6)) {
+	if (!strncmp(ciphertext, apr1_salt_prefix, apr1_salt_prefix_len)) {
 		out[8] = MD5_TYPE_APACHE;
-		p = ciphertext + 6;
+		p = ciphertext + apr1_salt_prefix_len;
 	} else
-	if (!strncmp(ciphertext, "{smd5}", 6)) {
+	if (!strncmp(ciphertext, smd5_salt_prefix, smd5_salt_prefix_len)) {
 		out[8] = MD5_TYPE_AIX;
-		p = ciphertext + 6;
+		p = ciphertext + smd5_salt_prefix_len;
 	} else {
 		out[8] = MD5_TYPE_STD;
-		p = ciphertext + 3;
+		p = ciphertext + md5_salt_prefix_len;
 	}
 	q = out;
 	for (i = 0; *p != '$' && i < 8; i++)
@@ -1026,10 +1033,10 @@ MD5_word *MD5_std_get_binary(char *ciphertext)
 	char *pos;
 	MD5_word value;
 
-	pos = ciphertext + 3;
-	if (!strncmp(ciphertext, "$apr1$", 6) ||
-	    !strncmp(ciphertext, "{smd5}", 6))
-		pos = ciphertext + 6;
+	pos = ciphertext + md5_salt_prefix_len;
+	if (!strncmp(ciphertext, apr1_salt_prefix, apr1_salt_prefix_len) ||
+	    !strncmp(ciphertext, smd5_salt_prefix, smd5_salt_prefix_len))
+		pos = ciphertext + apr1_salt_prefix_len;
 
 	while (*pos++ != '$');
 

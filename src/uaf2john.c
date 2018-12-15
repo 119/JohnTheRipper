@@ -80,9 +80,12 @@
 #include <starlet.h>
 #include <lib$routines.h>
 #include <uaidef.h>
-#endif
-#ifndef UAI$M_PWDMIX
-#define UAI$M_PWDMIX 0
+#define UAIsM_PWDMIX UAI$M_PWDMIX
+#else
+/*
+ * Emulate symbols defined for VMS services.
+ */
+#define UAIsM_PWDMIX 0
 #endif
 
 #include "uaf_encode.h"
@@ -127,7 +130,7 @@ int uaf_extract_from_raw(void *rec_vp, int rec_len,
 	 * Fill in acct struct.
 	 */
 	for (i = 0; (i < 31) && (rec->username[i] != ' '); i++) {
-		acct->username[i] = toupper(rec->username[i]);
+		acct->username[i] = toupper(((unsigned char)(rec->username[i])));
 	}
 	acct->username[i] = '\0';
 	if (i > 12) {
@@ -164,6 +167,10 @@ int uaf_extract_from_raw(void *rec_vp, int rec_len,
 		acct->home_dir[i] = rec->defdev.s[i];
 	devlen = i;
 	len = rec->defdir.len;
+	if (len + devlen > sizeof(acct->home_dir)) {
+		*acct_status = "invalid defdir length";
+		return 0;
+	}
 	for (i = 0; i < len; i++)
 		acct->home_dir[i + devlen] = rec->defdir.s[i];
 	acct->home_dir[len + devlen] = '\0';
@@ -172,11 +179,11 @@ int uaf_extract_from_raw(void *rec_vp, int rec_len,
 	 */
 	memcpy(pwd, rec->pwd, 8);	/* assume hash is first member */
 	pwd->flags = rec->flagbits;
-	if ((pwd->flags & UAI$M_PWDMIX) && !rec->flags.pwdmix)
+	if ((pwd->flags & UAIsM_PWDMIX) && !rec->flags.pwdmix)
 		printf("Bugcheck, pwdmix bitfield definition wrong: %d\n",
 		    rec->flags.pwdmix);
 	if (rec->flags.pwdmix)
-		pwd->flags |= UAI$M_PWDMIX;
+		pwd->flags |= UAIsM_PWDMIX;
 	pwd->salt = rec->salt;
 	pwd->alg = rec->encrypt;
 	pwd->opt = rec->flags.pwdmix;
@@ -186,7 +193,7 @@ int uaf_extract_from_raw(void *rec_vp, int rec_len,
 	memcpy(pwd2, rec->pwd2, 8);	/* assume hash is first member */
 	pwd2->flags = 0;
 	if (rec->flags.pwdmix)
-		pwd2->flags |= UAI$M_PWDMIX;
+		pwd2->flags |= UAIsM_PWDMIX;
 	pwd2->salt = rec->salt;
 	pwd2->alg = rec->encrypt;
 	pwd2->opt = rec->flags.pwdmix;
@@ -311,7 +318,8 @@ static void process_file(char *infile)
 		rawf = (FILE *) 0;
 	}
 	if (!listf && !rawf) {
-		fprintf(stderr, "File open failue on '%s'\n", infile);
+		fprintf(stderr, "File open failure on '%s'\n", infile);
+		if (rawf) fclose(rawf);
 		return;
 	}
 
@@ -400,7 +408,7 @@ static void process_file(char *infile)
 			    acct.uic[0],
 			    acct.uic[1],
 			    colon_blow(acct.owner),
-			    (pwd.flags & UAI$M_PWDMIX) ? "Users" : "USERS",
+			    (pwd.flags & UAIsM_PWDMIX) ? "Users" : "USERS",
 			    prefix[0] ? "/" : "", prefix, priv_summary,
 			    colon_blow(acct.shell));
 			if (suffix[0] == '.') {
@@ -414,16 +422,17 @@ static void process_file(char *infile)
 				    acct.uic[0], acct.uic[1],
 				    colon_blow(acct.owner),
 				    (pwd.
-					flags & UAI$M_PWDMIX) ? "Users" :
+					flags & UAIsM_PWDMIX) ? "Users" :
 				    "USERS", prefix[0] ? "/" : "", prefix,
 				    priv_summary, colon_blow(acct.shell));
 			}
 		} else {
 			fprintf(stderr, "Error fetching UAF information, %s\n", prefix);
-			return;
+			goto bailout;
 		}
 	}
 
+bailout:
 	if (is_raw)
 		fclose(rawf);
 	else
@@ -431,7 +440,18 @@ static void process_file(char *infile)
 
 }
 
+#ifdef HAVE_LIBFUZZER
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	return 0;
+}
+#endif
+
+#ifdef HAVE_LIBFUZZER
+int main_dummy(int argc, char **argv)
+#else
 int main(int argc, char **argv)
+#endif
 {
 	int i;
 

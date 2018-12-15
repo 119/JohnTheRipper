@@ -1,19 +1,24 @@
-/* AIX smd5 cracker patch for JtR. Hacked together during April of 2013 by Dhiru
+/*
+ * AIX smd5 cracker patch for JtR. Hacked together during April of 2013 by Dhiru
  * Kholia <dhiru at openwall.com>.
  *
  * This software is Copyright (c) 2013 Dhiru Kholia <dhiru at openwall.com> and
  * it is hereby released to the general public under the following terms:
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted.
  */
 
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_smd5;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_smd5);
+#else
+
 #include <string.h>
-#include <assert.h>
-#include <errno.h>
+
 #ifdef _OPENMP
-static int omp_t = 1;
 #include <omp.h>
-#define OMP_SCALE               16 // tuned on i7 w/HT
 #endif
 
 #include "md5.h"
@@ -25,18 +30,26 @@ static int omp_t = 1;
 #include "options.h"
 #include "memdbg.h"
 
-#define FORMAT_LABEL		"aix-smd5"
-#define FORMAT_NAME		"AIX LPA {smd5} (modified crypt-md5)"
-#define ALGORITHM_NAME		"MD5 32/" ARCH_BITS_STR
-#define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	-1
-#define PLAINTEXT_LENGTH	125
-#define BINARY_SIZE		16
-#define BINARY_ALIGN			4
-#define SALT_SIZE		sizeof(struct custom_salt)
-#define SALT_ALIGN			sizeof(int)
-#define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	1
+#define FORMAT_LABEL            "aix-smd5"
+#define FORMAT_NAME             "AIX LPA {smd5} (modified crypt-md5)"
+#define FORMAT_TAG              "{smd5}"
+#define FORMAT_TAG1             "$1$"
+#define FORMAT_TAG_LEN          (sizeof(FORMAT_TAG)-1)
+#define FORMAT_TAG1_LEN         (sizeof(FORMAT_TAG1)-1)
+#define ALGORITHM_NAME          "MD5 32/" ARCH_BITS_STR
+#define BENCHMARK_COMMENT       ""
+#define BENCHMARK_LENGTH        -1
+#define PLAINTEXT_LENGTH        125
+#define BINARY_SIZE             16
+#define BINARY_ALIGN            4
+#define SALT_SIZE               sizeof(struct custom_salt)
+#define SALT_ALIGN              sizeof(int)
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      4
+
+#ifndef OMP_SCALE
+#define OMP_SCALE               2 // Tuned w/ MKPC for core i7
+#endif
 
 static struct fmt_tests smd5_tests[] = {
 	/* following hashes are AIX non-standard smd5 hashes */
@@ -52,7 +65,7 @@ static struct fmt_tests smd5_tests[] = {
 };
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE / sizeof(uint32_t)];
 
 static struct custom_salt {
 	int is_standard;
@@ -61,15 +74,18 @@ static struct custom_salt {
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
-	saved_key = mem_calloc_tiny(sizeof(*saved_key) *
-			self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	crypt_out = mem_calloc_tiny(sizeof(*crypt_out) * self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
+	omp_autotune(self, OMP_SCALE);
+
+	saved_key = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*saved_key));
+	crypt_out = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*crypt_out));
+}
+
+static void done(void)
+{
+	MEM_FREE(crypt_out);
+	MEM_FREE(saved_key);
 }
 
 static int valid(char *ciphertext, struct fmt_main *self)
@@ -77,23 +93,23 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	char *p;
 	char *ctcopy;
 	char *keeptr;
-	if (strncmp(ciphertext, "{smd5}", 6) != 0 &&
-		strncmp(ciphertext, "$1$", 3))
+	if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN) != 0 &&
+		strncmp(ciphertext, FORMAT_TAG1, FORMAT_TAG1_LEN))
 		return 0;
 
 	ctcopy = strdup(ciphertext);
 	keeptr = ctcopy;
 
-	if (!strncmp(ciphertext, "{smd5}", 6))
-		ctcopy += 6;
+	if (!strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN))
+		ctcopy += FORMAT_TAG_LEN;
 	else
-		ctcopy += 3;
+		ctcopy += FORMAT_TAG1_LEN;
 
-	if ((p = strtok(ctcopy, "$")) == NULL)	/* salt */
+	if ((p = strtokm(ctcopy, "$")) == NULL)	/* salt */
 		goto err;
 	if (strlen(p) != 8)
 		goto err;
-	if ((p = strtok(NULL, "$")) == NULL)	/* hash */
+	if ((p = strtokm(NULL, "$")) == NULL)	/* hash */
 		goto err;
 	MEM_FREE(keeptr);
 	return 1;
@@ -108,30 +124,33 @@ static void *get_salt(char *ciphertext)
 	char *keeptr = ctcopy;
 	char *p;
 	static struct custom_salt cs;
+
+	memset(&cs, 0, sizeof(cs));
 	keeptr = ctcopy;
-	if (!strncmp(ciphertext, "{smd5}", 6)) {
-		ctcopy += 6;
+	if (!strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN)) {
+		ctcopy += FORMAT_TAG_LEN;
 		cs.is_standard = 0;
 	}
 	else {
-		ctcopy += 3;
+		ctcopy += FORMAT_TAG1_LEN;
 		cs.is_standard = 1;
 	}
 
-	p = strtok(ctcopy, "$");
+	p = strtokm(ctcopy, "$");
 	strncpy((char*)cs.salt, p, 9);
-	p = strtok(NULL, "$");
+	p = strtokm(NULL, "$");
 
 	MEM_FREE(keeptr);
+
 	return (void *)&cs;
 }
 
 #define TO_BINARY(b1, b2, b3) \
 	value = \
-		(ARCH_WORD_32)atoi64[ARCH_INDEX(pos[0])] | \
-		((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[1])] << 6) | \
-		((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[2])] << 12) | \
-		((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[3])] << 18); \
+		(uint32_t)atoi64[ARCH_INDEX(pos[0])] | \
+		((uint32_t)atoi64[ARCH_INDEX(pos[1])] << 6) | \
+		((uint32_t)atoi64[ARCH_INDEX(pos[2])] << 12) | \
+		((uint32_t)atoi64[ARCH_INDEX(pos[3])] << 18); \
 	pos += 4; \
 	out.b[b1] = value >> 16; \
 	out.b[b2] = value >> 8; \
@@ -144,11 +163,12 @@ static void* get_binary(char *ciphertext)
 		ARCH_WORD w;
 	} out;
 	char *pos;
-	ARCH_WORD_32 value;
+	uint32_t value;
 
-	pos = ciphertext + 3;
-	if (!strncmp(ciphertext, "{smd5}", 6))
-		pos = ciphertext + 6;
+	if (!strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN))
+		pos = ciphertext + FORMAT_TAG_LEN;
+	else
+		pos = ciphertext + FORMAT_TAG1_LEN;
 
 	while (*pos++ != '$');
 
@@ -158,19 +178,14 @@ static void* get_binary(char *ciphertext)
 	TO_BINARY(3, 9, 15);
 	TO_BINARY(4, 10, 5);
 	out.b[11] =
-		(ARCH_WORD_32)atoi64[ARCH_INDEX(pos[0])] |
-		((ARCH_WORD_32)atoi64[ARCH_INDEX(pos[1])] << 6);
+		(uint32_t)atoi64[ARCH_INDEX(pos[0])] |
+		((uint32_t)atoi64[ARCH_INDEX(pos[1])] << 6);
 
 	return out.b;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & 0xf; }
-static int get_hash_1(int index) { return crypt_out[index][0] & 0xff; }
-static int get_hash_2(int index) { return crypt_out[index][0] & 0xfff; }
-static int get_hash_3(int index) { return crypt_out[index][0] & 0xffff; }
-static int get_hash_4(int index) { return crypt_out[index][0] & 0xfffff; }
-static int get_hash_5(int index) { return crypt_out[index][0] & 0xffffff; }
-static int get_hash_6(int index) { return crypt_out[index][0] & 0x7ffffff; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static void set_salt(void *salt)
 {
@@ -293,26 +308,25 @@ static void crypt_md5(char *pw, char *salt, int is_standard, char *passwd)
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
-	int index = 0;
+	const int count = *pcount;
+	int index;
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		crypt_md5(saved_key[index], (char*)cur_salt->salt, cur_salt->is_standard, (char *)crypt_out[index]);
 	}
+
 	return count;
 }
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#ifdef _OPENMP
-	for (; index < count; index++)
-#endif
-		if (!memcmp(binary, crypt_out[index], BINARY_SIZE))
+	int index;
+
+	for (index = 0; index < count; index++)
+		if (!memcmp(binary, crypt_out[index], ARCH_SIZE))
 			return 1;
 	return 0;
 }
@@ -329,16 +343,17 @@ static int cmp_exact(char *source, int index)
 
 static void smd5_set_key(char *key, int index)
 {
-	int saved_key_length = strlen(key);
-	if (saved_key_length > PLAINTEXT_LENGTH)
-		saved_key_length = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, saved_key_length);
-	saved_key[index][saved_key_length] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
 {
 	return saved_key[index];
+}
+
+static int salt_hash(void *salt)
+{
+	return *(unsigned int*)salt & (SALT_HASH_SIZE - 1);
 }
 
 struct fmt_main fmt_smd5 = {
@@ -348,6 +363,7 @@ struct fmt_main fmt_smd5 = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
 		BINARY_ALIGN,
@@ -356,22 +372,19 @@ struct fmt_main fmt_smd5 = {
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
+		{ FORMAT_TAG, FORMAT_TAG1 },
 		smd5_tests
 	}, {
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		fmt_default_prepare,
 		valid,
 		fmt_default_split,
 		get_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash_0,
@@ -382,23 +395,21 @@ struct fmt_main fmt_smd5 = {
 			fmt_default_binary_hash_5,
 			fmt_default_binary_hash_6
 		},
-		fmt_default_salt_hash,
+		salt_hash,
+		NULL,
 		set_salt,
 		smd5_set_key,
 		get_key,
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

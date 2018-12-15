@@ -1,9 +1,9 @@
-/* MYSQL_half_fmt.c
+/*
+ * MYSQL_half_fmt.c
  *
  * Copyright (c) 2008 by <earthquake at rycon.hu>
  *
  * John the ripper MYSQL-fast module
- *
  *
  * Note: The mysql hash's first 8byte is relevant,
  * the another ones depends on the first 8. Maybe
@@ -18,20 +18,38 @@
  * OpenMP support and other assorted hacks by Solar Designer
  */
 
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_MYSQL_fast;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_MYSQL_fast);
+#else
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "arch.h"
+#if !FAST_FORMATS_OMP
+#undef _OPENMP
+#endif
 #ifdef _OPENMP
 #include <omp.h>
-#define OMP_SCALE			10240
 #endif
 
-#include "arch.h"
 #include "misc.h"
 #include "common.h"
 #include "formats.h"
 #include "memdbg.h"
+
+#ifdef __MIC__
+#ifndef OMP_SCALE
+#define OMP_SCALE			2048
+#endif
+#else
+#ifndef OMP_SCALE
+#define OMP_SCALE			16 // This and MKPC tuned for core i7
+#endif
+#endif
 
 #define FORMAT_LABEL			"mysql"
 #define FORMAT_NAME			"MySQL pre-4.1"
@@ -45,9 +63,11 @@
 
 #define BINARY_SIZE			4
 #define SALT_SIZE			0
+#define BINARY_ALIGN		sizeof(uint32_t)
+#define SALT_ALIGN			1
 
 #define MIN_KEYS_PER_CRYPT		1
-#define MAX_KEYS_PER_CRYPT		64
+#define MAX_KEYS_PER_CRYPT		512
 
 static struct fmt_tests tests[] = {
 	// ciphertext, plaintext
@@ -65,31 +85,35 @@ static struct fmt_tests tests[] = {
 	{"28ff8d49159ffbaf", "http://violating.us"},
 	{"5d2e19393cc5ef67", "password"},
 	{"5030573512345671", ""},
+	{"723d80f65bf9d670", "UPPERCASE"},
 	{NULL}
 };
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_key)[BINARY_SIZE / 4];
+static uint32_t (*crypt_key)[BINARY_SIZE / 4];
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	int omp_t = omp_get_max_threads();
-	if (omp_t > 1) {
-		self->params.min_keys_per_crypt *= omp_t;
-		omp_t *= OMP_SCALE;
-		self->params.max_keys_per_crypt *= omp_t;
-	}
-#endif
-	saved_key = mem_alloc_tiny(sizeof(*saved_key) * self->params.max_keys_per_crypt, MEM_ALIGN_CACHE);
-	crypt_key = mem_alloc_tiny(sizeof(*crypt_key) * self->params.max_keys_per_crypt, MEM_ALIGN_CACHE);
+
+	omp_autotune(self, OMP_SCALE);
+
+	saved_key = mem_calloc(self->params.max_keys_per_crypt,
+	                      sizeof(*saved_key));
+	crypt_key = mem_calloc(self->params.max_keys_per_crypt,
+	                      sizeof(*crypt_key));
+}
+
+static void done(void)
+{
+	MEM_FREE(crypt_key);
+	MEM_FREE(saved_key);
 }
 
 static int valid(char* ciphertext, struct fmt_main *self)
 {
 	unsigned int i;
 
-	if (strlen(ciphertext) != CIPHERTEXT_LENGTH)
+	if (strnlen(ciphertext, CIPHERTEXT_LENGTH + 1) != CIPHERTEXT_LENGTH)
 		return 0;
 
 	for (i = 0; i < CIPHERTEXT_LENGTH; i++)
@@ -113,7 +137,7 @@ static char *split(char *ciphertext, int index, struct fmt_main *self)
 static void *get_binary_size(char *ciphertext, int size)
 {
 	/* maybe bigger than BINARY_SIZE for use from cmp_exact() */
-	static ARCH_WORD_32 buff_[8];
+	static uint32_t buff_[8];
 	unsigned char *buff = (unsigned char *)buff_;
 	unsigned int i;
 
@@ -135,7 +159,7 @@ static void *get_binary(char *ciphertext)
 
 static void set_key(char* key, int index)
 {
-	strnzcpy(saved_key[index], key, PLAINTEXT_LENGTH + 1);
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char* get_key(int index)
@@ -145,7 +169,7 @@ static char* get_key(int index)
 
 static int cmp_one(void* binary, int index)
 {
-	return *(ARCH_WORD_32 *)binary == crypt_key[index][0];
+	return *(uint32_t *)binary == crypt_key[index][0];
 }
 
 static int cmp_all(void* binary, int count)
@@ -156,13 +180,13 @@ static int cmp_all(void* binary, int count)
 	int retval = 0;
 #pragma omp parallel for default(none) private(i) shared(count, binary, crypt_key, retval)
 	for (i = 0; i < count; i++)
-		if (*(ARCH_WORD_32 *)binary == crypt_key[i][0])
-#pragma omp critical
-			retval = 1;
+		if (*(uint32_t *)binary == crypt_key[i][0])
+#pragma omp atomic
+			retval |= 1;
 	return retval;
 #else
 	for (i = 0; i < count; i++)
-		if (*(ARCH_WORD_32 *)binary == crypt_key[i][0])
+		if (*(uint32_t *)binary == crypt_key[i][0])
 			return 1;
 	return 0;
 #endif
@@ -170,8 +194,9 @@ static int cmp_all(void* binary, int count)
 
 static int cmp_exact(char* source, int index)
 {
-	register ARCH_WORD_32 nr = 1345345333, add = 7, nr2 = 0x12345671;
-	register ARCH_WORD_32 tmp;
+	uint32_t *binary = get_binary_size(source, 8);
+	register uint32_t nr = 1345345333, add = 7, nr2 = 0x12345671;
+	register uint32_t tmp;
 	unsigned char *p;
 
 	p = (unsigned char *)saved_key[index];
@@ -179,26 +204,15 @@ static int cmp_exact(char* source, int index)
 		if (*p == ' ' || *p == '\t')
 			continue;
 
-		tmp = (ARCH_WORD_32)*p;
+		tmp = (uint32_t)*p;
 		nr ^= (((nr & 63) + add) * tmp) + (nr << 8);
 		nr2 += (nr2 << 8) ^ nr;
 		add += tmp;
 	}
 
-#if 0
-	{
-		char ctmp[CIPHERTEXT_LENGTH + 1];
-		sprintf(ctmp, "%08x%08x", nr & (((ARCH_WORD_32)1 << 31) - 1), nr2 & (((ARCH_WORD_32)1 << 31) - 1));
-		return !memcmp(source, ctmp, CIPHERTEXT_LENGTH);
-	}
-#else
-	{
-		ARCH_WORD_32 *binary = get_binary_size(source, 8);
-		return
-		    binary[0] == (nr & (((ARCH_WORD_32)1 << 31) - 1)) &&
-		    binary[1] == (nr2 & (((ARCH_WORD_32)1 << 31) - 1));
-	}
-#endif
+	return
+		binary[0] == (nr & (((uint32_t)1 << 31) - 1)) &&
+		binary[1] == (nr2 & (((uint32_t)1 << 31) - 1));
 }
 
 static int crypt_all(int *pcount, struct db_salt *salt)
@@ -211,63 +225,32 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 #endif
 	for (i = 0; i < count; i++) {
 		unsigned char *p = (unsigned char *)saved_key[i];
+
 		if (*p) {
-			ARCH_WORD_32 nr, add;
-			ARCH_WORD_32 tmp;
+			uint32_t nr, add;
+			uint32_t tmp;
 			while (*p == ' ' || *p == '\t')
 				p++;
-			tmp = (ARCH_WORD_32) (unsigned char) *p++;
+			tmp = (uint32_t) (unsigned char) *p++;
 			nr = 1345345333 ^ ((((1345345333 & 63) + 7) * tmp) + (1345345333U << 8));
 			add = 7 + tmp;
 			for (; *p; p++) {
 				if (*p == ' ' || *p == '\t')
 					continue;
-				tmp = (ARCH_WORD_32) (unsigned char) *p;
+				tmp = (uint32_t) (unsigned char) *p;
 				nr ^= (((nr & 63) + add) * tmp) + (nr << 8);
 				add += tmp;
 			}
-			crypt_key[i][0] = (nr & (((ARCH_WORD_32)1 << 31) - 1));
+			crypt_key[i][0] = (nr & (((uint32_t)1 << 31) - 1));
 			continue;
 		}
-		crypt_key[i][0] = (1345345333 & (((ARCH_WORD_32)1 << 31) - 1));
+		crypt_key[i][0] = (1345345333 & (((uint32_t)1 << 31) - 1));
 	}
 	return count;
 }
 
-static int get_hash_0(int index)
-{
-	return crypt_key[index][0] & 0xF;
-}
-
-static int get_hash_1(int index)
-{
-	return crypt_key[index][0] & 0xFF;
-}
-
-static int get_hash_2(int index)
-{
-	return crypt_key[index][0] & 0xFFF;
-}
-
-static int get_hash_3(int index)
-{
-	return crypt_key[index][0] & 0xFFFF;
-}
-
-static int get_hash_4(int index)
-{
-	return crypt_key[index][0] & 0xFFFFF;
-}
-
-static int get_hash_5(int index)
-{
-	return crypt_key[index][0] & 0xFFFFFF;
-}
-
-static int get_hash_6(int index)
-{
-	return crypt_key[index][0] & 0x7FFFFFF;
-}
+#define COMMON_GET_HASH_VAR crypt_key
+#include "common-get-hash.h"
 
 struct fmt_main fmt_MYSQL_fast =
 {
@@ -277,30 +260,31 @@ struct fmt_main fmt_MYSQL_fast =
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
-		DEFAULT_ALIGN,
+		BINARY_ALIGN,
 		SALT_SIZE,
-		DEFAULT_ALIGN,
+		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
-		{ NULL },
+#ifdef _OPENMP
+		FMT_OMP | FMT_OMP_BAD |
 #endif
+		FMT_CASE | FMT_8_BIT | FMT_SPLIT_UNIFIES_CASE,
+		{ NULL },
+		{ NULL },
 		tests
 	}, {
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		fmt_default_prepare,
 		valid,
 		split,
 		get_binary,
 		fmt_default_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash_0,
@@ -312,22 +296,20 @@ struct fmt_main fmt_MYSQL_fast =
 			fmt_default_binary_hash_6
 		},
 		fmt_default_salt_hash,
+		NULL,
 		fmt_default_set_salt,
 		set_key,
 		get_key,
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

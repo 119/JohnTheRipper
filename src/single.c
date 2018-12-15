@@ -5,6 +5,9 @@
  * ...with changes in the jumbo patch, by magnum & JimF.
  */
 
+#define NEED_OS_FORK
+#include "os.h"
+
 #include <stdio.h>
 #include <string.h>
 
@@ -12,7 +15,6 @@
 #include "params.h"
 #include "common.h"
 #include "memory.h"
-#include "os.h" /* Needed for signals.h */
 #include "signals.h"
 #include "loader.h"
 #include "logger.h"
@@ -26,7 +28,11 @@
 #include "john.h"
 #include "unicode.h"
 #include "config.h"
+#include "opencl_common.h"
 #include "memdbg.h"
+
+/* List with optional global words to add for every salt */
+struct list_main *single_seed;
 
 static double progress = 0;
 static int rec_rule;
@@ -38,6 +44,17 @@ static struct db_keys *guessed_keys;
 static struct rpp_context *rule_ctx;
 
 static int words_pair_max;
+static int retest_guessed;
+static int orig_max_len, orig_min_kpc;
+static int stacked_rule_count = 1;
+static rule_stack single_rule_stack;
+
+#if HAVE_OPENCL || HAVE_ZTEX
+static int acc_fmt, prio_resume;
+#if HAVE_OPENCL
+static int ocl_fmt;
+#endif /* HAVE_OPENCL */
+#endif /* HAVE_OPENCL || HAVE_ZTEX */
 
 static void save_state(FILE *file)
 {
@@ -62,10 +79,24 @@ static int restore_state(FILE *file)
 
 static double get_progress(void)
 {
+	uint64_t tot_rules = rule_count * stacked_rule_count;
+	uint64_t tot_rule_number =
+		(rules_stacked_number - 1) * rule_count + rule_number;
+
 	emms();
 
 	return progress ? progress :
-		(double)rule_number / (rule_count + 1) * 100.0;
+		(double)tot_rule_number / (tot_rules + 1) * 100.0;
+}
+
+static uint64_t calc_buf_size(int length, int min_kpc)
+{
+	uint64_t res = sizeof(struct db_keys_hash) +
+		sizeof(struct db_keys_hash_entry) * (min_kpc - 1);
+
+	res += (sizeof(struct db_keys) - 1 + length * min_kpc);
+
+	return res * single_db->salt_count;
 }
 
 static void single_alloc_keys(struct db_keys **keys)
@@ -84,51 +115,273 @@ static void single_alloc_keys(struct db_keys **keys)
 	(*keys)->ptr = (*keys)->buffer;
 	(*keys)->have_words = 1; /* assume yes; we'll see for real later */
 	(*keys)->rule = rule_number;
+	//if (rules_stacked_after)
+	//	(*keys)->rule2 = rules_stacked_number;
 	(*keys)->lock = 0;
 	memset((*keys)->hash, -1, hash_size);
+}
+
+#undef log2
+#define log2 jtr_log2
+
+static uint32_t log2(uint32_t val)
+{
+	uint32_t res = 0;
+
+	while (val >>= 1)
+		res++;
+
+	return res;
 }
 
 static void single_init(void)
 {
 	struct db_salt *salt;
+	int lim_kpc, max_buffer_GB;
+	uint64_t my_buf_share;
+
+#if HAVE_OPENCL || HAVE_ZTEX
+	prio_resume = cfg_get_bool(SECTION_OPTIONS, NULL, "SinglePrioResume", 0);
+
+	acc_fmt = strcasestr(single_db->format->params.label, "-opencl") ||
+		strcasestr(single_db->format->params.label, "-ztex");
+#endif
+#if HAVE_OPENCL
+	ocl_fmt = acc_fmt && strcasestr(single_db->format->params.label, "-opencl");
+#endif
 
 	log_event("Proceeding with \"single crack\" mode");
+
+	if ((options.flags & FLG_BATCH_CHK || rec_restored) && john_main_process) {
+		fprintf(stderr, "Proceeding with single, rules:");
+		if (options.rule_stack)
+			fprintf(stderr, "(%s x %s)",
+			        options.activewordlistrules, options.rule_stack);
+		else
+			fprintf(stderr, "%s", options.activewordlistrules);
+		if (options.req_minlength >= 0 || options.req_maxlength)
+			fprintf(stderr, ", lengths:%d-%d", options.eff_minlength,
+			        options.eff_maxlength);
+		fprintf(stderr, "\n");
+	}
+
+	retest_guessed = cfg_get_bool(SECTION_OPTIONS, NULL,
+	                              "SingleRetestGuessed", 1);
 
 	if ((words_pair_max = cfg_get_int(SECTION_OPTIONS, NULL,
 	                                  "SingleWordsPairMax")) < 0)
 		words_pair_max = SINGLE_WORDS_PAIR_MAX;
 
+	if ((max_buffer_GB = cfg_get_int(SECTION_OPTIONS, NULL,
+	                                  "SingleMaxBufferSize")) < 0)
+		max_buffer_GB = SINGLE_MAX_WORD_BUFFER;
+
+	my_buf_share = (uint64_t)max_buffer_GB << 30;
+
+#if HAVE_MPI
+	if (mpi_p_local > 1)
+		my_buf_share /= mpi_p_local;
+	else
+#endif
+#if OS_FORK
+	if (options.fork)
+		my_buf_share /= options.fork;
+#endif
+
 	progress = 0;
 
-	length = single_db->format->params.plaintext_length;
-	if (options.force_maxlength && options.force_maxlength < length)
-		length = options.force_maxlength;
+	length = options.eff_maxlength;
 	key_count = single_db->format->params.min_keys_per_crypt;
 	if (key_count < SINGLE_HASH_MIN)
 		key_count = SINGLE_HASH_MIN;
 /*
  * We use "short" for buffered key indices and "unsigned short" for buffered
  * key offsets - make sure these don't overflow.
+ *
+ * Jumbo now uses SINGLE_KEYS_TYPE and SINGLE_KEYS_UTYPE for this,
+ * from params.h, and they are 32-bit for OpenCL and ZTEX builds.
  */
-	if (key_count > 0x8000)
-		key_count = 0x8000;
-	while (key_count > 0xffff / length + 1)
-		key_count >>= 1;
+	if (key_count > SINGLE_IDX_MAX)
+		key_count = SINGLE_IDX_MAX;
+	while (key_count > SINGLE_BUF_MAX / length + 1)
+#if HAVE_OPENCL
+		if (ocl_fmt)
+			key_count -= MIN(key_count >> 1, local_work_size * ocl_v_width);
+		else
+#endif
+			key_count >>= 1;
 
-	if (rpp_init(rule_ctx, pers_opts.activesinglerules)) {
-		log_event("! No \"%s\" mode rules found",
-		          pers_opts.activesinglerules);
+	if (key_count < single_db->format->params.min_keys_per_crypt) {
+		if (john_main_process) {
+			fprintf(stderr,
+"Note: Performance for this format/device may be lower due to single mode\n"
+"      constraints. Format wanted %d keys per crypt but was limited to %d.\n",
+			        single_db->format->params.min_keys_per_crypt,
+			        key_count);
+		}
+		log_event(
+"- Min KPC decreased from %d to %d due to single mode constraints.",
+			single_db->format->params.min_keys_per_crypt,
+			key_count);
+	}
+
+/*
+ * For large salt counts, we need to limit total memory use as well.
+ */
+	lim_kpc = key_count;
+
+	while (key_count >= 2 * SINGLE_HASH_MIN &&
+	       calc_buf_size(length, key_count) > my_buf_share) {
+		if (!options.req_maxlength && length >= 32 &&
+		    (length >> 1) >= options.eff_minlength)
+			length >>= 1;
+		else if (!options.req_maxlength && length > 16 &&
+		         (length - 1) >= options.eff_minlength)
+			length--;
+#if HAVE_OPENCL
+		else if (ocl_fmt)
+			key_count -= MIN(key_count >> 1, local_work_size * ocl_v_width);
+#endif
+		else
+			key_count >>= 1;
+	}
+
+	if (length < options.eff_maxlength) {
 		if (john_main_process)
-			fprintf(stderr, "No \"%s\" mode rules found in %s\n",
-			        pers_opts.activesinglerules, cfg_name);
+			fprintf(stderr,
+"Note: Max. length decreased from %d to %d due to single mode buffer size\n"
+"      limit of %sB. Use --max-length=N option to override, or increase\n"
+"      SingleMaxBufferSize in config (%sB needed).\n",
+			        options.eff_maxlength,
+			        length,
+			        human_prefix(my_buf_share),
+			        human_prefix(calc_buf_size(options.eff_maxlength,
+			                                   key_count)));
+		log_event(
+"- Max. length decreased from %d to %d due to buffer size limit of %sB.",
+			options.eff_maxlength,
+			length,
+			human_prefix(my_buf_share));
+	}
+
+	if (calc_buf_size(length, key_count) > my_buf_share) {
+		if (john_main_process) {
+			fprintf(stderr,
+"Note: Can't run single mode with this many salts due to single mode buffer\n"
+"      size limit of %sB (%d keys per batch would use %sB, decreased to\n"
+"      %d for %sB). To work around this, bump SingleMaxBufferSize in\n"
+"      john.conf (if you have enough RAM) or load fewer salts at a time.\n",
+			        human_prefix(my_buf_share),
+			        lim_kpc,
+			        human_prefix(calc_buf_size(length, lim_kpc)),
+			        key_count,
+			        human_prefix(calc_buf_size(length, key_count)));
+		}
+		if (lim_kpc < single_db->format->params.min_keys_per_crypt)
+			log_event(
+"- Min KPC decreased further to %d (%sB), can't meet buffer size limit of %sB.",
+			key_count,
+			human_prefix(calc_buf_size(length, key_count)),
+			human_prefix(my_buf_share));
+		else
+			log_event(
+"- Min KPC decreased from %d to %d (%sB), can't meet buffer size limit of %sB.",
+			lim_kpc,
+			key_count,
+			human_prefix(calc_buf_size(length, key_count)),
+			human_prefix(my_buf_share));
 		error();
 	}
 
-	rules_init(length);
+	if (key_count < lim_kpc) {
+		if (john_main_process) {
+			fprintf(stderr,
+"Note: Performance for this many salts may be lower due to single mode buffer\n"
+"      size limit of %sB (%d keys per batch would use %sB, decreased to\n"
+"      %d for %sB). To work around this, ",
+			        human_prefix(my_buf_share),
+			        lim_kpc,
+			        human_prefix(calc_buf_size(length, lim_kpc)),
+			        key_count,
+			        human_prefix(calc_buf_size(length, key_count)));
+			if (options.eff_maxlength > 8)
+				fprintf(stderr, "%s --max-length and/or ",
+				        options.req_maxlength ?
+				        "decrease" : "use");
+			fprintf(stderr,
+			        "bump%sSingleMaxBufferSize in config.\n",
+			        options.eff_maxlength > 8 ? "\n      " : " ");
+		}
+		if (lim_kpc < single_db->format->params.min_keys_per_crypt)
+			log_event(
+"- Min KPC decreased further to %d due to buffer size limit of %sB.",
+			key_count,
+			human_prefix(my_buf_share));
+		else
+			log_event(
+"- Min KPC decreased from %d to %d due to buffer size limit of %sB.",
+			lim_kpc,
+			key_count,
+			human_prefix(my_buf_share));
+	}
+
+	if (rpp_init(rule_ctx, options.activesinglerules)) {
+		log_event("! No \"%s\" mode rules found",
+		          options.activesinglerules);
+		if (john_main_process)
+			fprintf(stderr, "No \"%s\" mode rules found in %s\n",
+			        options.activesinglerules, cfg_name);
+		error();
+	}
+
+	/*
+	 * Now set our possibly capped figures as global in order to get
+	 * proper function and less warnings. We reset them in single_done
+	 * for in case we run batch mode
+	 */
+	orig_max_len = options.eff_maxlength;
+	options.eff_maxlength = length;
+	orig_min_kpc = single_db->format->params.min_keys_per_crypt;
+	single_db->format->params.min_keys_per_crypt = key_count;
+
+	if (log2(key_count) > words_pair_max) {
+		words_pair_max = log2(key_count);
+		log_event("- SingleWordsPairMax increased to %d for high KPC (%d)",
+		          log2(key_count), key_count);
+	}
+
+	if (single_seed->count) {
+		words_pair_max += single_seed->count;
+		log_event("- SingleWordsPairMax increased for %d global seed words",
+		          single_seed->count);
+	}
+	log_event("- SingleWordsPairMax used is %d", words_pair_max);
+	log_event("- SingleRetestGuessed = %s",retest_guessed ? "true" : "false");
+	log_event("- SingleMaxBufferSize = %sB%s", human_prefix(my_buf_share),
+#if HAVE_MPI
+	          (mpi_p_local > 1 || options.fork)
+#elif OS_FORK
+	          options.fork
+#else
+	          0
+#endif
+	          ? " (per local process)" : "");
+#if HAVE_OPENCL || HAVE_ZTEX
+	log_event("- SinglePrioResume = %s", prio_resume ?
+	          "Y (prioritize resumability over speed)" :
+	          "N (prioritize speed over resumability)");
+#endif
+
+	rules_init(single_db, length);
 	rec_rule = rule_number = 0;
 	rule_count = rules_count(rule_ctx, 0);
 
-	log_event("- %d preprocessed word mangling rules", rule_count);
+	if (rules_stacked_after)
+		log_event("- Total %u (%d x %u) preprocessed word mangling rules",
+		          rule_count * stacked_rule_count,
+		          rule_count, stacked_rule_count);
+	else
+		log_event("- %d preprocessed word mangling rules", rule_count);
 
 	status_init(get_progress, 0);
 
@@ -141,16 +394,26 @@ static void single_init(void)
 	} while ((salt = salt->next));
 
 	if (key_count > 1)
-	log_event("- Allocated %d buffer%s of %d candidate passwords%s",
-		single_db->salt_count,
-		single_db->salt_count != 1 ? "s" : "",
-		key_count,
-		single_db->salt_count != 1 ? " each" : "");
+		log_event("- Allocated %d buffer%s of %d candidate passwords"
+		          "%s (total %sB)",
+		          single_db->salt_count,
+		          single_db->salt_count != 1 ? "s" : "",
+		          key_count,
+		          single_db->salt_count != 1 ? " each" : "",
+		          human_prefix(calc_buf_size(length, key_count)));
 
 	guessed_keys = NULL;
 	single_alloc_keys(&guessed_keys);
 
 	crk_init(single_db, NULL, guessed_keys);
+
+	stacked_rule_count = rules_init_stack(options.rule_stack,
+	                                      &single_rule_stack, single_db);
+
+	rules_stacked_after = (stacked_rule_count > 0);
+
+	if (!stacked_rule_count)
+		stacked_rule_count = 1;
 }
 
 static MAYBE_INLINE int single_key_hash(char *key)
@@ -201,6 +464,10 @@ static int single_add_key(struct db_salt *salt, char *key, int is_from_guesses)
 	struct db_keys *keys = salt->keys;
 	int index, new_hash, reuse_hash;
 	struct db_keys_hash_entry *entry;
+
+	if (rules_stacked_after)
+		if (!(key = rules_process_stack(key, &single_rule_stack)))
+			return 0;
 
 /* Check if this is a known duplicate, and reject it if so */
 	if ((index = keys->hash->hash[new_hash = single_key_hash(key)]) >= 0)
@@ -270,6 +537,7 @@ static int single_process_buffer(struct db_salt *salt)
 	keys->ptr = keys->buffer;
 	keys->lock++;
 
+	if (retest_guessed)
 	if (guessed_keys->count) {
 		keys = mem_alloc(size = sizeof(struct db_keys) - 1 +
 			length * guessed_keys->count);
@@ -293,8 +561,10 @@ static int single_process_buffer(struct db_salt *salt)
 
 	keys = salt->keys;
 	keys->lock--;
-	if (!keys->count && !keys->lock)
+	if (!keys->count && !keys->lock) {
 		keys->rule = rule_number;
+		//keys->rule2 = rules_stacked_number;
+	}
 
 	return 0;
 }
@@ -303,6 +573,8 @@ static int single_process_pw(struct db_salt *salt, struct db_password *pw,
 	char *rule)
 {
 	struct list_entry *first, *second;
+	struct list_entry *global_head = single_seed->head;
+	int first_global, second_global;
 	int first_number, second_number;
 	char pair[RULE_WORD_SIZE];
 	int split;
@@ -311,8 +583,10 @@ static int single_process_pw(struct db_salt *salt, struct db_password *pw,
 	if (!(first = pw->words->head))
 		return -1;
 
-	first_number = 0;
+	first_number = first_global = 0;
 	do {
+		if (first == global_head)
+			first_global = 1;
 		if ((key = rules_apply(first->data, rule, 0, NULL)))
 		if (ext_filter(key))
 		if (single_add_key(salt, key, 0))
@@ -328,11 +602,14 @@ static int single_process_pw(struct db_salt *salt, struct db_password *pw,
 		if (!CP_isLetter[(unsigned char)first->data[0]])
 			continue;
 
-		second_number = 0;
+		second_number = second_global = 0;
 		second = pw->words->head;
 
-		do
-		if (first != second) {
+		do {
+			if (second == global_head)
+				second_global = 1;
+			if (first == second || (first_global && second_global))
+				continue;
 			if ((split = strlen(first->data)) < length) {
 				strnzcpy(pair, first->data, RULE_WORD_SIZE);
 				strnzcat(pair, second->data, RULE_WORD_SIZE);
@@ -347,7 +624,7 @@ static int single_process_pw(struct db_salt *salt, struct db_password *pw,
 					return 0;
 			}
 
-			if (first->data[1]) {
+			if (!first_global && first->data[1]) {
 				pair[0] = first->data[0];
 				pair[1] = 0;
 				strnzcat(pair, second->data, RULE_WORD_SIZE);
@@ -403,12 +680,17 @@ next:
 		last = &pw->next;
 	} while ((pw = pw->next));
 
+#if HAVE_OPENCL || HAVE_ZTEX
+	if (!acc_fmt || prio_resume)
+#endif
 	if (keys->count && rule_number - keys->rule > (key_count << 1))
 		if (single_process_buffer(salt))
 			return 1;
 
-	if (!keys->count)
+	if (!keys->count) {
 		keys->rule = rule_number;
+		//keys->rule2 = rules_stacked_number;
+	}
 
 	if (!have_words) {
 		keys->have_words = 0;
@@ -428,72 +710,93 @@ static void single_run(void)
 	int have_words;
 
 	saved_min = rec_rule;
-	while ((prerule = rpp_next(rule_ctx))) {
-		if (options.node_count) {
-			int for_node = rule_number % options.node_count + 1;
-			if (for_node < options.node_min ||
-			    for_node > options.node_max) {
+	rpp_real_run = 1;
+
+	do {
+		while ((prerule = rpp_next(rule_ctx))) {
+			if (options.node_count) {
+				int for_node = rule_number % options.node_count + 1;
+				if (for_node < options.node_min ||
+				    for_node > options.node_max) {
+					rule_number++;
+					continue;
+				}
+			}
+
+			if (!(rule = rules_reject(prerule, 0, NULL, single_db))) {
 				rule_number++;
+				if (options.verbosity >= VERB_DEFAULT &&
+				    !rules_mute &&
+				    strncmp(prerule, "!!", 2))
+					log_event("- Rule #%d: '%.100s' rejected",
+					          rule_number, prerule);
 				continue;
+			}
+
+			if (!rules_mute) {
+				if (strcmp(prerule, rule)) {
+					log_event("- Rule #%d: '%.100s' accepted as '%.100s')",
+					          rule_number + 1, prerule, rule);
+				} else {
+					log_event("- Rule #%d: '%.100s' accepted",
+					          rule_number + 1, prerule);
+				}
+			}
+
+			if (saved_min != rec_rule) {
+				if (!rules_mute)
+					log_event("- Oldest still in use is now rule #%d",
+					          rec_rule + 1);
+				saved_min = rec_rule;
+			}
+
+			have_words = 0;
+
+			min = rule_number;
+
+			/* pot reload might have removed the salt */
+			if (!(salt = single_db->salts))
+				return;
+			do {
+				if (!salt->list)
+					continue;
+				if (single_process_salt(salt, rule))
+					return;
+				if (!salt->keys->have_words)
+					continue;
+				have_words = 1;
+				if (salt->keys->rule < min)
+					min = salt->keys->rule;
+			} while ((salt = salt->next));
+
+			if (event_reload && single_db->salts)
+				crk_reload_pot();
+
+			rec_rule = min;
+			rule_number++;
+
+			if (have_words)
+				continue;
+
+			log_event("- No information to base%s candidate passwords on",
+			          rule_number > 1 ? " further" : "");
+			return;
+		}
+
+		if (rules_stacked_after) {
+			rule_number = 0;
+			rpp_init(rule_ctx, options.activesinglerules);
+			if (!rules_mute && options.verbosity <= VERB_DEFAULT) {
+				rules_mute = 1;
+				if (john_main_process) {
+					log_event(
+"- Some rule logging suppressed. Re-enable with --verbosity=%d or greater",
+					          VERB_LEGACY);
+				}
 			}
 		}
 
-		if (!(rule = rules_reject(prerule, 0, NULL, single_db))) {
-			if (options.verbosity > 2)
-			log_event("- Rule #%d: '%.100s' rejected",
-				++rule_number, prerule);
-			continue;
-		}
-
-		if (strcmp(prerule, rule)) {
-			if (options.verbosity > 2)
-			log_event("- Rule #%d: '%.100s' accepted as '%.100s'",
-				rule_number + 1, prerule, rule);
-		} else {
-			if (options.verbosity > 2)
-			log_event("- Rule #%d: '%.100s' accepted",
-				rule_number + 1, prerule);
-		}
-
-		if (saved_min != rec_rule) {
-			if (options.verbosity > 2)
-			log_event("- Oldest still in use is now rule #%d",
-				rec_rule + 1);
-			saved_min = rec_rule;
-		}
-
-		have_words = 0;
-
-		min = rule_number;
-
-		/* pot reload might have removed the salt */
-		if (!(salt = single_db->salts))
-			return;
-		do {
-			if (!salt->list)
-				continue;
-			if (single_process_salt(salt, rule))
-				return;
-			if (!salt->keys->have_words)
-				continue;
-			have_words = 1;
-			if (salt->keys->rule < min)
-				min = salt->keys->rule;
-		} while ((salt = salt->next));
-
-		if (event_reload && single_db->salts)
-			crk_reload_pot();
-
-		rec_rule = min;
-		rule_number++;
-
-		if (have_words)
-			continue;
-
-		log_event("- No information to base%s candidate passwords on",
-			rule_number > 1 ? " further" : "");
-		return;
-	}
+	} while (rules_stacked_after && rules_advance_stack(&single_rule_stack));
 }
 
 static void single_done(void)
@@ -504,6 +807,10 @@ static void single_done(void)
 		if ((salt = single_db->salts)) {
 			log_event("- Processing the remaining buffered "
 				"candidate passwords, if any");
+
+			if (options.verbosity >= VERB_DEFAULT)
+				fprintf(stderr, "Almost done: Processing the remaining "
+				        "buffered candidate passwords, if any\n");
 
 			do {
 				if (!salt->list)
@@ -517,7 +824,11 @@ static void single_done(void)
 		progress = 100;
 	}
 
+	options.eff_maxlength = orig_max_len;
+	single_db->format->params.min_keys_per_crypt = orig_min_kpc;
+
 	rec_done(event_abort || (status.pass && single_db->salts));
+	c_cleanup();
 }
 
 void do_single_crack(struct db_main *db)

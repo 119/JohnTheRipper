@@ -20,7 +20,7 @@
 /*
  * Option flags bitmask type.
  */
-typedef ARCH_WORD_64 opt_flags;
+typedef uint64_t opt_flags;
 
 /*
  * Supported options list entry, the list ends with a NULL name field.
@@ -46,6 +46,10 @@ struct opt_entry {
 
 /* Pointer to buffer where the parameter is to be stored */
 	void *param;
+
+/* Used to detect dupe options without a specific option flag. This is
+ * used only with FLG_NONE and OPT_REQ_PARAM. */
+	int param_set;
 };
 
 /*

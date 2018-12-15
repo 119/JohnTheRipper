@@ -20,6 +20,9 @@
 #define ARCH_BITS_STR			"32"
 #define ARCH_LITTLE_ENDIAN		1
 #define ARCH_INT_GT_32			0
+#endif
+
+#if !defined(ARCH_ALLOWS_UNALIGNED)
 #define ARCH_ALLOWS_UNALIGNED		1
 #endif
 #define ARCH_INDEX(x)			((unsigned int)(unsigned char)(x))
@@ -53,7 +56,9 @@
 
 #ifdef _OPENMP
 #define BF_ASM				0
+#ifndef BF_X2
 #define BF_X2				1
+#endif
 #else
 #define BF_ASM				1
 #define BF_X2				0

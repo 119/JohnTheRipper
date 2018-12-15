@@ -47,7 +47,13 @@
 #ifndef SPH_TYPES_H__
 #define SPH_TYPES_H__
 
+#if AC_BUILT
+#include "autoconfig.h"
+#endif
+
+#if !AC_BUILT || HAVE_LIMITS_H
 #include <limits.h>
+#endif
 #include "arch.h"
 
 /*
@@ -162,7 +168,7 @@
  * computations may be performed in parallel, provided that they do not
  * operate on the same context. Moreover, a running computation can be
  * cloned by copying the context (with a simple <code>memcpy()</code>):
- * the context and its clone are then independant and may be updated
+ * the context and its clone are then independent and may be updated
  * with new data and/or closed without interfering with each other.
  * Similarly, a context structure can be moved in memory at will:
  * context structures contain no pointer, in particular no pointer to
@@ -561,7 +567,7 @@ typedef __arch_dependant__ sph_s64;
 
 /**
  * When defined, this macro indicates that unaligned memory accesses
- * are possible with only a minor penalty, and thus should be prefered
+ * are possible with only a minor penalty, and thus should be preferred
  * over strategies which first copy data to an aligned buffer.
  */
 #define SPH_UNALIGNED
@@ -574,7 +580,7 @@ typedef __arch_dependant__ sph_s64;
  * @param x   the 32-bit value to byte-swap
  * @return  the byte-swapped value
  */
-static inline sph_u32 sph_bswap32(sph_u32 x);
+inline static sph_u32 sph_bswap32(sph_u32 x);
 
 /**
  * Byte-swap a 64-bit word. This is an inline function which resorts
@@ -585,7 +591,7 @@ static inline sph_u32 sph_bswap32(sph_u32 x);
  * @param x   the 64-bit value to byte-swap
  * @return  the byte-swapped value
  */
-static inline sph_u64 sph_bswap64(sph_u64 x);
+inline static sph_u64 sph_bswap64(sph_u64 x);
 
 /**
  * Decode a 16-bit unsigned value from memory, in little-endian convention
@@ -594,7 +600,7 @@ static inline sph_u64 sph_bswap64(sph_u64 x);
  * @param src   the source address
  * @return  the decoded value
  */
-static inline unsigned sph_dec16le(const void *src);
+inline static unsigned sph_dec16le(const void *src);
 
 /**
  * Encode a 16-bit unsigned value into memory, in little-endian convention
@@ -603,7 +609,7 @@ static inline unsigned sph_dec16le(const void *src);
  * @param dst   the destination buffer
  * @param val   the value to encode
  */
-static inline void sph_enc16le(void *dst, unsigned val);
+inline static void sph_enc16le(void *dst, unsigned val);
 
 /**
  * Decode a 16-bit unsigned value from memory, in big-endian convention
@@ -612,7 +618,7 @@ static inline void sph_enc16le(void *dst, unsigned val);
  * @param src   the source address
  * @return  the decoded value
  */
-static inline unsigned sph_dec16be(const void *src);
+inline static unsigned sph_dec16be(const void *src);
 
 /**
  * Encode a 16-bit unsigned value into memory, in big-endian convention
@@ -621,7 +627,7 @@ static inline unsigned sph_dec16be(const void *src);
  * @param dst   the destination buffer
  * @param val   the value to encode
  */
-static inline void sph_enc16be(void *dst, unsigned val);
+inline static void sph_enc16be(void *dst, unsigned val);
 
 /**
  * Decode a 32-bit unsigned value from memory, in little-endian convention
@@ -630,7 +636,7 @@ static inline void sph_enc16be(void *dst, unsigned val);
  * @param src   the source address
  * @return  the decoded value
  */
-static inline sph_u32 sph_dec32le(const void *src);
+inline static sph_u32 sph_dec32le(const void *src);
 
 /**
  * Decode a 32-bit unsigned value from memory, in little-endian convention
@@ -642,7 +648,7 @@ static inline sph_u32 sph_dec32le(const void *src);
  * @param src   the source address
  * @return  the decoded value
  */
-static inline sph_u32 sph_dec32le_aligned(const void *src);
+inline static sph_u32 sph_dec32le_aligned(const void *src);
 
 /**
  * Encode a 32-bit unsigned value into memory, in little-endian convention
@@ -651,7 +657,7 @@ static inline sph_u32 sph_dec32le_aligned(const void *src);
  * @param dst   the destination buffer
  * @param val   the value to encode
  */
-static inline void sph_enc32le(void *dst, sph_u32 val);
+inline static void sph_enc32le(void *dst, sph_u32 val);
 
 /**
  * Encode a 32-bit unsigned value into memory, in little-endian convention
@@ -663,7 +669,7 @@ static inline void sph_enc32le(void *dst, sph_u32 val);
  * @param dst   the destination buffer
  * @param val   the value to encode
  */
-static inline void sph_enc32le_aligned(void *dst, sph_u32 val);
+inline static void sph_enc32le_aligned(void *dst, sph_u32 val);
 
 /**
  * Decode a 32-bit unsigned value from memory, in big-endian convention
@@ -672,7 +678,7 @@ static inline void sph_enc32le_aligned(void *dst, sph_u32 val);
  * @param src   the source address
  * @return  the decoded value
  */
-static inline sph_u32 sph_dec32be(const void *src);
+inline static sph_u32 sph_dec32be(const void *src);
 
 /**
  * Decode a 32-bit unsigned value from memory, in big-endian convention
@@ -684,7 +690,7 @@ static inline sph_u32 sph_dec32be(const void *src);
  * @param src   the source address
  * @return  the decoded value
  */
-static inline sph_u32 sph_dec32be_aligned(const void *src);
+inline static sph_u32 sph_dec32be_aligned(const void *src);
 
 /**
  * Encode a 32-bit unsigned value into memory, in big-endian convention
@@ -693,7 +699,7 @@ static inline sph_u32 sph_dec32be_aligned(const void *src);
  * @param dst   the destination buffer
  * @param val   the value to encode
  */
-static inline void sph_enc32be(void *dst, sph_u32 val);
+inline static void sph_enc32be(void *dst, sph_u32 val);
 
 /**
  * Encode a 32-bit unsigned value into memory, in big-endian convention
@@ -705,7 +711,7 @@ static inline void sph_enc32be(void *dst, sph_u32 val);
  * @param dst   the destination buffer
  * @param val   the value to encode
  */
-static inline void sph_enc32be_aligned(void *dst, sph_u32 val);
+inline static void sph_enc32be_aligned(void *dst, sph_u32 val);
 
 /**
  * Decode a 64-bit unsigned value from memory, in little-endian convention
@@ -715,7 +721,7 @@ static inline void sph_enc32be_aligned(void *dst, sph_u32 val);
  * @param src   the source address
  * @return  the decoded value
  */
-static inline sph_u64 sph_dec64le(const void *src);
+inline static sph_u64 sph_dec64le(const void *src);
 
 /**
  * Decode a 64-bit unsigned value from memory, in little-endian convention
@@ -728,7 +734,7 @@ static inline sph_u64 sph_dec64le(const void *src);
  * @param src   the source address
  * @return  the decoded value
  */
-static inline sph_u64 sph_dec64le_aligned(const void *src);
+inline static sph_u64 sph_dec64le_aligned(const void *src);
 
 /**
  * Encode a 64-bit unsigned value into memory, in little-endian convention
@@ -738,7 +744,7 @@ static inline sph_u64 sph_dec64le_aligned(const void *src);
  * @param dst   the destination buffer
  * @param val   the value to encode
  */
-static inline void sph_enc64le(void *dst, sph_u64 val);
+inline static void sph_enc64le(void *dst, sph_u64 val);
 
 /**
  * Encode a 64-bit unsigned value into memory, in little-endian convention
@@ -752,7 +758,7 @@ static inline void sph_enc64le(void *dst, sph_u64 val);
  * @param dst   the destination buffer
  * @param val   the value to encode
  */
-static inline void sph_enc64le_aligned(void *dst, sph_u64 val);
+inline static void sph_enc64le_aligned(void *dst, sph_u64 val);
 
 /**
  * Decode a 64-bit unsigned value from memory, in big-endian convention
@@ -762,7 +768,7 @@ static inline void sph_enc64le_aligned(void *dst, sph_u64 val);
  * @param src   the source address
  * @return  the decoded value
  */
-static inline sph_u64 sph_dec64be(const void *src);
+inline static sph_u64 sph_dec64be(const void *src);
 
 /**
  * Decode a 64-bit unsigned value from memory, in big-endian convention
@@ -775,7 +781,7 @@ static inline sph_u64 sph_dec64be(const void *src);
  * @param src   the source address
  * @return  the decoded value
  */
-static inline sph_u64 sph_dec64be_aligned(const void *src);
+inline static sph_u64 sph_dec64be_aligned(const void *src);
 
 /**
  * Encode a 64-bit unsigned value into memory, in big-endian convention
@@ -785,7 +791,7 @@ static inline sph_u64 sph_dec64be_aligned(const void *src);
  * @param dst   the destination buffer
  * @param val   the value to encode
  */
-static inline void sph_enc64be(void *dst, sph_u64 val);
+inline static void sph_enc64be(void *dst, sph_u64 val);
 
 /**
  * Encode a 64-bit unsigned value into memory, in big-endian convention
@@ -799,7 +805,7 @@ static inline void sph_enc64be(void *dst, sph_u64 val);
  * @param dst   the destination buffer
  * @param val   the value to encode
  */
-static inline void sph_enc64be_aligned(void *dst, sph_u64 val);
+inline static void sph_enc64be_aligned(void *dst, sph_u64 val);
 
 #endif
 
@@ -1573,7 +1579,7 @@ sph_dec32le(const void *src)
  * For most hash functions, using this inline assembly trick changes
  * hashing speed by less than 5% and often _reduces_ it. The biggest
  * gains are for MD4 (+11%) and CubeHash (+30%). For all others, it is
- * less then 10%. The speed gain on CubeHash is probably due to the
+ * less than 10%. The speed gain on CubeHash is probably due to the
  * chronic shortage of registers that CubeHash endures; for the other
  * functions, the generic code appears to be efficient enough already.
  *

@@ -17,6 +17,7 @@
 #include <io.h>
 #include <windows.h>
 #include <sys/types.h>
+#include "memdbg.h"
 
 #define PROT_READ     0x1
 #define PROT_WRITE    0x2
@@ -35,11 +36,11 @@
 #define MAP_FAILED    ((void *) -1)
 
 #ifdef __USE_FILE_OFFSET64
-# define DWORD_HI(x) (x >> 32)
-# define DWORD_LO(x) ((x) & 0xffffffff)
+ #define DWORD_HI(x) (x >> 32)
+ #define DWORD_LO(x) ((x) & 0xffffffff)
 #else
-# define DWORD_HI(x) (0)
-# define DWORD_LO(x) (x)
+ #define DWORD_HI(x) (0)
+ #define DWORD_LO(x) (x)
 #endif
 
 static void *mmap(void *start, size_t length, int prot, int flags, int fd, off_t offset)
@@ -76,12 +77,12 @@ static void *mmap(void *start, size_t length, int prot, int flags, int fd, off_t
 		mmap_fd = INVALID_HANDLE_VALUE;
 	else
 		mmap_fd = (HANDLE)_get_osfhandle(fd);
-	//h = CreateFileMapping(mmap_fd, NULL, flProtect, DWORD_HI(end), DWORD_LO(end), NULL);
-	h = CreateFileMapping(mmap_fd, NULL, flProtect, 0, 0, NULL);
+	h = CreateFileMapping(mmap_fd, NULL, flProtect, DWORD_HI(end), DWORD_LO(end), NULL);
+	//h = CreateFileMapping(mmap_fd, NULL, flProtect, 0, 0, NULL);
 	if (h == NULL) {
         /* we will log this at some time, once I know PROPER fixes */
 		DWORD x = GetLastError();
-		fprintf(stderr, "Error, CreateFileMapping failed, Error code %x\n", x);
+		fprintf(stderr, "Error, CreateFileMapping failed, Error code %x\n", (unsigned)x);
 		return 0;
 	}
 
@@ -94,12 +95,12 @@ static void *mmap(void *start, size_t length, int prot, int flags, int fd, off_t
 	if (flags & MAP_PRIVATE)
 		dwDesiredAccess |= FILE_MAP_COPY;
 
-	//ret = MapViewOfFile(h, dwDesiredAccess, DWORD_HI(offset), DWORD_LO(offset), length);
-	ret = MapViewOfFile(h, dwDesiredAccess, 0, 0, length);
+	ret = MapViewOfFile(h, dwDesiredAccess, DWORD_HI(offset), DWORD_LO(offset), length);
+	//ret = MapViewOfFile(h, dwDesiredAccess, 0, 0, length);
 	if (ret == NULL)  {
 		/* we will log this at some time, once I know PROPER fixes */
 		DWORD x = GetLastError();
-		fprintf(stderr, "Error, MapViewOfFile failed, Error code %x\n", x);
+		fprintf(stderr, "Error, MapViewOfFile failed, Error code %x\n", (unsigned)x);
 		CloseHandle(h);
 		ret = 0;
 	}

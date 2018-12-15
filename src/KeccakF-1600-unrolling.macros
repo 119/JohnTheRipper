@@ -38,11 +38,11 @@ http://creativecommons.org/publicdomain/zero/1.0/
     thetaRhoPiChiIotaPrepareTheta(21, E, A) \
     thetaRhoPiChiIotaPrepareTheta(22, A, E) \
     thetaRhoPiChiIota(23, E, A) \
-    copyToState(state, A)
+
 #elif (Unrolling == 12)
 #define rounds \
     prepareTheta \
-    for(i=0; i<24; i+=12) { \
+    for (i=0; i<24; i+=12) { \
         thetaRhoPiChiIotaPrepareTheta(i   , A, E) \
         thetaRhoPiChiIotaPrepareTheta(i+ 1, E, A) \
         thetaRhoPiChiIotaPrepareTheta(i+ 2, A, E) \
@@ -56,11 +56,11 @@ http://creativecommons.org/publicdomain/zero/1.0/
         thetaRhoPiChiIotaPrepareTheta(i+10, A, E) \
         thetaRhoPiChiIotaPrepareTheta(i+11, E, A) \
     } \
-    copyToState(state, A)
+
 #elif (Unrolling == 8)
 #define rounds \
     prepareTheta \
-    for(i=0; i<24; i+=8) { \
+    for (i=0; i<24; i+=8) { \
         thetaRhoPiChiIotaPrepareTheta(i  , A, E) \
         thetaRhoPiChiIotaPrepareTheta(i+1, E, A) \
         thetaRhoPiChiIotaPrepareTheta(i+2, A, E) \
@@ -70,11 +70,11 @@ http://creativecommons.org/publicdomain/zero/1.0/
         thetaRhoPiChiIotaPrepareTheta(i+6, A, E) \
         thetaRhoPiChiIotaPrepareTheta(i+7, E, A) \
     } \
-    copyToState(state, A)
+
 #elif (Unrolling == 6)
 #define rounds \
     prepareTheta \
-    for(i=0; i<24; i+=6) { \
+    for (i=0; i<24; i+=6) { \
         thetaRhoPiChiIotaPrepareTheta(i  , A, E) \
         thetaRhoPiChiIotaPrepareTheta(i+1, E, A) \
         thetaRhoPiChiIotaPrepareTheta(i+2, A, E) \
@@ -82,43 +82,43 @@ http://creativecommons.org/publicdomain/zero/1.0/
         thetaRhoPiChiIotaPrepareTheta(i+4, A, E) \
         thetaRhoPiChiIotaPrepareTheta(i+5, E, A) \
     } \
-    copyToState(state, A)
+
 #elif (Unrolling == 4)
 #define rounds \
     prepareTheta \
-    for(i=0; i<24; i+=4) { \
+    for (i=0; i<24; i+=4) { \
         thetaRhoPiChiIotaPrepareTheta(i  , A, E) \
         thetaRhoPiChiIotaPrepareTheta(i+1, E, A) \
         thetaRhoPiChiIotaPrepareTheta(i+2, A, E) \
         thetaRhoPiChiIotaPrepareTheta(i+3, E, A) \
     } \
-    copyToState(state, A)
+
 #elif (Unrolling == 3)
 #define rounds \
     prepareTheta \
-    for(i=0; i<24; i+=3) { \
+    for (i=0; i<24; i+=3) { \
         thetaRhoPiChiIotaPrepareTheta(i  , A, E) \
         thetaRhoPiChiIotaPrepareTheta(i+1, E, A) \
         thetaRhoPiChiIotaPrepareTheta(i+2, A, E) \
         copyStateVariables(A, E) \
     } \
-    copyToState(state, A)
+
 #elif (Unrolling == 2)
 #define rounds \
     prepareTheta \
-    for(i=0; i<24; i+=2) { \
+    for (i=0; i<24; i+=2) { \
         thetaRhoPiChiIotaPrepareTheta(i  , A, E) \
         thetaRhoPiChiIotaPrepareTheta(i+1, E, A) \
     } \
-    copyToState(state, A)
+
 #elif (Unrolling == 1)
 #define rounds \
     prepareTheta \
-    for(i=0; i<24; i++) { \
+    for (i=0; i<24; i++) { \
         thetaRhoPiChiIotaPrepareTheta(i  , A, E) \
         copyStateVariables(A, E) \
     } \
-    copyToState(state, A)
+
 #else
 #error "Unrolling is not correctly specified!"
 #endif

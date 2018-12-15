@@ -15,18 +15,9 @@
 #define __BLAKE2_H__
 
 #include <stddef.h>
-#include "stdint.h"
-
-#if defined(_MSC_VER)
-#define ALIGN(x) __declspec(align(x))
-#define inline _inline
-#else
-#if !defined(__SSE2__) && !defined(__SSE4_1__) && !defined(__XOP__)
-#define ALIGN(x) __attribute__((aligned(x)))
-#else
-#define ALIGN(x) __attribute__ ((__aligned__(x)))
-#endif
-#endif
+#include <stdint.h>
+#include "aligned.h"
+#include "jumbo.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -50,7 +41,7 @@ extern "C" {
     BLAKE2B_PERSONALBYTES = 16
   };
 
-#pragma pack(push, 1)
+//#pragma pack(push, 1)
   typedef struct __blake2s_param
   {
     uint8_t  digest_length; // 1
@@ -66,7 +57,7 @@ extern "C" {
     uint8_t  personal[BLAKE2S_PERSONALBYTES];  // 32
   } blake2s_param;
 
-  ALIGN( 64 ) typedef struct __blake2s_state
+  JTR_ALIGN( 64 ) typedef struct __blake2s_state
   {
     uint32_t h[8];
     uint32_t t[2];
@@ -91,7 +82,7 @@ extern "C" {
     uint8_t  personal[BLAKE2B_PERSONALBYTES];  // 64
   } blake2b_param;
 
-  ALIGN( 64 ) typedef struct __blake2b_state
+  JTR_ALIGN( 64 ) typedef struct __blake2b_state
   {
     uint64_t h[8];
     uint64_t t[2];
@@ -103,7 +94,7 @@ extern "C" {
 #if !defined(__SSE2__) && !defined(__SSE4_1__) && !defined(__XOP__)
   typedef struct __blake2sp_state
 #else
-  ALIGN( 64 ) typedef struct __blake2sp_state
+  JTR_ALIGN( 64 ) typedef struct __blake2sp_state
 #endif
   {
     blake2s_state S[8][1];
@@ -115,7 +106,7 @@ extern "C" {
 #if !defined(__SSE2__) && !defined(__SSE4_1__) && !defined(__XOP__)
   typedef struct __blake2bp_state
 #else
-  ALIGN( 64 ) typedef struct __blake2bp_state
+  JTR_ALIGN( 64 ) typedef struct __blake2bp_state
 #endif
   {
     blake2b_state S[4][1];
@@ -123,7 +114,7 @@ extern "C" {
     uint8_t buf[4 * BLAKE2B_BLOCKBYTES];
     size_t  buflen;
   } blake2bp_state;
-#pragma pack(pop)
+//#pragma pack(pop)
 
   // Streaming API
   int blake2s_init( blake2s_state *S, const uint8_t outlen );
@@ -155,7 +146,7 @@ extern "C" {
   int blake2sp( uint8_t *out, const void *in, const void *key, const uint8_t outlen, const uint64_t inlen, uint8_t keylen );
   int blake2bp( uint8_t *out, const void *in, const void *key, const uint8_t outlen, const uint64_t inlen, uint8_t keylen );
 
-  static inline int blake2( uint8_t *out, const void *in, const void *key, const uint8_t outlen, const uint64_t inlen, uint8_t keylen )
+  inline static int blake2( uint8_t *out, const void *in, const void *key, const uint8_t outlen, const uint64_t inlen, uint8_t keylen )
   {
     return blake2b( out, in, key, outlen, inlen, keylen );
   }
@@ -165,4 +156,3 @@ extern "C" {
 #endif
 
 #endif
-

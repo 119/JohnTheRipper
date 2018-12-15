@@ -1,6 +1,6 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 1996-99,2003,2005,2009,2010,2012 by Solar Designer
+ * Copyright (c) 1996-99,2003,2005,2009,2010,2015,2016 by Solar Designer
  *
  * With heavy changes in Jumbo, by JimF and magnum
  */
@@ -54,12 +54,35 @@ static const char * const rules_errors[] = {
 static int rules_errno;
 
 /*
+ * Last error code refer to this rule.
+ */
+static const char *rules_err_rule;
+
+/*
+ * Optimization for not unnecessarily flipping length variables.
+ */
+static int length_initiated_as;
+
+/*
+ * If this is set, our result will be passed to later rules. This means
+ * we should consider max_length as PLAINTEXT_BUFFER_SIZE so we don't
+ * truncate or reject a word that will later become valid.
+ */
+unsigned int rules_stacked_after;
+
+/*
+ * Line number of stacked rule in use.
+ */
+int rules_stacked_number;
+
+/*
  * Configuration file line number, only set after a rules_check() call if
  * rules_errno indicates an error.
  */
 static int rules_line;
 
-static int rules_max_length = 0, minlength, maxlength;
+static int rules_max_length = 0, min_length, skip_length;
+int hc_logic; /* can not be static. rpp.c needs to see it */
 
 /* data structures used in 'dupe' removal code */
 unsigned HASH_LOG, HASH_SIZE, HASH_LOG_HALF, HASH_MASK;
@@ -70,6 +93,10 @@ struct HashPtr {
 struct HashPtr *pHashTbl, *pHashDat;
 static struct cfg_list rules_tmp_dup_removal;
 static int             rules_tmp_dup_removal_cnt;
+
+int rules_mute, stack_rules_mute;
+
+static int fmt_case;
 
 static struct {
 	unsigned char vars[0x100];
@@ -88,9 +115,11 @@ static struct {
  * or for switching between two input words (in "single crack" mode).
  * rules_apply() tries to minimize data copying, and thus it may return a
  * pointer to any of the three buffers.
+ *
+ * With stacked rules, we need a second set of three buffers.
  */
 	union {
-		char buffer[3][RULE_WORD_SIZE * 2 + CACHE_BANK_SHIFT];
+		char buffer[3][2][RULE_WORD_SIZE * 2];
 		ARCH_WORD dummy;
 	} aligned;
 /*
@@ -101,6 +130,9 @@ static struct {
 	char memory[RULE_WORD_SIZE];
 	char *classes[0x100];
 } CC_CACHE_ALIGN rules_data;
+
+/* A null string that is safe to read past (e.g. for ASan) */
+static char safe_null_string[RULE_BUFFER_SIZE];
 
 #define rules_pass rules_data.pass
 #define rules_classes rules_data.classes
@@ -177,7 +209,7 @@ static char *conv_tolower, *conv_toupper;
 
 #define CLASS_export_pos(start, true, false) { \
 	char value, *class; \
-	if ((value = RULE) == '?') { \
+	if (((value = RULE) == '?') && !hc_logic) { \
 		if (!(class = rules_classes[ARCH_INDEX(RULE)])) \
 			goto out_ERROR_CLASS; \
 		for (pos = (start); ARCH_INDEX(in[pos]); pos++) \
@@ -218,6 +250,16 @@ static char *conv_tolower, *conv_toupper;
 	alt = in; \
 }
 
+#define SWAP2(a,b) { \
+	if (length > b && length > a) { \
+		int tmp = in[a]; \
+		in[a] = in[b]; \
+		in[b] = tmp; \
+	} \
+}
+
+#define STAGE !rules_stacked_after
+
 static void rules_init_class(char name, char *valid)
 {
 	char *pos, inv;
@@ -238,12 +280,7 @@ static void rules_init_class(char name, char *valid)
 	}
 }
 
-/* function used in fake_salts.c, to load user class data from john.conf   */
-/* note there 'used' to be a very nasty thing in this function, where we   */
-/* modified the data contents of our const src input param. This has been  */
-/* changed, so we have a separate buffer to memcpy to, instead of blasting */
-/* a buffer that we had assured would not be destroyed.  Also unneeded     */
-/* allocation was removed  (JimF, 2013)                                    */
+/* Function exported because it's also used in fake_salts.c */
 char *userclass_expand(const char *src)
 {
 	unsigned char _src2[0x100], *src2=_src2, dst_seen[0x100];
@@ -334,21 +371,22 @@ char *userclass_expand(const char *src)
 
 static void rules_init_classes(void)
 {
-	static unsigned char eightbitchars[129];
+	unsigned char eightbitchars[129];
 	int i;
+
 	memset(rules_classes, 0, sizeof(rules_classes));
 
-	// this is an ugly hack but it works fine, used for 'b' below
-	for(i=0;i<128;i++)
-		eightbitchars[i] = i+128;
+	// This is for 'b' below
+	for (i = 0; i < 128; i++)
+		eightbitchars[i] = i + 128;
 	eightbitchars[128] = 0;
 
 	rules_init_class('?', "?");
-	rules_init_class('b', (char *)&eightbitchars);
+	rules_init_class('b', (char*)&eightbitchars);
 	rules_init_class('Z', "");
 
 	// Load user-defined character classes ?0 .. ?9 from john.conf
-	for(i='0'; i <= '9'; i++) {
+	for (i = '0'; i <= '9'; i++) {
 		char user_class_num[] = "0";
 		char *user_class;
 		user_class_num[0] = i;
@@ -366,7 +404,7 @@ static void rules_init_classes(void)
 		}
 	}
 
-	switch(pers_opts.intermediate_enc) {
+	switch(options.internal_cp) {
 	case ISO_8859_1:
 		rules_init_class('v', CHARS_VOWELS CHARS_VOWELS_ISO_8859_1);
 		rules_init_class('c', CHARS_CONSONANTS
@@ -390,291 +428,11 @@ static void rules_init_classes(void)
 		                 CHARS_CONTROL_ISO_8859_1);
 		rules_init_class('Y', CHARS_INVALID_ISO_8859_1);
 		break;
-	case ISO_8859_2:
-		rules_init_class('v', CHARS_VOWELS
-		                 CHARS_VOWELS_ISO_8859_2);
-		rules_init_class('c', CHARS_CONSONANTS
-		                 CHARS_CONSONANTS_ISO_8859_2);
-		rules_init_class('w', CHARS_WHITESPACE
-		                 CHARS_WHITESPACE_ISO_8859_2);
-		rules_init_class('p', CHARS_PUNCTUATION
-		                 CHARS_PUNCTUATION_ISO_8859_2);
-		rules_init_class('s', CHARS_SPECIALS
-		                 CHARS_SPECIALS_ISO_8859_2);
-		rules_init_class('l', CHARS_LOWER CHARS_LOWER_ISO_8859_2
-		                 CHARS_LOW_ONLY_ISO_8859_2);
-		rules_init_class('u', CHARS_UPPER CHARS_UPPER_ISO_8859_2
-		                 CHARS_UP_ONLY_ISO_8859_2);
-		rules_init_class('d', CHARS_DIGITS CHARS_DIGITS_ISO_8859_2);
-		rules_init_class('a', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_ISO_8859_2);
-		rules_init_class('x', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_ISO_8859_2 CHARS_DIGITS
-		                 CHARS_DIGITS_ISO_8859_2);
-		rules_init_class('o', CHARS_CONTROL_ASCII
-		                 CHARS_CONTROL_ISO_8859_2);
-		rules_init_class('Y', CHARS_INVALID_ISO_8859_2);
-		break;
-	case ISO_8859_7:
-		rules_init_class('v', CHARS_VOWELS CHARS_VOWELS_ISO_8859_7);
-		rules_init_class('c', CHARS_CONSONANTS
-		                 CHARS_CONSONANTS_ISO_8859_7);
-		rules_init_class('w', CHARS_WHITESPACE
-		                 CHARS_WHITESPACE_ISO_8859_7);
-		rules_init_class('p', CHARS_PUNCTUATION
-		                 CHARS_PUNCTUATION_ISO_8859_7);
-		rules_init_class('s', CHARS_SPECIALS
-		                 CHARS_SPECIALS_ISO_8859_7);
-		rules_init_class('l', CHARS_LOWER CHARS_LOWER_ISO_8859_7
-		                 CHARS_LOW_ONLY_ISO_8859_7);
-		rules_init_class('u', CHARS_UPPER CHARS_UPPER_ISO_8859_7
-		                 CHARS_UP_ONLY_ISO_8859_7);
-		rules_init_class('d', CHARS_DIGITS CHARS_DIGITS_ISO_8859_7);
-		rules_init_class('a', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_ISO_8859_7);
-		rules_init_class('x', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_ISO_8859_7 CHARS_DIGITS
-		                 CHARS_DIGITS_ISO_8859_7);
-		rules_init_class('o', CHARS_CONTROL_ASCII
-		                 CHARS_CONTROL_ISO_8859_7);
-		rules_init_class('Y', CHARS_INVALID_ISO_8859_7);
-		break;
-	case ISO_8859_15:
-		rules_init_class('v', CHARS_VOWELS CHARS_VOWELS_ISO_8859_15);
-		rules_init_class('c', CHARS_CONSONANTS
-		                 CHARS_CONSONANTS_ISO_8859_15);
-		rules_init_class('w', CHARS_WHITESPACE
-		                 CHARS_WHITESPACE_ISO_8859_15);
-		rules_init_class('p', CHARS_PUNCTUATION
-		                 CHARS_PUNCTUATION_ISO_8859_15);
-		rules_init_class('s', CHARS_SPECIALS
-		                 CHARS_SPECIALS_ISO_8859_15);
-		rules_init_class('l', CHARS_LOWER CHARS_LOWER_ISO_8859_15
-		                 CHARS_LOW_ONLY_ISO_8859_15);
-		rules_init_class('u', CHARS_UPPER CHARS_UPPER_ISO_8859_15
-		                 CHARS_UP_ONLY_ISO_8859_15);
-		rules_init_class('d', CHARS_DIGITS CHARS_DIGITS_ISO_8859_15);
-		rules_init_class('a', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_ISO_8859_15);
-		rules_init_class('x', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_ISO_8859_15 CHARS_DIGITS
-		                 CHARS_DIGITS_ISO_8859_15);
-		rules_init_class('o', CHARS_CONTROL_ASCII
-		                 CHARS_CONTROL_ISO_8859_15);
-		rules_init_class('Y', CHARS_INVALID_ISO_8859_15);
-		break;
-	case KOI8_R:
-		rules_init_class('v', CHARS_VOWELS CHARS_VOWELS_KOI8_R);
-		rules_init_class('c', CHARS_CONSONANTS CHARS_CONSONANTS_KOI8_R);
-		rules_init_class('w', CHARS_WHITESPACE CHARS_WHITESPACE_KOI8_R);
-		rules_init_class('p', CHARS_PUNCTUATION
-		                 CHARS_PUNCTUATION_KOI8_R);
-		rules_init_class('s', CHARS_SPECIALS CHARS_SPECIALS_KOI8_R);
-		rules_init_class('l', CHARS_LOWER CHARS_LOWER_KOI8_R
-		                 CHARS_LOW_ONLY_KOI8_R);
-		rules_init_class('u', CHARS_UPPER CHARS_UPPER_KOI8_R
-		                 CHARS_UP_ONLY_KOI8_R);
-		rules_init_class('d', CHARS_DIGITS CHARS_DIGITS_KOI8_R);
-		rules_init_class('a', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_KOI8_R);
-		rules_init_class('x', CHARS_LOWER CHARS_UPPER CHARS_ALPHA_KOI8_R
-		                 CHARS_DIGITS CHARS_DIGITS_KOI8_R);
-		rules_init_class('o', CHARS_CONTROL_ASCII CHARS_CONTROL_KOI8_R);
-		rules_init_class('Y', CHARS_INVALID_KOI8_R);
-		break;
-	case CP437:
-		rules_init_class('v', CHARS_VOWELS CHARS_VOWELS_CP437);
-		rules_init_class('c', CHARS_CONSONANTS CHARS_CONSONANTS_CP437);
-		rules_init_class('w', CHARS_WHITESPACE CHARS_WHITESPACE_CP437);
-		rules_init_class('p', CHARS_PUNCTUATION
-		                 CHARS_PUNCTUATION_CP437);
-		rules_init_class('s', CHARS_SPECIALS CHARS_SPECIALS_CP437);
-		rules_init_class('l', CHARS_LOWER CHARS_LOWER_CP437
-		                 CHARS_LOW_ONLY_CP437);
-		rules_init_class('u', CHARS_UPPER CHARS_UPPER_CP437
-		                 CHARS_UP_ONLY_CP437);
-		rules_init_class('d', CHARS_DIGITS CHARS_DIGITS_CP437);
-		rules_init_class('a', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_CP437);
-		rules_init_class('x', CHARS_LOWER CHARS_UPPER CHARS_ALPHA_CP437
-		                 CHARS_DIGITS CHARS_DIGITS_CP437);
-		rules_init_class('o', CHARS_CONTROL_ASCII CHARS_CONTROL_CP437);
-		rules_init_class('Y', CHARS_INVALID_CP437);
-		break;
-	case CP737:
-		rules_init_class('v', CHARS_VOWELS CHARS_VOWELS_CP737);
-		rules_init_class('c', CHARS_CONSONANTS CHARS_CONSONANTS_CP737);
-		rules_init_class('w', CHARS_WHITESPACE CHARS_WHITESPACE_CP737);
-		rules_init_class('p', CHARS_PUNCTUATION
-		                 CHARS_PUNCTUATION_CP737);
-		rules_init_class('s', CHARS_SPECIALS CHARS_SPECIALS_CP737);
-		rules_init_class('l', CHARS_LOWER CHARS_LOWER_CP737
-		                 CHARS_LOW_ONLY_CP737);
-		rules_init_class('u', CHARS_UPPER CHARS_UPPER_CP737
-		                 CHARS_UP_ONLY_CP737);
-		rules_init_class('d', CHARS_DIGITS CHARS_DIGITS_CP737);
-		rules_init_class('a', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_CP737);
-		rules_init_class('x', CHARS_LOWER CHARS_UPPER CHARS_ALPHA_CP737
-		                 CHARS_DIGITS CHARS_DIGITS_CP737);
-		rules_init_class('o', CHARS_CONTROL_ASCII CHARS_CONTROL_CP737);
-		rules_init_class('Y', CHARS_INVALID_CP737);
-		break;
-	case CP850:
-		// NOTE, we need to deal with U+0131 (dottless I)
-		rules_init_class('v', CHARS_VOWELS CHARS_VOWELS_CP850);
-		rules_init_class('c', CHARS_CONSONANTS CHARS_CONSONANTS_CP850);
-		rules_init_class('w', CHARS_WHITESPACE CHARS_WHITESPACE_CP850);
-		rules_init_class('p', CHARS_PUNCTUATION
-		                 CHARS_PUNCTUATION_CP850);
-		rules_init_class('s', CHARS_SPECIALS CHARS_SPECIALS_CP850);
-		rules_init_class('l', CHARS_LOWER CHARS_LOWER_CP850
-		                 CHARS_LOW_ONLY_CP850);
-		rules_init_class('u', CHARS_UPPER CHARS_UPPER_CP850
-		                 CHARS_UP_ONLY_CP850);
-		rules_init_class('d', CHARS_DIGITS CHARS_DIGITS_CP850);
-		rules_init_class('a', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_CP850);
-		rules_init_class('x', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_CP850 CHARS_DIGITS
-		                 CHARS_DIGITS_CP850);
-		rules_init_class('o', CHARS_CONTROL_ASCII CHARS_CONTROL_CP850);
-		rules_init_class('Y', CHARS_INVALID_CP850);
-		break;
-	case CP852:
-		rules_init_class('v', CHARS_VOWELS CHARS_VOWELS_CP852);
-		rules_init_class('c', CHARS_CONSONANTS CHARS_CONSONANTS_CP852);
-		rules_init_class('w', CHARS_WHITESPACE CHARS_WHITESPACE_CP852);
-		rules_init_class('p', CHARS_PUNCTUATION
-		                 CHARS_PUNCTUATION_CP852);
-		rules_init_class('s', CHARS_SPECIALS CHARS_SPECIALS_CP852);
-		rules_init_class('l', CHARS_LOWER CHARS_LOWER_CP852
-		                 CHARS_LOW_ONLY_CP852);
-		rules_init_class('u', CHARS_UPPER CHARS_UPPER_CP852
-		                 CHARS_UP_ONLY_CP852);
-		rules_init_class('d', CHARS_DIGITS CHARS_DIGITS_CP852);
-		rules_init_class('a', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_CP852);
-		rules_init_class('x', CHARS_LOWER CHARS_UPPER CHARS_ALPHA_CP852
-		                 CHARS_DIGITS CHARS_DIGITS_CP852);
-		rules_init_class('o', CHARS_CONTROL_ASCII CHARS_CONTROL_CP852);
-		rules_init_class('Y', CHARS_INVALID_CP852);
-		break;
-	case CP858:
-		rules_init_class('v', CHARS_VOWELS CHARS_VOWELS_CP858);
-		rules_init_class('c', CHARS_CONSONANTS CHARS_CONSONANTS_CP858);
-		rules_init_class('w', CHARS_WHITESPACE CHARS_WHITESPACE_CP858);
-		rules_init_class('p', CHARS_PUNCTUATION
-		                 CHARS_PUNCTUATION_CP858);
-		rules_init_class('s', CHARS_SPECIALS CHARS_SPECIALS_CP858);
-		rules_init_class('l', CHARS_LOWER CHARS_LOWER_CP858
-		                 CHARS_LOW_ONLY_CP858);
-		rules_init_class('u', CHARS_UPPER CHARS_UPPER_CP858
-		                 CHARS_UP_ONLY_CP858);
-		rules_init_class('d', CHARS_DIGITS CHARS_DIGITS_CP858);
-		rules_init_class('a', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_CP858);
-		rules_init_class('x', CHARS_LOWER CHARS_UPPER CHARS_ALPHA_CP858
-		                 CHARS_DIGITS CHARS_DIGITS_CP858);
-		rules_init_class('o', CHARS_CONTROL_ASCII CHARS_CONTROL_CP858);
-		rules_init_class('Y', CHARS_INVALID_CP858);
-		break;
-	case CP866:
-		rules_init_class('v', CHARS_VOWELS CHARS_VOWELS_CP866);
-		rules_init_class('c', CHARS_CONSONANTS CHARS_CONSONANTS_CP866);
-		rules_init_class('w', CHARS_WHITESPACE CHARS_WHITESPACE_CP866);
-		rules_init_class('p', CHARS_PUNCTUATION
-		                 CHARS_PUNCTUATION_CP866);
-		rules_init_class('s', CHARS_SPECIALS CHARS_SPECIALS_CP866);
-		rules_init_class('l', CHARS_LOWER CHARS_LOWER_CP866
-		                 CHARS_LOW_ONLY_CP866);
-		rules_init_class('u', CHARS_UPPER CHARS_UPPER_CP866
-		                 CHARS_UP_ONLY_CP866);
-		rules_init_class('d', CHARS_DIGITS CHARS_DIGITS_CP866);
-		rules_init_class('a', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_CP866);
-		rules_init_class('x', CHARS_LOWER CHARS_UPPER CHARS_ALPHA_CP866
-		                 CHARS_DIGITS CHARS_DIGITS_CP866);
-		rules_init_class('o', CHARS_CONTROL_ASCII CHARS_CONTROL_CP866);
-		rules_init_class('Y', CHARS_INVALID_CP866);
-		break;
-	case CP1250:
-		rules_init_class('v', CHARS_VOWELS CHARS_VOWELS_CP1250);
-		rules_init_class('c', CHARS_CONSONANTS CHARS_CONSONANTS_CP1250);
-		rules_init_class('w', CHARS_WHITESPACE CHARS_WHITESPACE_CP1250);
-		rules_init_class('p', CHARS_PUNCTUATION
-		                 CHARS_PUNCTUATION_CP1250);
-		rules_init_class('s', CHARS_SPECIALS CHARS_SPECIALS_CP1250);
-		rules_init_class('l', CHARS_LOWER CHARS_LOWER_CP1250
-		                 CHARS_LOW_ONLY_CP1250);
-		rules_init_class('u', CHARS_UPPER CHARS_UPPER_CP1250
-		                 CHARS_UP_ONLY_CP1250);
-		rules_init_class('d', CHARS_DIGITS CHARS_DIGITS_CP1250);
-		rules_init_class('a', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_CP1250);
-		rules_init_class('x', CHARS_LOWER CHARS_UPPER CHARS_ALPHA_CP1250
-		                 CHARS_DIGITS CHARS_DIGITS_CP1250);
-		rules_init_class('o', CHARS_CONTROL_ASCII CHARS_CONTROL_CP1250);
-		rules_init_class('Y', CHARS_INVALID_CP1250);
-		break;
-	case CP1251:
-		rules_init_class('v', CHARS_VOWELS CHARS_VOWELS_CP1251);
-		rules_init_class('c', CHARS_CONSONANTS CHARS_CONSONANTS_CP1251);
-		rules_init_class('w', CHARS_WHITESPACE CHARS_WHITESPACE_CP1251);
-		rules_init_class('p', CHARS_PUNCTUATION
-		                 CHARS_PUNCTUATION_CP1251);
-		rules_init_class('s', CHARS_SPECIALS CHARS_SPECIALS_CP1251);
-		rules_init_class('l', CHARS_LOWER CHARS_LOWER_CP1251
-		                 CHARS_LOW_ONLY_CP1251);
-		rules_init_class('u', CHARS_UPPER CHARS_UPPER_CP1251
-		                 CHARS_UP_ONLY_CP1251);
-		rules_init_class('d', CHARS_DIGITS CHARS_DIGITS_CP1251);
-		rules_init_class('a', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_CP1251);
-		rules_init_class('x', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_CP1251 CHARS_DIGITS
-		                 CHARS_DIGITS_CP1251);
-		rules_init_class('o', CHARS_CONTROL_ASCII CHARS_CONTROL_CP1251);
-		rules_init_class('Y', CHARS_INVALID_CP1251);
-		break;
-	case CP1252:
-		rules_init_class('v', CHARS_VOWELS CHARS_VOWELS_CP1252);
-		rules_init_class('c', CHARS_CONSONANTS CHARS_CONSONANTS_CP1252);
-		rules_init_class('w', CHARS_WHITESPACE CHARS_WHITESPACE_CP1252);
-		rules_init_class('p', CHARS_PUNCTUATION
-		                 CHARS_PUNCTUATION_CP1252);
-		rules_init_class('s', CHARS_SPECIALS CHARS_SPECIALS_CP1252);
-		rules_init_class('l', CHARS_LOWER CHARS_LOWER_CP1252
-		                 CHARS_LOW_ONLY_CP1252);
-		rules_init_class('u', CHARS_UPPER CHARS_UPPER_CP1252
-		                 CHARS_UP_ONLY_CP1252);
-		rules_init_class('d', CHARS_DIGITS CHARS_DIGITS_CP1252);
-		rules_init_class('a', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_CP1252);
-		rules_init_class('x', CHARS_LOWER CHARS_UPPER CHARS_ALPHA_CP1252
-		                 CHARS_DIGITS CHARS_DIGITS_CP1252);
-		rules_init_class('o', CHARS_CONTROL_ASCII CHARS_CONTROL_CP1252);
-		rules_init_class('Y', CHARS_INVALID_CP1252);
-		break;
-	case CP1253:
-		rules_init_class('v', CHARS_VOWELS CHARS_VOWELS_CP1253);
-		rules_init_class('c', CHARS_CONSONANTS CHARS_CONSONANTS_CP1253);
-		rules_init_class('w', CHARS_WHITESPACE CHARS_WHITESPACE_CP1253);
-		rules_init_class('p', CHARS_PUNCTUATION
-		                 CHARS_PUNCTUATION_CP1253);
-		rules_init_class('s', CHARS_SPECIALS CHARS_SPECIALS_CP1253);
-		rules_init_class('l', CHARS_LOWER CHARS_LOWER_CP1253
-		                 CHARS_LOW_ONLY_CP1253);
-		rules_init_class('u', CHARS_UPPER CHARS_UPPER_CP1253
-		                 CHARS_UP_ONLY_CP1253);
-		rules_init_class('d', CHARS_DIGITS CHARS_DIGITS_CP1253);
-		rules_init_class('a', CHARS_LOWER CHARS_UPPER
-		                 CHARS_ALPHA_CP1253);
-		rules_init_class('x', CHARS_LOWER CHARS_UPPER CHARS_ALPHA_CP1253
-		                 CHARS_DIGITS CHARS_DIGITS_CP1253);
-		rules_init_class('o', CHARS_CONTROL_ASCII CHARS_CONTROL_CP1253);
-		rules_init_class('Y', CHARS_INVALID_CP1253);
-		break;
+/*
+ * Other codepages moved to header
+ */
+#include "rules_init_classes.h"
+
 	default:
 		rules_init_class('v', CHARS_VOWELS);
 		rules_init_class('c', CHARS_CONSONANTS);
@@ -686,7 +444,7 @@ static void rules_init_classes(void)
 		rules_init_class('d', CHARS_DIGITS);
 		rules_init_class('a', CHARS_LOWER CHARS_UPPER);
 		rules_init_class('x', CHARS_LOWER CHARS_UPPER CHARS_DIGITS);
-		if (pers_opts.intermediate_enc == UTF_8) {
+		if (options.internal_cp == UTF_8) {
 			rules_init_class('Y', CHARS_INVALID_UTF8);
 			rules_init_class('o', CHARS_CONTROL_ASCII);
 		} else {
@@ -702,11 +460,22 @@ static char *rules_init_conv(char *src, char *dst)
 	char *conv;
 	int pos;
 
+	if (strlen(src) != strlen(dst)) {
+		fprintf(stderr, "Error: encoding_data.h format error. CHARS_UPPER and CHARS_LOWER must be same\nlength and map exactly to each other\n");
+		error();
+	}
+
 	conv = mem_alloc_tiny(0x100, MEM_ALIGN_NONE);
 	for (pos = 0; pos < 0x100; pos++) conv[pos] = pos;
 
-	while (*src)
-		conv[ARCH_INDEX(*src++)] = *dst++;
+	while (*src) {
+		if (fmt_case || !conv_toupper ||
+		    conv_toupper[ARCH_INDEX(*src)] !=
+		    conv_toupper[ARCH_INDEX(*dst)])
+			conv[ARCH_INDEX(*src)] = *dst;
+		src++;
+		dst++;
+	}
 
 	return conv;
 }
@@ -717,16 +486,10 @@ static void rules_init_convs(void)
 	conv_right = rules_init_conv(conv_source, CONV_RIGHT);
 	conv_left = rules_init_conv(conv_source, CONV_LEFT);
 
-	switch(pers_opts.intermediate_enc) {
+	switch(options.internal_cp) {
 	case ISO_8859_1:
 		conv_source = CONV_SOURCE CHARS_LOWER_ISO_8859_1
 			CHARS_UPPER_ISO_8859_1;
-		conv_shift = rules_init_conv(conv_source, CONV_SHIFT
-		                             CHARS_UPPER_ISO_8859_1
-		                             CHARS_LOWER_ISO_8859_1);
-		conv_invert = rules_init_conv(conv_source, CONV_INVERT
-		                              CHARS_UPPER_ISO_8859_1
-		                              CHARS_LOWER_ISO_8859_1);
 		conv_tolower = rules_init_conv(CHARS_UPPER
 		                               CHARS_UPPER_ISO_8859_1,
 		                               CHARS_LOWER
@@ -735,214 +498,23 @@ static void rules_init_convs(void)
 		                               CHARS_LOWER_ISO_8859_1,
 		                               CHARS_UPPER
 		                               CHARS_UPPER_ISO_8859_1);
-		break;
-	case ISO_8859_2:
-		conv_source = CONV_SOURCE CHARS_LOWER_ISO_8859_2
-			CHARS_UPPER_ISO_8859_2;
 		conv_shift = rules_init_conv(conv_source, CONV_SHIFT
-		                             CHARS_UPPER_ISO_8859_2
-		                             CHARS_LOWER_ISO_8859_2);
+		                             CHARS_UPPER_ISO_8859_1
+		                             CHARS_LOWER_ISO_8859_1);
 		conv_invert = rules_init_conv(conv_source, CONV_INVERT
-		                              CHARS_UPPER_ISO_8859_2
-		                              CHARS_LOWER_ISO_8859_2);
-		conv_tolower = rules_init_conv(CHARS_UPPER
-		                               CHARS_UPPER_ISO_8859_2,
-		                               CHARS_LOWER
-		                               CHARS_LOWER_ISO_8859_2);
-		conv_toupper = rules_init_conv(CHARS_LOWER
-		                               CHARS_LOWER_ISO_8859_2,
-		                               CHARS_UPPER
-		                               CHARS_UPPER_ISO_8859_2);
+		                              CHARS_UPPER_ISO_8859_1
+		                              CHARS_LOWER_ISO_8859_1);
 		break;
-	case ISO_8859_7:
-		conv_source = CONV_SOURCE CHARS_LOWER_ISO_8859_7
-			CHARS_UPPER_ISO_8859_7;
-		conv_shift = rules_init_conv(conv_source, CONV_SHIFT
-		                             CHARS_UPPER_ISO_8859_7
-		                             CHARS_LOWER_ISO_8859_7);
-		conv_invert = rules_init_conv(conv_source, CONV_INVERT
-		                              CHARS_UPPER_ISO_8859_7
-		                              CHARS_LOWER_ISO_8859_7);
-		conv_tolower = rules_init_conv(CHARS_UPPER
-		                               CHARS_UPPER_ISO_8859_7,
-		                               CHARS_LOWER
-		                               CHARS_LOWER_ISO_8859_7);
-		conv_toupper = rules_init_conv(CHARS_LOWER
-		                               CHARS_LOWER_ISO_8859_7,
-		                               CHARS_UPPER
-		                               CHARS_UPPER_ISO_8859_7);
-		break;
-	case ISO_8859_15:
-		conv_source = CONV_SOURCE CHARS_LOWER_ISO_8859_15
-			CHARS_UPPER_ISO_8859_15;
-		conv_shift = rules_init_conv(conv_source, CONV_SHIFT
-		                             CHARS_UPPER_ISO_8859_15
-		                             CHARS_LOWER_ISO_8859_15);
-		conv_invert = rules_init_conv(conv_source, CONV_INVERT
-		                              CHARS_UPPER_ISO_8859_15
-		                              CHARS_LOWER_ISO_8859_15);
-		conv_tolower = rules_init_conv(CHARS_UPPER
-		                               CHARS_UPPER_ISO_8859_15,
-		                               CHARS_LOWER
-		                               CHARS_LOWER_ISO_8859_15);
-		conv_toupper = rules_init_conv(CHARS_LOWER
-		                               CHARS_LOWER_ISO_8859_15,
-		                               CHARS_UPPER
-		                               CHARS_UPPER_ISO_8859_15);
-		break;
-	case KOI8_R:
-		conv_source = CONV_SOURCE CHARS_LOWER_KOI8_R CHARS_UPPER_KOI8_R;
-		conv_shift = rules_init_conv(conv_source, CONV_SHIFT
-		                             CHARS_UPPER_KOI8_R
-		                             CHARS_LOWER_KOI8_R);
-		conv_invert = rules_init_conv(conv_source, CONV_INVERT
-		                              CHARS_UPPER_KOI8_R
-		                              CHARS_LOWER_KOI8_R);
-		conv_tolower = rules_init_conv(CHARS_UPPER CHARS_UPPER_KOI8_R,
-		                               CHARS_LOWER CHARS_LOWER_KOI8_R);
-		conv_toupper = rules_init_conv(CHARS_LOWER CHARS_LOWER_KOI8_R,
-		                               CHARS_UPPER CHARS_UPPER_KOI8_R);
-		break;
-	case CP437:
-		conv_source = CONV_SOURCE CHARS_LOWER_CP437 CHARS_UPPER_CP437;
-		conv_shift = rules_init_conv(conv_source, CONV_SHIFT
-		                             CHARS_UPPER_CP437
-		                             CHARS_LOWER_CP437);
-		conv_invert = rules_init_conv(conv_source, CONV_INVERT
-		                              CHARS_UPPER_CP437
-		                              CHARS_LOWER_CP437);
-		conv_tolower = rules_init_conv(CHARS_UPPER CHARS_UPPER_CP437,
-		                               CHARS_LOWER CHARS_LOWER_CP437);
-		conv_toupper = rules_init_conv(CHARS_LOWER CHARS_LOWER_CP437,
-		                               CHARS_UPPER CHARS_UPPER_CP437);
-		break;
-	case CP737:
-		conv_source = CONV_SOURCE CHARS_LOWER_CP737 CHARS_UPPER_CP737;
-		conv_shift = rules_init_conv(conv_source, CONV_SHIFT
-		                             CHARS_UPPER_CP737
-		                             CHARS_LOWER_CP737);
-		conv_invert = rules_init_conv(conv_source, CONV_INVERT
-		                              CHARS_UPPER_CP737
-		                              CHARS_LOWER_CP737);
-		conv_tolower = rules_init_conv(CHARS_UPPER CHARS_UPPER_CP737,
-		                               CHARS_LOWER CHARS_LOWER_CP737);
-		conv_toupper = rules_init_conv(CHARS_LOWER CHARS_LOWER_CP737,
-		                               CHARS_UPPER CHARS_UPPER_CP737);
-		break;
-	case CP850:
-		conv_source = CONV_SOURCE CHARS_LOWER_CP850 CHARS_UPPER_CP850;
-		conv_shift = rules_init_conv(conv_source, CONV_SHIFT
-		                             CHARS_UPPER_CP850
-		                             CHARS_LOWER_CP850);
-		conv_invert = rules_init_conv(conv_source, CONV_INVERT
-		                              CHARS_UPPER_CP850
-		                              CHARS_LOWER_CP850);
-		conv_tolower = rules_init_conv(CHARS_UPPER CHARS_UPPER_CP850,
-		                               CHARS_LOWER CHARS_LOWER_CP850);
-		conv_toupper = rules_init_conv(CHARS_LOWER CHARS_LOWER_CP850,
-		                               CHARS_UPPER CHARS_UPPER_CP850);
-// Ok, we need to handle upcasing of 0xD5. This is U+0131 and upcases to U+0049
-// (undotted low i upcases to normal I).
-// but there is NO low case into U+131, so we have to handle this, after setup
-// of all the 'normal' shit.
-		conv_toupper[0xD5] = 0x49;
-		break;
-	case CP852:
-		conv_source = CONV_SOURCE CHARS_LOWER_CP852 CHARS_UPPER_CP852;
-		conv_shift = rules_init_conv(conv_source, CONV_SHIFT
-		                             CHARS_UPPER_CP852
-		                             CHARS_LOWER_CP852);
-		conv_invert = rules_init_conv(conv_source, CONV_INVERT
-		                              CHARS_UPPER_CP852
-		                              CHARS_LOWER_CP852);
-		conv_tolower = rules_init_conv(CHARS_UPPER CHARS_UPPER_CP852,
-		                               CHARS_LOWER CHARS_LOWER_CP852);
-		conv_toupper = rules_init_conv(CHARS_LOWER CHARS_LOWER_CP852,
-		                               CHARS_UPPER CHARS_UPPER_CP852);
-		break;
-	case CP858:
-		conv_source = CONV_SOURCE CHARS_LOWER_CP858 CHARS_UPPER_CP858;
-		conv_shift = rules_init_conv(conv_source, CONV_SHIFT
-		                             CHARS_UPPER_CP858
-		                             CHARS_LOWER_CP858);
-		conv_invert = rules_init_conv(conv_source, CONV_INVERT
-		                              CHARS_UPPER_CP858
-		                              CHARS_LOWER_CP858);
-		conv_tolower = rules_init_conv(CHARS_UPPER CHARS_UPPER_CP858,
-		                               CHARS_LOWER CHARS_LOWER_CP858);
-		conv_toupper = rules_init_conv(CHARS_LOWER CHARS_LOWER_CP858,
-		                               CHARS_UPPER CHARS_UPPER_CP858);
-		break;
-	case CP866:
-		conv_source = CONV_SOURCE CHARS_LOWER_CP866 CHARS_UPPER_CP866;
-		conv_shift = rules_init_conv(conv_source, CONV_SHIFT
-		                             CHARS_UPPER_CP866
-		                             CHARS_LOWER_CP866);
-		conv_invert = rules_init_conv(conv_source, CONV_INVERT
-		                              CHARS_UPPER_CP866
-		                              CHARS_LOWER_CP866);
-		conv_tolower = rules_init_conv(CHARS_UPPER CHARS_UPPER_CP866,
-		                               CHARS_LOWER CHARS_LOWER_CP866);
-		conv_toupper = rules_init_conv(CHARS_LOWER CHARS_LOWER_CP866,
-		                               CHARS_UPPER CHARS_UPPER_CP866);
-		break;
-	case CP1250:
-		conv_source = CONV_SOURCE CHARS_LOWER_CP1250 CHARS_UPPER_CP1250;
-		conv_shift = rules_init_conv(conv_source, CONV_SHIFT
-		                             CHARS_UPPER_CP1250
-		                             CHARS_LOWER_CP1250);
-		conv_invert = rules_init_conv(conv_source, CONV_INVERT
-		                              CHARS_UPPER_CP1250
-		                              CHARS_LOWER_CP1250);
-		conv_tolower = rules_init_conv(CHARS_UPPER CHARS_UPPER_CP1250,
-		                               CHARS_LOWER CHARS_LOWER_CP1250);
-		conv_toupper = rules_init_conv(CHARS_LOWER CHARS_LOWER_CP1250,
-		                               CHARS_UPPER CHARS_UPPER_CP1250);
-		break;
-	case CP1251:
-		conv_source = CONV_SOURCE CHARS_LOWER_CP1251 CHARS_UPPER_CP1251;
-		conv_shift = rules_init_conv(conv_source, CONV_SHIFT
-		                             CHARS_UPPER_CP1251
-		                             CHARS_LOWER_CP1251);
-		conv_invert = rules_init_conv(conv_source, CONV_INVERT
-		                              CHARS_UPPER_CP1251
-		                              CHARS_LOWER_CP1251);
-		conv_tolower = rules_init_conv(CHARS_UPPER CHARS_UPPER_CP1251,
-		                               CHARS_LOWER CHARS_LOWER_CP1251);
-		conv_toupper = rules_init_conv(CHARS_LOWER CHARS_LOWER_CP1251,
-		                               CHARS_UPPER CHARS_UPPER_CP1251);
-		break;
-	case CP1252:
-		conv_source = CONV_SOURCE CHARS_LOWER_CP1252 CHARS_UPPER_CP1252;
-		conv_shift = rules_init_conv(conv_source, CONV_SHIFT
-		                             CHARS_UPPER_CP1252
-		                             CHARS_LOWER_CP1252);
-		conv_invert = rules_init_conv(conv_source, CONV_INVERT
-		                              CHARS_UPPER_CP1252
-		                              CHARS_LOWER_CP1252);
-		conv_tolower = rules_init_conv(CHARS_UPPER CHARS_UPPER_CP1252,
-		                               CHARS_LOWER CHARS_LOWER_CP1252);
-		conv_toupper = rules_init_conv(CHARS_LOWER CHARS_LOWER_CP1252,
-		                               CHARS_UPPER CHARS_UPPER_CP1252);
-		break;
-	case CP1253:
-		conv_source = CONV_SOURCE CHARS_LOWER_CP1253 CHARS_UPPER_CP1253;
-		conv_shift = rules_init_conv(conv_source, CONV_SHIFT
-		                             CHARS_UPPER_CP1253
-		                             CHARS_LOWER_CP1253);
-		conv_invert = rules_init_conv(conv_source, CONV_INVERT
-		                              CHARS_UPPER_CP1253
-		                              CHARS_LOWER_CP1253);
-		conv_tolower = rules_init_conv(CHARS_UPPER CHARS_UPPER_CP1253,
-		                               CHARS_LOWER CHARS_LOWER_CP1253);
-		conv_toupper = rules_init_conv(CHARS_LOWER CHARS_LOWER_CP1253,
-		                               CHARS_UPPER CHARS_UPPER_CP1253);
-		break;
+/*
+ * Other codepages moved to header
+ */
+#include "rules_init_convs.h"
+
 	default:
-		conv_shift = rules_init_conv(conv_source, CONV_SHIFT);
-		conv_invert = rules_init_conv(conv_source, CONV_INVERT);
 		conv_tolower = rules_init_conv(CHARS_UPPER, CHARS_LOWER);
 		conv_toupper = rules_init_conv(CHARS_LOWER, CHARS_UPPER);
+		conv_shift = rules_init_conv(conv_source, CONV_SHIFT);
+		conv_invert = rules_init_conv(conv_source, CONV_INVERT);
 	}
 }
 
@@ -959,32 +531,118 @@ static void rules_init_length(int max_length)
 	rules_vars['-'] = max_length - 1;
 	rules_vars['+'] = max_length + 1;
 
+	rules_vars['#'] = min_length;
+	rules_vars['@'] = min_length ? min_length - 1 : 0;
+	rules_vars['$'] = min_length + 1;
+
 	rules_vars['z'] = INFINITE_LENGTH;
 }
 
-void rules_init(int max_length)
+int rules_init_stack(char *ruleset, rule_stack *stack_ctx,
+                     struct db_main *db)
+{
+	int rule_count;
+
+	if (ruleset) {
+		char *rule, *prerule="";
+		struct rpp_context ctx, *rule_ctx;
+		int active_rules = 0, rule_number = 0;
+
+		if (ruleset)
+			log_event("+ Stacked rules: %.100s", ruleset);
+
+		if (rpp_init(rule_ctx = &ctx, ruleset)) {
+			log_event("! No \"%s\" mode rules found", ruleset);
+			if (john_main_process)
+				fprintf(stderr, "No \"%s\" mode rules found in %s\n",
+				        ruleset, cfg_name);
+			error();
+		}
+
+		rules_init(db, options.eff_maxlength);
+		rule_count = rules_count(&ctx, -1);
+
+		log_event("- %d preprocessed stacked rules", rule_count);
+
+		list_init(&stack_ctx->stack_rule);
+
+		rpp_real_run = 1;
+
+		if ((prerule = rpp_next(&ctx)))
+		do {
+			rule_number++;
+
+			if ((rule = rules_reject(prerule, -1, NULL, db))) {
+				list_add(stack_ctx->stack_rule, rule);
+				active_rules++;
+
+				if (options.verbosity >= VERB_DEBUG &&
+				    strcmp(prerule, rule))
+					log_event("+ Stacked Rule #%d: '%.100s' pre-accepted as '%.100s'",
+					          rule_number, prerule, rule);
+			} else
+			if (options.verbosity >= VERB_DEBUG &&
+			    strncmp(prerule, "!!", 2))
+				log_event("+ Stacked Rule #%d: '%.100s' pre-rejected",
+				          rule_number, prerule);
+
+		} while ((rule = rpp_next(&ctx)));
+
+		if (active_rules != rule_count) {
+			log_event("+ %d pre-accepted stacked rules (%d pre-rejected)",
+			          active_rules, rule_count - active_rules);
+			rule_count = active_rules;
+		}
+
+		if (rule_count == 1 &&
+		    stack_ctx->stack_rule->head->data[0] == 0)
+			rule_count = 0;
+
+		if (rule_count < 1)
+			rule_count = 0;
+	} else {
+		rule_count = 0;
+		log_event("- No stacked rules");
+	}
+
+	return rule_count;
+}
+
+void rules_init(struct db_main *db, int max_length)
 {
 	rules_pass = 0;
 	rules_errno = RULES_ERROR_NONE;
+	hc_logic = 0;
 
 	if (max_length > RULE_WORD_SIZE - 1)
 		max_length = RULE_WORD_SIZE - 1;
 
-	if (max_length == rules_max_length) return;
+	min_length = options.eff_minlength;
+	skip_length = options.force_maxlength;
+
+	if (max_length == rules_max_length)
+		return;
+
+	fmt_case = db->format->params.flags & FMT_CASE;
 
 	if (!rules_max_length) {
 		rules_init_classes();
 		rules_init_convs();
 	}
 	rules_init_length(max_length);
-	minlength = (options.force_minlength >= 0) ?
-		options.force_minlength : 0;
-	maxlength = options.force_maxlength;
 }
 
 char *rules_reject(char *rule, int split, char *last, struct db_main *db)
 {
 	static char out_rule[RULE_BUFFER_SIZE];
+
+	if (!strcmp(rule, "!! hashcat logic ON")) {
+		hc_logic = 1;
+		return NULL;
+	} else if (!strcmp(rule, "!! hashcat logic OFF")) {
+		hc_logic = 0;
+		return NULL;
+	}
 
 	while (RULE)
 	switch (LAST) {
@@ -994,6 +652,7 @@ char *rules_reject(char *rule, int split, char *last, struct db_main *db)
 		break;
 
 	case '-':
+		if (!hc_logic && (NEXT < '0' || NEXT > '9')) // HC hack
 		switch (RULE) {
 		case ':':
 			continue;
@@ -1017,102 +676,42 @@ char *rules_reject(char *rule, int split, char *last, struct db_main *db)
 			if (split >= 0) continue;
 			return NULL;
 
+		case '\0':
+			rules_errno = RULES_ERROR_END;
+			return NULL;
+
+/* Flags added in Jumbo */
 		case '>':
 			if (!db && RULE) continue;
 			if (!NEXT) {
 				rules_errno = RULES_ERROR_END;
 				return NULL;
 			}
+			if (rules_stacked_after) continue;
 			if (rules_vars[ARCH_INDEX(RULE)] <=
-			    db->format->params.plaintext_length ) continue;
+			    rules_max_length) continue;
 			return NULL;
 
-		case '\0':
-			rules_errno = RULES_ERROR_END;
+		case '<':
+			if (!db && RULE) continue;
+			if (!NEXT) {
+				rules_errno = RULES_ERROR_END;
+				return NULL;
+			}
+			if (rules_stacked_after) continue;
+			if (rules_vars[ARCH_INDEX(RULE)] >= min_length)
+				continue;
 			return NULL;
 
 		case 'u':
 			if (!db) continue;
-			if (pers_opts.intermediate_enc == UTF_8) continue;
+			if (options.internal_cp == UTF_8) continue;
 			return NULL;
 
 		case 'U':
 			if (!db) continue;
-			if (pers_opts.intermediate_enc != UTF_8) continue;
+			if (options.internal_cp != UTF_8) continue;
 			return NULL;
-
-/*
- * This inner case was added to handle things like this, which ARE seen in the
- * wild:
- * -[:c] other_rule_stuff    This case will chew up the -[.....] items,
- * handling them in proper method, just like stand alone -c -:, etc
- */
-		case '[':
-		do {
-			switch (*rule) {
-			case ':':
-				continue;
-
-			case 'c':
-				if (!db) continue;
-				if (db->format->params.flags & FMT_CASE)
-					continue;
-				return NULL;
-
-			case '8':
-				if (!db) continue;
-				if (db->format->params.flags & FMT_8_BIT)
-					continue;
-				return NULL;
-
-			case 's':
-				if (!db) continue;
-				if (db->options->flags & DB_SPLIT) continue;
-				return NULL;
-
-			case 'p':
-				if (split >= 0) continue;
-				return NULL;
-
-			case '>':
-				if (!db && RULE) continue;
-				if (!NEXT) {
-					rules_errno = RULES_ERROR_END;
-					return NULL;
-				}
-				if (rules_vars[ARCH_INDEX(RULE)] <=
-				    db->format->params.plaintext_length )
-					continue;
-				return NULL;
-
-			case '\0':
-				rules_errno = RULES_ERROR_END;
-				return NULL;
-
-			case 'u':
-				if (!db) continue;
-				if (pers_opts.intermediate_enc == UTF_8)
-					continue;
-				return NULL;
-
-			case 'U':
-				if (!db) continue;
-				if (pers_opts.intermediate_enc != UTF_8)
-					continue;
-				return NULL;
-
-			case ']':
-// skip the ']', since we are not dropping down to the while clause.
-				++rule;
-				goto EndPP;
-
-			default:
-				rules_errno = RULES_ERROR_REJECT;
-				return NULL;
-			}
-		} while (RULE);
-		EndPP:
-		continue;
 
 		default:
 			rules_errno = RULES_ERROR_REJECT;
@@ -1126,44 +725,39 @@ char *rules_reject(char *rule, int split, char *last, struct db_main *db)
 accept:
 	rules_pass--;
 	strnzcpy(out_rule, rule - 1, sizeof(out_rule));
-	rules_apply("", out_rule, split, last);
+	rules_apply(safe_null_string, out_rule, split, last);
 	rules_pass++;
 
 	return out_rule;
 }
 
-static char* rules_cp_to_utf8(char *in)
-{
-	static char out[PLAINTEXT_BUFFER_SIZE + 1];
-
-	if (pers_opts.intermediate_enc != UTF_8 &&
-	    pers_opts.intermediate_enc != pers_opts.target_enc)
-		return cp_to_utf8_r(in, out, PLAINTEXT_BUFFER_SIZE);
-
-	return in;
-}
+#define STACK_MAXLEN (rules_stacked_after ? RULE_WORD_SIZE : rules_max_length)
 
 char *rules_apply(char *word_in, char *rule, int split, char *last)
 {
-	char cpword[PLAINTEXT_BUFFER_SIZE + 1];
+	union {
+		char aligned[PLAINTEXT_BUFFER_SIZE];
+		ARCH_WORD dummy;
+	} convbuf;
+	char *cpword = convbuf.aligned;
 	char *word;
 	char *in, *alt, *memory;
 	int length;
 	int which;
 
-	if (pers_opts.intermediate_enc != UTF_8 &&
-	    pers_opts.intermediate_enc != pers_opts.target_enc)
+	if (!(options.flags & FLG_SINGLE_CHK) &&
+	    options.internal_cp != UTF_8 && options.target_enc == UTF_8)
 		memory = word = utf8_to_cp_r(word_in, cpword,
-		                             PLAINTEXT_BUFFER_SIZE);
+		                             PLAINTEXT_BUFFER_SIZE - 1);
 	else
 		memory = word = word_in;
 
-	in = buffer[0];
+	in = buffer[0][STAGE];
 	if (in == last)
-		in = buffer[2];
+		in = buffer[2][STAGE];
 
 	length = 0;
-	while (length < RULE_WORD_SIZE - 1) {
+	while (length < RULE_WORD_SIZE) {
 		if (!(in[length] = word[length]))
 			break;
 		length++;
@@ -1176,11 +770,12 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 	if (!NEXT)
 		goto out_OK;
 
-	if (!length) REJECT
+	if (!length && !hc_logic)
+		REJECT
 
-	alt = buffer[1];
+	alt = buffer[1][STAGE];
 	if (alt == last)
-		alt = buffer[2];
+		alt = buffer[2][STAGE];
 
 /*
  * This assumes that RULE_WORD_SIZE is small enough that length can't reach or
@@ -1189,10 +784,32 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 	rules_vars['l'] = length;
 	rules_vars['m'] = (unsigned char)length - 1;
 
+	if (rules_stacked_after != length_initiated_as) {
+		if (rules_stacked_after) {
+			rules_vars['*'] = RULE_WORD_SIZE - 1;
+			rules_vars['-'] = RULE_WORD_SIZE - 2;
+			rules_vars['+'] = RULE_WORD_SIZE;
+
+			rules_vars['#'] = 0;
+			rules_vars['@'] = 0;
+			rules_vars['$'] = 1;
+		} else {
+			rules_vars['*'] = rules_max_length;
+			rules_vars['-'] = rules_max_length - 1;
+			rules_vars['+'] = rules_max_length + 1;
+
+			rules_vars['#'] = min_length;
+			rules_vars['@'] = min_length ? min_length - 1 : 0;
+			rules_vars['$'] = min_length + 1;
+		}
+		length_initiated_as = rules_stacked_after;
+	}
+
 	which = 0;
 
 	while (RULE) {
-		in[RULE_WORD_SIZE - 1] = 0;
+		if (length >= RULE_WORD_SIZE)
+			in[length = RULE_WORD_SIZE - 1] = 0;
 
 		switch (LAST) {
 /* Crack 4.1 rules */
@@ -1202,14 +819,6 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 			if (rules_pass == -1) {
 				memmove(rule - 1, rule, strlen(rule) + 1);
 				rule--;
-			}
-			break;
-
-		case '_':
-			{
-				int pos;
-				POSITION(pos)
-				if (length != pos) REJECT
 			}
 			break;
 
@@ -1246,9 +855,6 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 					    conv_tolower[ARCH_INDEX(in[pos])];
 				in[pos] = 0;
 			}
-			if (in[0] != 'M' || in[1] != 'c')
-				break;
-			in[2] = conv_toupper[ARCH_INDEX(in[2])];
 			break;
 
 		case 'r':
@@ -1280,6 +886,19 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 			break;
 
 		case 'p':
+			if (hc_logic || (*rule >= '1' && *rule <= '9')) {
+				/* HC rule: duplicate word N times */
+				unsigned char x, y;
+				POSITION(x)
+				y = x;
+				in[length*(x + 1)] = 0;
+				while (x) {
+					memcpy(in + length*x, in, length);
+					--x;
+				}
+				length *= (y + 1);
+				break;
+			} else { /* else john's original pluralize rule. */
 			if (length < 2) break;
 			{
 				int pos = length - 1;
@@ -1304,25 +923,69 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 					strcat(in, "s");
 			}
 			length = strlen(in);
+			}
 			break;
 
 		case '$':
 			VALUE(in[length++])
+			if (NEXT == '$') {
+				(void)RULE;
+				VALUE(in[length++])
+				if (NEXT == '$') {
+					(void)RULE;
+					VALUE(in[length++])
+				}
+			}
 			in[length] = 0;
 			break;
 
 		case '^':
 			{
-				char *out;
+				char *out, a, b;
 				GET_OUT
+				VALUE(a)
+				if (NEXT != '^') {
+					out[0] = a;
+					memcpy(&out[1], in, ++length);
+					in = out;
+					break;
+				}
+				(void)RULE;
+				VALUE(b)
+				if (NEXT != '^') {
+					out[0] = b;
+					out[1] = a;
+					memcpy(&out[2], in, length + 1);
+					length += 2;
+					in = out;
+					break;
+				}
+				(void)RULE;
 				VALUE(out[0])
-				strcpy(&out[1], in);
+				out[1] = b;
+				out[2] = a;
+				memcpy(&out[3], in, length + 1);
+				length += 3;
 				in = out;
 			}
-			length++;
 			break;
 
 		case 'x':
+			if (hc_logic) {
+				/* Slightly different edge logic for HC */
+				int pos, pos2;
+				POSITION(pos)
+				POSITION(pos2)
+				if (pos < length && pos+pos2 <= length) {
+					char *out;
+					GET_OUT
+					in += pos;
+					strnzcpy(out, in, pos2 + 1);
+					length = strlen(in = out);
+					break;
+				}
+				break;
+			} else
 			{
 				int pos;
 				POSITION(pos)
@@ -1349,6 +1012,16 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 					memmove(p + 1, p, length++ - pos);
 					VALUE(*p)
 					in[length] = 0;
+					break;
+				}
+				if (hc_logic) {
+					/* different edge logic for HC */
+					int x;
+					VALUE(x)
+					if (pos == length) {
+						in[length++] = x;
+						in[length] = 0;
+					}
 					break;
 				}
 			}
@@ -1410,20 +1083,34 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 
 /* Crack 5.0 rules */
 		case '[':
-			if (length) {
-				char *out;
-				GET_OUT
-				strcpy(out, &in[1]);
-				length--;
-				in = out;
-				break;
+			{
+				int count = 1;
+				while (NEXT == '[') {
+					(void)RULE;
+					count++;
+				}
+				if ((length -= count) > 0) {
+					char *out;
+					GET_OUT
+					memcpy(out, &in[count], length + 1);
+					in = out;
+					break;
+				}
+				in[length = 0] = 0;
 			}
-			in[0] = 0;
 			break;
 
 		case ']':
-			if (length)
-				in[--length] = 0;
+			{
+				int count = 1;
+				while (NEXT == ']') {
+					(void)RULE;
+					count++;
+				}
+				if ((length -= count) < 0)
+					length = 0;
+				in[length] = 0;
+			}
 			break;
 
 		case 'C':
@@ -1435,8 +1122,6 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 					    conv_toupper[ARCH_INDEX(in[pos])];
 				in[pos] = 0;
 			}
-			if (in[0] == 'm' && in[1] == 'C')
-				in[2] = conv_tolower[ARCH_INDEX(in[2])];
 			break;
 
 		case 't':
@@ -1538,12 +1223,9 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 				int pos;
 				POSITION(pos)
 				if (pos < length) {
-					char *out;
-					GET_OUT
-					memcpy(out, in, pos);
-					strcpy(&out[pos], &in[pos + 1]);
+					memmove(&in[pos], &in[pos + 1],
+					    length - pos);
 					length--;
-					in = out;
 				}
 			}
 			break;
@@ -1551,10 +1233,19 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 		case '{':
 			if (length) {
 				char *out;
+				int count = 1;
+				while (NEXT == '{') {
+					(void)RULE;
+					count++;
+				}
+				while (count >= length)
+					count -= length;
+				if (!count)
+					break;
 				GET_OUT
-				strcpy(out, &in[1]);
-				in[1] = 0;
-				strcat(out, in);
+				memcpy(out, &in[count], length - count);
+				memcpy(&out[length - count], in, count);
+				out[length] = 0;
 				in = out;
 				break;
 			}
@@ -1565,10 +1256,19 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 			if (length) {
 				char *out;
 				int pos;
+				int count = 1;
+				while (NEXT == '}') {
+					(void)RULE;
+					count++;
+				}
+				while (count >= length)
+					count -= length;
+				if (!count)
+					break;
 				GET_OUT
-				out[0] = in[pos = length - 1];
-				in[pos] = 0;
-				strcpy(&out[1], in);
+				memcpy(out, &in[pos = length - count], count);
+				memcpy(&out[count], in, pos);
+				out[length] = 0;
 				in = out;
 				break;
 			}
@@ -1584,10 +1284,34 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 			break;
 
 		case 'R':
+			if (hc_logic || (*rule >= '0' && *rule <= '9')) {
+				/* HC rule: bit-shift character right */
+				unsigned char n;
+				unsigned char val;
+				POSITION(n)
+				if (n < length) {
+					val = in[n];
+					val >>= 1;
+					in[n] = val;
+				}
+				break;
+			}
 			CONV(conv_right);
 			break;
 
 		case 'L':
+			if (hc_logic || (*rule >= '0' && *rule <= '9')) {
+				/* HC rule: bit-shift character left */
+				unsigned char n;
+				unsigned char val;
+				POSITION(n)
+				if (n < length) {
+					val = in[n];
+					val <<= 1;
+					in[n] = val;
+				}
+				break;
+			}
 			CONV(conv_left);
 			break;
 
@@ -1632,12 +1356,12 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 
 		case 'M':
 			memory = memory_buffer;
-			strnfcpy(memory_buffer, in, rules_max_length);
+			strnfcpy(memory_buffer, in, STACK_MAXLEN);
 			rules_vars['m'] = (unsigned char)length - 1;
 			break;
 
 		case 'Q':
-			if (!strncmp(memory, in, rules_max_length))
+			if (!strncmp(memory, in, STACK_MAXLEN))
 				REJECT
 			break;
 
@@ -1649,7 +1373,8 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 				POSITION(mpos)
 				POSITION(count)
 				POSITION(ipos)
-				mleft = (int)(rules_vars['m'] + 1) - mpos;
+				mleft = (int)(unsigned char)
+				    (rules_vars['m'] + 1) - mpos;
 				if (count > mleft)
 					count = mleft;
 				if (count <= 0)
@@ -1687,9 +1412,11 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 				goto out_ERROR_UNALLOWED;
 			if (!split) REJECT
 			if (which)
-				memcpy(buffer[2], in, length + 1);
+				memcpy(buffer[2][STAGE],
+				       in, length + 1);
 			else
-				strnzcpy(buffer[2], &word[split],
+				strnzcpy(buffer[2][STAGE],
+				         &word[split],
 				    RULE_WORD_SIZE);
 			length = split;
 			if (length > RULE_WORD_SIZE - 1)
@@ -1704,12 +1431,14 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 				goto out_ERROR_UNALLOWED;
 			if (!split) REJECT
 			if (which) {
-				memcpy(buffer[2], in, length + 1);
+				memcpy(buffer[2][STAGE],
+				       in, length + 1);
 			} else {
 				length = split;
 				if (length > RULE_WORD_SIZE - 1)
 					length = RULE_WORD_SIZE - 1;
-				strnzcpy(buffer[2], word, length + 1);
+				strnzcpy(buffer[2][STAGE],
+				         word, length + 1);
 			}
 			strnzcpy(in, &word[split], RULE_WORD_SIZE);
 			length = strlen(in);
@@ -1717,16 +1446,24 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 			break;
 
 		case '+':
+			if (hc_logic || split < 0) {
+				/* HC rule: increment character */
+				unsigned char x;
+				POSITION(x)
+				if (x < length)
+					++in[x];
+			} else {
 			switch (which) {
 			case 1:
-				strcat(in, buffer[2]);
+				strcat(in, buffer[2][STAGE]);
 				break;
 
 			case 2:
 				{
 					char *out;
 					GET_OUT
-					strcpy(out, buffer[2]);
+					strcpy(out,
+					       buffer[2][STAGE]);
 					strcat(out, in);
 					in = out;
 				}
@@ -1737,52 +1474,301 @@ char *rules_apply(char *word_in, char *rule, int split, char *last)
 			}
 			length = strlen(in);
 			which = 0;
+			}
+			break;
+
+/* Rules added in Jumbo */
+		case 'a':
+			{
+				int pos;
+				POSITION(pos)
+				if (!rules_stacked_after) {
+					if (length + pos > rules_max_length)
+						REJECT
+					if (length + pos < min_length)
+						REJECT
+				}
+			}
+			break;
+
+		case 'b':
+			{
+				int pos;
+				POSITION(pos)
+				if (!rules_stacked_after) {
+					if (length - pos > rules_max_length)
+						REJECT
+					if (length - pos < min_length)
+						REJECT
+				}
+			}
+			break;
+
+		case 'W':
+			{
+				int pos;
+				POSITION(pos)
+				in[pos] = conv_shift[ARCH_INDEX(in[pos])];
+			}
+			break;
+
+		case 'U':
+			if (!valid_utf8((UTF8*)in))
+				REJECT
+			break;
+
+/* Hashcat rules added to Jumbo */
+		case '_': /* reject unless length equals to N */
+			{
+				int pos;
+				POSITION(pos)
+				if (length != pos) REJECT
+			}
+			break;
+
+		case '-': /* decrement character */
+			{
+				unsigned char x;
+				POSITION(x)
+				if (x < length)
+					--in[x];
+			}
+			break;
+
+		case 'k': /* swap leading two characters */
+			if (length > 1)
+				SWAP2(0,1)
+			break;
+
+		case 'K': /* swap last two characters */
+			if (length > 1)
+				SWAP2((unsigned)length - 1,(unsigned)length - 2)
+			break;
+
+		case '*': /* swap any two characters */
+			{
+				unsigned char x, y;
+				POSITION(x)
+				POSITION(y)
+				if (length > x && length > y)
+					SWAP2(x,y)
+			}
+			break;
+
+		case 'z': /* duplicate first char N times */
+			{
+				unsigned char x;
+				int y;
+				POSITION(x)
+				y = length;
+				while (y) {
+					in[y + x] = in[y];
+					--y;
+				}
+				length += x;
+				in[length] = 0;
+				while(x) {
+					in[x] = in[0];
+					--x;
+				}
+			}
+			break;
+
+		case 'Z': /* duplicate char char N times */
+			{
+				unsigned char x;
+				POSITION(x)
+				while (x) {
+					in[length] = in[length - 1];
+					++length;
+					--x;
+				}
+				in[length] = 0;
+			}
+			break;
+
+		case 'q': /* duplicate every character */
+			{
+				int x = length << 1;
+				in[x--] = 0;
+				while (x>0) {
+					in[x] = in[x - 1] = in[x >> 1];
+					x -= 2;
+				}
+				length <<= 1;
+			}
+			break;
+
+		case '.': /* replace character with next */
+			{
+				unsigned char n;
+				POSITION(n)
+				if (n < length - 1 && length > 1)
+					in[n] = in[n + 1];
+			}
+			break;
+
+		case ',': /* replace character with prior */
+			{
+				unsigned char n;
+				POSITION(n)
+				if (n >= 1 && length > 1 && n < length)
+					in[n] = in[n - 1];
+			}
+			break;
+
+		case 'y': /* duplicate first n characters */
+			{
+				unsigned char n;
+				POSITION(n)
+				if (n <= length) {
+					memmove(&in[n], in, length);
+					length += n;
+					in[length] = 0;
+				}
+			}
+			break;
+
+		case 'Y': /* duplicate last n characters */
+			{
+				unsigned char n;
+				POSITION(n)
+				if (n <= length) {
+					memmove(&in[length], &in[length - n], n);
+					length += n;
+					in[length] = 0;
+				}
+			}
+			break;
+
+		case '4': /*  append memory */
+			{
+				int m = rules_vars['m'] + 1;
+				memcpy(&in[length], memory, m);
+				in[length += m] = 0;
+				break;
+			}
+			break;
+
+		case '6': /*  prepend memory */
+			{
+				int m = rules_vars['m'] + 1;
+				memmove(&in[m], in, length);
+				memcpy(in, memory, m);
+				in[length += m] = 0;
+				break;
+			}
+			break;
+
+		case 'O': /*  Omit */
+			{
+				int pos, pos2;
+				POSITION(pos)
+				POSITION(pos2)
+				if (pos < length && pos+pos2 <= length) {
+					char *out;
+					GET_OUT
+					strncpy(out, in, pos);
+					in += pos + pos2;
+					strnzcpy(out + pos, in, length - (pos + pos2) + 1);
+					length -= pos2;
+					in = out;
+					break;
+				}
+			}
+			break;
+
+		case 'E': /*  Title Case */
+			{
+				int up=1, idx=0;
+				while (in[idx]) {
+					if (up) {
+						if (in[idx] != ' ') {
+							if (in[idx] >= 'a' &&
+							    in[idx] <= 'z')
+								in[idx] -= 0x20;
+							up = 0;
+						}
+					} else {
+						if (in[idx] == ' ')
+							up = 1;
+						else if (in[idx] >= 'A' &&
+						         in[idx] <= 'Z')
+							in[idx] += 0x20;
+					}
+					++idx;
+				}
+
+			}
+			break;
+
+		case 'e': /* extended title case JtR specific, not HC 'yet' */
+			{
+				int up=1;
+				CLASS(0,
+				      up=1,
+				      if (up) in[pos] = conv_toupper[ARCH_INDEX(in[pos])];
+				      else   in[pos] = conv_tolower[ARCH_INDEX(in[pos])];
+				      up=0)
+			}
 			break;
 
 		default:
 			goto out_ERROR_UNKNOWN;
 		}
 
-		if (!length) REJECT
+		if (!length && !hc_logic)
+			REJECT
 	}
 
 	if (which)
 		goto out_which;
 
 out_OK:
-	in[rules_max_length] = 0;
-	if (minlength)
-		if (length < minlength)
+	in[STACK_MAXLEN] = 0;
+	if (!rules_stacked_after) {
+		if (min_length && length < min_length)
 			return NULL;
-	/* --maxlength will skip, not truncate */
-	if (maxlength)
-		if (length > maxlength)
+		/*
+		 * Over --max-length are always skipped, while over
+		 * format's length are truncated if FMT_TRUNC.
+		 */
+		if (skip_length && length > skip_length)
 			return NULL;
+	}
+	if (!(options.flags & FLG_MASK_STACKED) &&
+	    options.internal_cp != UTF_8 && options.target_enc == UTF_8) {
+		char out[PLAINTEXT_BUFFER_SIZE + 1];
+
+		strcpy(in, cp_to_utf8_r(in, out, STACK_MAXLEN));
+		length = strlen(in);
+	}
+
 	if (last) {
-		if (length > rules_max_length)
-			length = rules_max_length;
+		if (length > STACK_MAXLEN)
+			length = STACK_MAXLEN;
 		if (length >= ARCH_SIZE - 1) {
 			if (*(ARCH_WORD *)in != *(ARCH_WORD *)last)
-				return rules_cp_to_utf8(in);
+				return in;
 			if (strcmp(&in[ARCH_SIZE - 1], &last[ARCH_SIZE - 1]))
-				return rules_cp_to_utf8(in);
+				return in;
 			return NULL;
 		}
 		if (last[length])
-			return rules_cp_to_utf8(in);
+			return in;
 		if (memcmp(in, last, length))
-			return rules_cp_to_utf8(in);
+			return in;
 		return NULL;
 	}
-	return rules_cp_to_utf8(in);
+	return in;
 
 out_which:
 	if (which == 1) {
-		strcat(in, buffer[2]);
+		strcat(in, buffer[2][STAGE]);
 		goto out_OK;
 	}
-	strcat(buffer[2], in);
-	in = buffer[2];
+	strcat(buffer[2][STAGE], in);
+	in = buffer[2][STAGE];
 	goto out_OK;
 
 out_ERROR_POSITION:
@@ -1808,6 +1794,103 @@ out_ERROR_UNKNOWN:
 out_ERROR_UNALLOWED:
 	rules_errno = RULES_ERROR_UNALLOWED;
 	goto out_NULL;
+}
+
+/*
+ * Advance stacked rules. We iterate main rules first and only then we
+ * advance the stacked rules (and rewind the main rules). Repeat until
+ * main rules are done with the last stacked rule.
+ */
+int rules_advance_stack(rule_stack *ctx)
+{
+	if (!(ctx->rule = ctx->rule->next))
+		ctx->done = 1;
+	else {
+		rules_stacked_number++;
+		log_event("+ Stacked Rule #%u: '%.100s' accepted",
+		          rules_stacked_number, ctx->rule->data);
+	}
+
+	return !ctx->done;
+}
+
+/*
+ * Return next word from stacked rules.
+ */
+char *rules_process_stack(char *key, rule_stack *ctx)
+{
+	static union {
+		char buf[LINE_BUFFER_SIZE];
+		ARCH_WORD dummy;
+	} aligned;
+	static char *last = aligned.buf;
+	char *word;
+
+	if (!ctx->rule) {
+		ctx->rule = ctx->stack_rule->head;
+		rules_stacked_number = 1;
+		log_event("+ Stacked Rule #%u: '%.100s' accepted",
+		          rules_stacked_number, ctx->rule->data);
+	}
+
+	rules_stacked_after = 0;
+
+	if ((word = rules_apply(key, ctx->rule->data, -1, last)))
+		last = word;
+
+	rules_stacked_after = 1;
+
+	return word;
+}
+
+/*
+ * Return all words from stacked rules, then NULL.
+ */
+char *rules_process_stack_all(char *key, rule_stack *ctx)
+{
+	static union {
+		char buf[LINE_BUFFER_SIZE];
+		ARCH_WORD dummy;
+	} aligned;
+	static char *last = aligned.buf;
+	char *word;
+
+	if (!ctx->rule) {
+		ctx->rule = ctx->stack_rule->head;
+		rules_stacked_number = 1;
+		if (!stack_rules_mute)
+			log_event("+ Stacked Rule #%u: '%.100s' accepted",
+			          rules_stacked_number, ctx->rule->data);
+	} else
+		ctx->rule = ctx->rule->next;
+
+	rules_stacked_after = 0;
+
+	while (ctx->rule) {
+		if ((word = rules_apply(key, ctx->rule->data, -1, last))) {
+			last = word;
+			return word;
+		} else
+		if ((ctx->rule = ctx->rule->next)) {
+			rules_stacked_number++;
+			if (!stack_rules_mute)
+			    log_event("+ Stacked Rule #%u: '%.100s' accepted",
+			          rules_stacked_number, ctx->rule->data);
+		}
+	}
+
+	rules_stacked_after = 1;
+
+	if (!stack_rules_mute && options.verbosity <= VERB_DEFAULT) {
+		stack_rules_mute = 1;
+		if (john_main_process) {
+			log_event(
+"- Some rule logging suppressed. Re-enable with --verbosity=%d or greater",
+			          VERB_LEGACY);
+		}
+	}
+
+	return NULL;
 }
 
 /*
@@ -1840,6 +1923,9 @@ static int rules_check(struct rpp_context *start, int split)
 		count++;
 	}
 	rules_pass = 0;
+
+	if (rules_errno)
+		rules_err_rule = rule;
 
 	return rules_errno ? 0 : count;
 }
@@ -1957,11 +2043,11 @@ int rules_remove_dups(struct cfg_line *pLines, int log)
 	rules_load_normalized_list(pLines);
 
 	HASH_LOG = 10;
-	while ( HASH_LOG < 22 && (1<<(HASH_LOG+1)) < rules_tmp_dup_removal_cnt)
+	while ( HASH_LOG < 22 && (1 << (HASH_LOG + 1)) < rules_tmp_dup_removal_cnt)
 		HASH_LOG += 2;
-	HASH_SIZE     = (1<<HASH_LOG);
-	HASH_LOG_HALF = (HASH_LOG>>1);
-	HASH_MASK     = (HASH_SIZE-1);
+	HASH_SIZE     = (1 << HASH_LOG);
+	HASH_LOG_HALF = (HASH_LOG >> 1);
+	HASH_MASK     = (HASH_SIZE - 1);
 
 	pHashTbl = mem_alloc(sizeof(struct HashPtr)*HASH_SIZE);
 	memset(pHashTbl, 0, sizeof(struct HashPtr)*HASH_SIZE);
@@ -1981,6 +2067,8 @@ int rules_remove_dups(struct cfg_line *pLines, int log)
 			// then we do NOT add this line.
 			struct HashPtr *p = pHashTbl[hashId].pNext;
 			int bGood = 1;
+
+			if (strncmp(p1->data, "!!", 2))
 			for (;;) {
 				if (!strcmp(p1->data, p->pLine->data)) {
 					bGood = 0;
@@ -2011,23 +2099,40 @@ int rules_count(struct rpp_context *start, int split)
 {
 	int count1, count2;
 
+	if (!strcmp(start->input->data, "!! hashcat logic ON"))
+		hc_logic = 1;
+	else if (!strcmp(start->input->data, "!! hashcat logic OFF"))
+		hc_logic = 0;
+
 	if (!(count1 = rules_check(start, split))) {
-		log_event("! Invalid rule at line %d: %.100s",
-			rules_line, rules_errors[rules_errno]);
+		log_event("! Invalid rule at line %d: %.100s %.100s",
+		          rules_line, rules_errors[rules_errno],
+		          rules_err_rule);
 		if (john_main_process)
-			fprintf(stderr, "Invalid rule in %s at line %d: %s\n",
+			fprintf(stderr,
+			        "Invalid rule in %s at line %d: %s %s\n",
 			        start->input->cfg_name, rules_line,
-			        rules_errors[rules_errno]);
+			        rules_errors[rules_errno], rules_err_rule);
 		error();
 	}
 
-	count2 = rules_remove_dups(start->input, 1);
+	count2 = rules_remove_dups(start->input,
+	                           options.verbosity == VERB_DEBUG);
 	if (count2) {
 		count2 = rules_check(start, split);
 		log_event("- %d preprocessed word mangling rules were reduced "
-		          "by dropping %d rules", count1, count1-count2);
+		          "by dropping %d rules", count1, count1 - count2);
 		count1 = count2;
 	}
 
+	if (((options.flags & FLG_PIPE_CHK) && count1 >= RULES_MUTE_THR) &&
+	    options.verbosity < VERB_LEGACY) {
+		rules_mute = 1;
+		if (john_main_process) {
+			log_event(
+"- Some rule logging suppressed. Re-enable with --verbosity=%d or greater",
+			          VERB_LEGACY);
+		}
+	}
 	return count1;
 }

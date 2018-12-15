@@ -2,14 +2,19 @@
 // It will make sure the salt does not contain any 'bad' characters, and if so, it will convert
 // the salt into the $HEX$ format.
 
+#if AC_BUILT
+#include "autoconfig.h"
+#endif
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
 // isatty() in different locations, for VC, vs *unix.
-#ifdef _MSC_VER
+#if (!AC_BUILT && _MSC_VER) || (AC_BUILT && HAVE_IO_H)
 #include <io.h>
-#else
+#endif
+#if (!AC_BUILT || HAVE_UNISTD_H) && !_MSC_VER
 #include <unistd.h>
 #endif
 #include "memdbg.h"
@@ -63,7 +68,18 @@ void Setup() {
 	atoi16['f'] = atoi16['F'] = 15;
 }
 
+#ifdef HAVE_LIBFUZZER
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	return 0;
+}
+#endif
+
+#ifdef HAVE_LIBFUZZER
+int main_dummy(int argc, char **argv) {
+#else
 int main(int argc, char **argv) {
+#endif
 	char Buf[1024], *cps, *cph, usr_id[512];;
 
 	Setup();
@@ -85,12 +101,12 @@ int main(int argc, char **argv) {
 		if (!leading_salt) {
 			recurse=0;
 			if (!find_items(Buf, &cph, &cps, usr_id)) {
-				fprintf (stderr, "invalid line:   %s\n", Buf);
+				fprintf(stderr, "invalid line:   %s\n", Buf);
 				FGETS(Buf, sizeof(Buf), stdin);
 				continue;
 			}
 			if (recurse > 1) {
-				fprintf (stderr, "multiple recurse line (usrid may be wrong):   %s\n", Buf);
+				fprintf(stderr, "multiple recurse line (usrid may be wrong):   %s\n", Buf);
 			}
 		} else {
 			cps = Buf;
@@ -117,6 +133,11 @@ char *GetSalt(char *s) {
 			// NOTE, some of these chars will never be seen in this app, due to strtok taking them out, or
 			// due to the C language not allowing them (i.e. null).  But they are listed here for documenation
 			if (*cp == ':' || *cp == '\\' || *cp == '\n' || *cp == '\r' || *cp == '\x0' || *cp == '$') { tohex=1; break; }
+			// Ok, if there is trailing white space in the salt, jtr core 'can' strip this out, if there is only a
+			// flat hash, and no user name.  This 'issue' is by design within core, so we try to work around that
+			// by detecting this can happen, and simply use $HEX$ in that situation.
+			if (!cp[1] && (*cp == ' ' || *cp == '\t'))
+				tohex = 1;
 			++cp;
 		}
 	}
@@ -152,7 +173,7 @@ int simple_convert() {
 	unsigned char *p = (unsigned char*)raw_str;
 	if (simple_to_from_hex==1) {
 		// convert a raw value into hex
-		printf ("$HEX$");
+		printf("$HEX$");
 		while (*p)
 			printf("%02x", *p++);
 	} else {
@@ -167,15 +188,15 @@ int simple_convert() {
 }
 
 // Ok, handle these 2 cases:
-// raw_hash:salt              // end result:    :$dynamic_x$raw_hash$fixed_salt
-// user_id:raw_hash:salt      // end result:    user_id:$dynamic_x$raw_hash$fixed_salt
+// raw_hash[:$]salt              // end result:    :$dynamic_x$raw_hash$fixed_salt
+// user_id:raw_hash[:$]salt      // end result:    user_id:$dynamic_x$raw_hash$fixed_salt
 
 int find_items(char *Buf, char **cph, char **cps, char *usr_id) {
 	int istype1=1;
 	char *usr_ptr;
 	*cph = Buf;
 	*cps = &Buf[hash_len];
-	if (*(*cps) == salt_sep) {
+	if (*(*cps) == salt_sep || *(*cps) == '$') {
 		// Ok, could be type 1.
 		int x=0;
 		while(x < hash_len && istype1) {

@@ -18,6 +18,8 @@
 #include "john.h"
 #include "memdbg.h"
 
+#define FLG_ZERO			0x0
+
 static char *opt_errors[] = {
 	NULL,	/* No error */
 	"Unknown option",
@@ -41,6 +43,9 @@ static char *opt_find(struct opt_entry *list, char *opt,
 		if (!(param = strchr(name, '=')))
 			param = strchr(name, ':');
 		if (param) {
+			char *c = strchr(name, ':');
+			if (c && param > c)
+				param = c;
 			length = param - name;
 			if (!*++param) param = NULL;
 		} else
@@ -55,8 +60,11 @@ static char *opt_find(struct opt_entry *list, char *opt,
 					if (length == strlen(list->name))
 						break;
 				} else {
-					*entry = NULL;
-					return NULL;
+					if (strncmp(found->name, list->name,
+					            strlen(found->name))) {
+						*entry = NULL;
+						return NULL;
+					}
 				}
 			}
 		} while ((++list)->name);
@@ -114,6 +122,11 @@ static int opt_process_one(struct opt_entry *list, opt_flags *flg, char *opt)
 		} else
 		if (opt_process_param(param, entry->format, entry->param))
 			return OPT_ERROR_PARAM_INV;
+
+		/* Dupe checking without an option flag */
+		if (param && entry->flg_set == FLG_ZERO &&
+		    entry->req_clr & OPT_REQ_PARAM && entry->param_set++)
+			return OPT_ERROR_COMB;
 	} else
 	if (param) return OPT_ERROR_PARAM_EXT;
 
@@ -135,8 +148,14 @@ static int opt_check_one(struct opt_entry *list, opt_flags flg, char *opt)
 
 void opt_process(struct opt_entry *list, opt_flags *flg, char **argv)
 {
+	struct opt_entry *lp;
 	char **opt;
 	int res;
+
+	/* Clear Jumbo dupe-check in case we're resuming */
+	if ((lp = list))
+	while (lp->name)
+		lp++->param_set = 0;
 
 	if (*(opt = argv))
 	while (*++opt)
@@ -153,20 +172,22 @@ void opt_check(struct opt_entry *list, opt_flags flg, char **argv)
 	int res;
 
 	if (*(opt = argv))
-	while (*++opt)
-	if ((res = opt_check_one(list, flg, *opt))) {
-		if (john_main_process)
-			fprintf(stderr, "%s: \"%s\"\n", opt_errors[res], *opt);
-		error();
-	}
-	/* Alter **argv to reflect to full option names */
-	else if (*opt[0] == '-') {
-		int len = strlen(completed) + 2 + 1;
-		if (completed_param)
-			len += strlen(completed_param) + 1;
-		*opt = mem_alloc_tiny(len, MEM_ALIGN_NONE);
-		sprintf(*opt, "--%s%s%s", completed,
-		        completed_param ? "=" : "",
-		        completed_param ? completed_param : "");
+	while (*++opt) {
+		if ((res = opt_check_one(list, flg, *opt))) {
+			if (john_main_process)
+				fprintf(stderr, "%s: \"%s\"\n",
+				        opt_errors[res], *opt);
+			error();
+		}
+		/* Alter **argv to reflect to full option names */
+		else if (*opt[0] == '-') {
+			int len = strlen(completed) + 2 + 1;
+			if (completed_param)
+				len += strlen(completed_param) + 1;
+			*opt = mem_alloc_tiny(len, MEM_ALIGN_NONE);
+			sprintf(*opt, "--%s%s%s", completed,
+			        completed_param ? "=" : "",
+			        completed_param ? completed_param : "");
+		}
 	}
 }

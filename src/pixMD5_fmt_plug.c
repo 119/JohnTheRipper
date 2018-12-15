@@ -5,6 +5,17 @@
  * Converted to thin format, into $dynamic_19$ format.
  */
 
+#if AC_BUILT
+#include "autoconfig.h"
+#endif
+#ifndef DYNAMIC_DISABLED
+
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_pixMD5;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_pixMD5);
+#else
+
 #include <string.h>
 
 #include "common.h"
@@ -16,11 +27,14 @@
 #define FORMAT_NAME		"Cisco PIX"
 #define ALGORITHM_NAME		"?" /* filled in by md5-gen */
 #define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH		0
+#define BENCHMARK_LENGTH		-1
 
-#define PLAINTEXT_LENGTH		32
+// set PLAINTEXT_LENGTH to 0, so dyna will set this  (note, 16 was right, but just let dyna set it)
+#define PLAINTEXT_LENGTH		0
 #define CIPHERTEXT_LENGTH		16
 #define BINARY_SIZE				16
+#define BINARY_ALIGN			MEM_ALIGN_WORD
+#define SALT_ALIGN				MEM_ALIGN_WORD
 
 #define SALT_SIZE			0
 
@@ -33,6 +47,8 @@ static struct fmt_tests pixmd5_tests[] = {
 	{"NuLKvvWGg.x9HEKO", "password"},
 	{"8Ry2YjIyt7RRXU24", ""},
 	{".7nfVBEIEu4KbF/1","0123456789abcdef"},        // added a exact 16 byte password, to make sure it works properly
+	// repeat first hash in exactly the same format that is used in john.pot
+	{"$dynamic_19$2KFQnbNIdI.2KYOU", "cisco"},
 	{NULL}
 };
 
@@ -47,7 +63,7 @@ static char *Convert(char *Buf, char *ciphertext) {
 	if (text_in_dynamic_format_already(pDynamic_19, ciphertext))
 		return ciphertext;
 
-	if (strlen(ciphertext) == CIPHERTEXT_LENGTH) {
+	if (strnlen(ciphertext, CIPHERTEXT_LENGTH + 1) == CIPHERTEXT_LENGTH) {
 		sprintf(Buf, "$dynamic_19$%s", ciphertext);
 		return Buf;
 	}
@@ -56,7 +72,8 @@ static char *Convert(char *Buf, char *ciphertext) {
 
 static char *our_split(char *ciphertext, int index, struct fmt_main *self)
 {
-	return Convert(Conv_Buf, ciphertext);
+	get_ptr();
+	return pDynamic_19->methods.split(Convert(Conv_Buf, ciphertext), index, self);
 }
 static void * our_salt(char *ciphertext) {
 	get_ptr();
@@ -69,7 +86,8 @@ static int valid(char *ciphertext, struct fmt_main *self) {
 	if (!ciphertext)
 		return 0;
 	get_ptr();
-	i = strlen(ciphertext);
+
+	i = strnlen(ciphertext, CIPHERTEXT_LENGTH + 1);
 	if (i > CIPHERTEXT_LENGTH)
 		return pDynamic_19->methods.valid(ciphertext, pDynamic_19);
 	if (i == CIPHERTEXT_LENGTH)
@@ -78,6 +96,7 @@ static int valid(char *ciphertext, struct fmt_main *self) {
 }
 
 static void * our_binary(char *ciphertext) {
+	get_ptr();
 	return pDynamic_19->methods.binary(Convert(Conv_Buf, ciphertext));
 }
 
@@ -86,10 +105,9 @@ struct fmt_main fmt_pixMD5 = {
 		// setup the labeling and stuff. NOTE the max and min crypts are set to 1
 		// here, but will be reset within our init() function.
 		FORMAT_LABEL, FORMAT_NAME, ALGORITHM_NAME, BENCHMARK_COMMENT, BENCHMARK_LENGTH,
-		16, BINARY_SIZE, DEFAULT_ALIGN, SALT_SIZE, DEFAULT_ALIGN, 1, 1, FMT_CASE | FMT_8_BIT,
-#if FMT_MAIN_VERSION > 11
+		0, PLAINTEXT_LENGTH, BINARY_SIZE, BINARY_ALIGN, SALT_SIZE, SALT_ALIGN, 1, 1, FMT_CASE | FMT_8_BIT | FMT_DYNAMIC,
 		{ NULL },
-#endif
+		{ NULL },
 		pixmd5_tests
 	},
 	{
@@ -99,18 +117,22 @@ struct fmt_main fmt_pixMD5 = {
 		fmt_default_done,
 		fmt_default_reset,
 		fmt_default_prepare,
-		valid
+		valid,
+		our_split
 	}
 };
+
+static void link_funcs() {
+	fmt_pixMD5.methods.salt   = our_salt;
+	fmt_pixMD5.methods.binary = our_binary;
+	fmt_pixMD5.methods.split = our_split;
+}
 
 static void pixmd5_init(struct fmt_main *self)
 {
 	if (self->private.initialized == 0) {
-		pDynamic_19 = dynamic_THIN_FORMAT_LINK(&fmt_pixMD5, Convert(Conv_Buf, pixmd5_tests[0].ciphertext), "pix-md5", 1);
-		fmt_pixMD5.methods.salt   = our_salt;
-		fmt_pixMD5.methods.binary = our_binary;
-		fmt_pixMD5.methods.split = our_split;
-		fmt_pixMD5.params.algorithm_name = pDynamic_19->params.algorithm_name;
+		get_ptr();
+		pDynamic_19->methods.init(pDynamic_19);
 		self->private.initialized = 1;
 	}
 }
@@ -118,17 +140,10 @@ static void pixmd5_init(struct fmt_main *self)
 static void get_ptr() {
 	if (!pDynamic_19) {
 		pDynamic_19 = dynamic_THIN_FORMAT_LINK(&fmt_pixMD5, Convert(Conv_Buf, pixmd5_tests[0].ciphertext), "pix-md5", 0);
-		fmt_pixMD5.methods.salt   = our_salt;
-		fmt_pixMD5.methods.binary = our_binary;
-		fmt_pixMD5.methods.split = our_split;
+		link_funcs();
 	}
 }
 
-/**
- * GNU Emacs settings: K&R with 1 tab indent.
- * Local Variables:
- * c-file-style: "k&r"
- * c-basic-offset: 8
- * indent-tabs-mode: t
- * End:
- */
+#endif /* plugin stanza */
+
+#endif /* DYNAMIC_DISABLED */

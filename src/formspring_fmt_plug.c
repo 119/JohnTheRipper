@@ -17,6 +17,17 @@
  *
  */
 
+#if AC_BUILT
+#include "autoconfig.h"
+#endif
+#ifndef DYNAMIC_DISABLED
+
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_FORMSPRING;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_FORMSPRING);
+#else
+
 #include <string.h>
 
 #include "common.h"
@@ -33,17 +44,28 @@
 #define BENCHMARK_LENGTH	0
 
 #define BINARY_SIZE		    32
+#define DYNA_BINARY_SIZE	16
+#define BINARY_ALIGN		MEM_ALIGN_WORD
 #define HEX_SIZE		    (BINARY_SIZE * 2)
 
 #define SALT_SIZE			2
+#define DYNA_SALT_SIZE		(sizeof(char*))
+#define SALT_ALIGN			MEM_ALIGN_WORD
 
-#define PLAINTEXT_LENGTH	32
+// set PLAINTEXT_LENGTH to 0, so dyna will set this
+#define PLAINTEXT_LENGTH	0
 #define CIPHERTEXT_LENGTH	(SALT_SIZE + 1 + HEX_SIZE)
 
 static struct fmt_tests formspring_tests[] = {
 	{"2a4fa0bf8c6a01dd625d3141746451ba51e07f99dc9143f1e25a37f65cb02eb4$RA", "test1"},
-	//{"b06b5c132bb1adf421ce6ac406bfabba380546deaab92bd20c3d56baaa70b6cf$  ", "test1"},
-	//{"cdefb423bad94e3abfe5fc4044bb315a2b875220eb8c8b840849df7ef45bdcef$  ", "test3"},
+	// repeat in the same format that is used in john.pot
+	{"$dynamic_61$2a4fa0bf8c6a01dd625d3141746451ba51e07f99dc9143f1e25a37f65cb02eb4$RA", "test1"},
+	{"b06b5c132bb1adf421ce6ac406bfabba380546deaab92bd20c3d56baaa70b6cf$  ", "test1"},
+	{"cdefb423bad94e3abfe5fc4044bb315a2b875220eb8c8b840849df7ef45bdcef$  ", "test3"},
+	// these fail, salt too long
+	//{"$dynamic_61$a987090ac31f466c4637e22858aa3db0001e7c0ad8e6724e26e76b8e531df46c$76931fac", "abc"},
+	//{"$dynamic_61$bb18710c098cc97a204d9a17bdd701d323a48ccaf67adcf67186a91da3619ac9$9dab2b36", "john"},
+	//{"$dynamic_61$eecc9358bf47c8739dd988c1926a5346721557ed50665c4ef41224fceb009ad5$c248b87d", "passweird"},
 	{NULL}
 };
 
@@ -66,7 +88,8 @@ static char *Convert(char *Buf, char *ciphertext)
 
 static char *our_split(char *ciphertext, int index, struct fmt_main *self)
 {
-	return Convert(Conv_Buf, ciphertext);
+	get_ptr();
+	return pDynamic_61->methods.split(Convert(Conv_Buf, ciphertext), index, self);
 }
 
 static char *our_prepare(char *split_fields[10], struct fmt_main *self)
@@ -77,16 +100,26 @@ static char *our_prepare(char *split_fields[10], struct fmt_main *self)
 
 static int formspring_valid(char *ciphertext, struct fmt_main *self)
 {
-	int i;
-	if (!ciphertext ) // || strlen(ciphertext) < CIPHERTEXT_LENGTH)
+	if (!ciphertext )
 		return 0;
 
 	get_ptr();
-	i = strlen(ciphertext);
 
-	if (i != CIPHERTEXT_LENGTH)
-		return pDynamic_61->methods.valid(ciphertext, pDynamic_61);
-	return pDynamic_61->methods.valid(Convert(Conv_Buf, ciphertext), pDynamic_61);
+	if (strnlen(ciphertext, CIPHERTEXT_LENGTH + 1) == CIPHERTEXT_LENGTH &&
+	    strncmp(ciphertext, "$dynamic", 8))
+		ciphertext = Convert(Conv_Buf, ciphertext);
+	if (!pDynamic_61->methods.valid(ciphertext, pDynamic_61))
+		return 0;
+	// safe, since this has already passed dynamic valid. We know there is a '$'
+	// for the salt, otherwise it would fail valid before this point.
+	if (strlen(strrchr(ciphertext, '$')) != SALT_SIZE + 1) {
+		// check for $HEX$ (such as re-reading from the .pot file
+		ciphertext = strstr(ciphertext, "$HEX$");
+		if (ciphertext && strlen(ciphertext) == 5 + SALT_SIZE * 2)
+			return 1;
+		return 0;
+	}
+	return 1;
 }
 
 
@@ -97,6 +130,7 @@ static void * our_salt(char *ciphertext)
 }
 static void * our_binary(char *ciphertext)
 {
+	get_ptr();
 	return pDynamic_61->methods.binary(Convert(Conv_Buf, ciphertext));
 }
 
@@ -106,10 +140,9 @@ struct fmt_main fmt_FORMSPRING =
 		// setup the labeling and stuff. NOTE the max and min crypts are set to 1
 		// here, but will be reset within our init() function.
 		FORMAT_LABEL, FORMAT_NAME, ALGORITHM_NAME, BENCHMARK_COMMENT, BENCHMARK_LENGTH,
-		PLAINTEXT_LENGTH, BINARY_SIZE, DEFAULT_ALIGN, SALT_SIZE+1, DEFAULT_ALIGN, 1, 1, FMT_CASE | FMT_8_BIT,
-#if FMT_MAIN_VERSION > 11
+		0, PLAINTEXT_LENGTH, DYNA_BINARY_SIZE, BINARY_ALIGN, DYNA_SALT_SIZE, SALT_ALIGN, 1, 1, FMT_CASE | FMT_8_BIT | FMT_DYNAMIC,
 		{ NULL },
-#endif
+		{ NULL },
 		formspring_tests
 	},
 	{
@@ -119,19 +152,23 @@ struct fmt_main fmt_FORMSPRING =
 		fmt_default_done,
 		fmt_default_reset,
 		our_prepare,
-		formspring_valid
+		formspring_valid,
+		our_split
 	}
 };
+
+static void link_funcs() {
+	fmt_FORMSPRING.methods.salt   = our_salt;
+	fmt_FORMSPRING.methods.binary = our_binary;
+	fmt_FORMSPRING.methods.split = our_split;
+	fmt_FORMSPRING.methods.prepare = our_prepare;
+}
 
 static void formspring_init(struct fmt_main *self)
 {
 	if (self->private.initialized == 0) {
-		pDynamic_61 = dynamic_THIN_FORMAT_LINK(&fmt_FORMSPRING, Convert(Conv_Buf, formspring_tests[0].ciphertext), "formspring", 1);
-		fmt_FORMSPRING.methods.salt   = our_salt;
-		fmt_FORMSPRING.methods.binary = our_binary;
-		fmt_FORMSPRING.methods.split = our_split;
-		fmt_FORMSPRING.methods.prepare = our_prepare;
-		fmt_FORMSPRING.params.algorithm_name = pDynamic_61->params.algorithm_name;
+		get_ptr();
+		pDynamic_61->methods.init(pDynamic_61);
 		self->private.initialized = 1;
 	}
 }
@@ -139,18 +176,10 @@ static void formspring_init(struct fmt_main *self)
 static void get_ptr() {
 	if (!pDynamic_61) {
 		pDynamic_61 = dynamic_THIN_FORMAT_LINK(&fmt_FORMSPRING, Convert(Conv_Buf, formspring_tests[0].ciphertext), "formspring", 0);
-		fmt_FORMSPRING.methods.salt   = our_salt;
-		fmt_FORMSPRING.methods.binary = our_binary;
-		fmt_FORMSPRING.methods.split = our_split;
-		fmt_FORMSPRING.methods.prepare = our_prepare;
+		link_funcs();
 	}
 }
 
-/**
- * GNU Emacs settings: K&R with 1 tab indent.
- * Local Variables:
- * c-file-style: "k&r"
- * c-basic-offset: 8
- * indent-tabs-mode: t
- * End:
- */
+#endif /* plugin stanza */
+
+#endif /* DYNAMIC_DISABLED */

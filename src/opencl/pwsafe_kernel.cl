@@ -5,27 +5,26 @@
 * Redistribution and use in source and binary forms, with or without modification, are permitted.
 */
 #include "opencl_device_info.h"
+#include "opencl_misc.h"
 
-#if gpu_amd(DEVICE_INFO)
-#define USE_BITSELECT
-#endif
-#ifdef USE_BITSELECT
-#define Ch(x,y,z) (bitselect(z,y,x))
-#define Maj(x,y,z) (bitselect(y, x,(z^y)))
+#if USE_BITSELECT
+#define Ch(x,y,z) bitselect(z, y, x)
+#define Maj(x, y, z) bitselect(x, y, z ^ x)
+#else
+#if HAVE_ANDNOT
+#define Ch(x, y, z) ((x & y) ^ ((~x) & z))
 #else
 #define Ch(x, y, z) (z ^ (x & (y ^ z)))
-#define Maj(x, y, z) ((y & z) | (x & (y | z)))
+#endif
+#define Maj(x, y, z) ((x & y) | (z & (x | y)))
 #endif
 
-#define uint8_t                         uchar
-#define uint32_t                        uint
-#define ror(x,n) rotate(x, (uint)n)
-#define Sigma0(x) ((ror(x,30))  ^ (ror(x,19)) ^ (ror(x,10)))
-#define Sigma1(x) ((ror(x,26))  ^ (ror(x,21)) ^ (ror(x,7)))
-#define sigma0(x) ((ror(x,25))  ^ (ror(x,14)) ^ (x>>3))
-#define sigma1(x) ((ror(x,15)) ^ (ror(x,13)) ^ (x>>10))
-# define SWAP32(n) \
-    (((n) << 24) | (((n) & 0xff00) << 8) | (((n) >> 8) & 0xff00) | ((n) >> 24))
+#define ror(x,n) rotate(x, 32U-n)
+
+#define Sigma0(x) ((ror(x, 2))  ^ (ror(x, 13)) ^ (ror(x, 22)))
+#define Sigma1(x) ((ror(x, 6))  ^ (ror(x, 11)) ^ (ror(x, 25)))
+#define sigma0(x) ((ror(x, 7))  ^ (ror(x, 18)) ^ (x >> 3))
+#define sigma1(x) ((ror(x, 17)) ^ (ror(x, 19)) ^ (x >> 10))
 
 #define R1(a, b, c, d, e, f, g, h, ac) \
 		h += Sigma1(e) + Ch(e,f,g) + ac; \
@@ -50,10 +49,6 @@
         w[14] += sigma1(w[12]) + w[7] + sigma0(w[15]); \
         w[15] += sigma1(w[13]) + w[8] + sigma0(w[0]);
 
-#define PWSAFE_IN_SIZE (KEYS_PER_CRYPT * sizeof(pwsafe_pass))
-#define PWSAFE_OUT_SIZE (KEYS_PER_CRYPT * sizeof(pwsafe_hash))
-#define PWSAFE_SALT_SIZE (sizeof(pwsafe_salt))
-
 
 typedef struct {
         uint8_t v[87];
@@ -71,7 +66,7 @@ typedef struct {
         uint8_t salt[32];
 } pwsafe_salt;
 
-inline void sha256_transform(uint32_t * w, uint32_t * state)
+inline void sha256_transform(uint32_t *w, uint32_t *state)
 {
 	uint32_t a = state[0];
 	uint32_t b = state[1];
@@ -166,17 +161,18 @@ inline void sha256_transform(uint32_t * w, uint32_t * state)
 	state[7] += h;
 }
 
-__kernel void pwsafe_init(__global pwsafe_pass * in, __global pwsafe_salt * salt)
+__kernel void pwsafe_init(__global pwsafe_pass *in,
+                          __constant pwsafe_salt *salt)
 {
 	uint32_t idx = get_global_id(0);
 	uint32_t pl = in[idx].length, i;
-	__global uint32_t * state = (__global uint32_t*)in[idx].v;
+	__global uint32_t *state = (__global uint32_t*)in[idx].v;
 	uint32_t w[32] = {0};
 	uint32_t tstate[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
 
-	if(pl < 24)
+	if (pl < 24)
 	{
-		for(i = 0; i < pl; i++)
+		for (i = 0; i < pl; i++)
 		{
 			w[i / 4] |= (((uint32_t) in[idx].v[i]) << ((3 - (i & 0x3)) << 3));
 		}
@@ -190,7 +186,7 @@ __kernel void pwsafe_init(__global pwsafe_pass * in, __global pwsafe_salt * salt
 	}
 	else
 	{
-		for(i = 0; i < pl; i++)
+		for (i = 0; i < pl; i++)
 		{
 			w[i / 4] |= (((uint32_t) in[idx].v[i]) << ((3 - (i & 0x3)) << 3));
 		}
@@ -215,16 +211,15 @@ __kernel void pwsafe_init(__global pwsafe_pass * in, __global pwsafe_salt * salt
 	in[idx].length = salt->iterations + 1;
 }
 
-__kernel void pwsafe_iter(__global pwsafe_pass * in)
+__kernel void pwsafe_iter(__global pwsafe_pass *in)
 {
 	uint32_t idx = get_global_id(0);
 	uint32_t i = (258 > in[idx].length) ? in[idx].length : 258;
 	in[idx].length -= i;
-	__global uint32_t * state = (__global uint32_t *)in[idx].v;
-
+	__global uint32_t *state = (__global uint32_t *)in[idx].v;
 	uint32_t a, b, c, d, e, f, g, h;
-
 	uint32_t w[16];
+
 	w[0] = state[0];
 	w[1] = state[1];
 	w[2] = state[2];
@@ -356,12 +351,14 @@ __kernel void pwsafe_iter(__global pwsafe_pass * in)
 
 
 
-__kernel void pwsafe_check(__global pwsafe_pass * in, __global pwsafe_hash * out, __global pwsafe_salt * salt)
+__kernel void pwsafe_check(__global pwsafe_pass *in, __global pwsafe_hash *out,
+                           __constant pwsafe_salt *salt)
 {
 	uint32_t idx = get_global_id(0);
-	__global uint32_t * w = (__global uint32_t *)in[idx].v;
+	__global uint32_t *w = (__global uint32_t *)in[idx].v;
 	uint32_t cmp = 0;
-	__global uint32_t *v = (__global uint32_t *) salt->hash;
+	__constant uint32_t *v = (__constant uint32_t *) salt->hash;
+
 	if (*v++ == w[0]) {
 		uint32_t diff;
 		diff = *v++ ^ (w[1]);

@@ -1,5 +1,6 @@
-/* RACF cracker patch for JtR. Hacked together during March of 2012 by
- * Dhiru Kholia <dhiru.kholia at gmail.com> .
+/*
+ * RACF cracker patch for JtR. Hacked together during March of 2012 by
+ * Dhiru Kholia <dhiru.kholia at gmail.com>.
  *
  * This software is Copyright (c) 2012, Dhiru Kholia <dhiru.kholia at gmail.com>
  * and it is hereby released to the general public under the following terms:
@@ -15,10 +16,19 @@
  * racfdump format => userid:$racf$*userid*deshash
  */
 
-#include <openssl/des.h>
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_racf;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_racf);
+#else
+
 #include <string.h>
-#include <assert.h>
-#include <errno.h>
+#include <openssl/des.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
 #include "crc32.h"
 #include "misc.h"
@@ -26,26 +36,28 @@
 #include "formats.h"
 #include "params.h"
 #include "options.h"
-#ifdef _OPENMP
-#include <omp.h>
-#define OMP_SCALE               64
-static int omp_t = 1;
-#endif
 #include "memdbg.h"
 
-#define FORMAT_LABEL		"RACF"
-#define FORMAT_NAME		""
-#define ALGORITHM_NAME		"DES 32/" ARCH_BITS_STR
-#define BENCHMARK_COMMENT	""
-#define BENCHMARK_LENGTH	0
-#define PLAINTEXT_LENGTH	8
-#define CIPHERTEXT_LENGTH	16
-#define BINARY_SIZE		8
-#define SALT_SIZE		sizeof(struct custom_salt)
-#define SALT_ALIGN		1
+#define FORMAT_LABEL            "RACF"
+#define FORMAT_NAME             ""
+#define FORMAT_TAG              "$racf$*"
+#define FORMAT_TAG_LEN          (sizeof(FORMAT_TAG)-1)
+#define ALGORITHM_NAME          "DES 32/" ARCH_BITS_STR
+#define BENCHMARK_COMMENT       ""
+#define BENCHMARK_LENGTH        0
+#define PLAINTEXT_LENGTH        8
+#define CIPHERTEXT_LENGTH       16
+#define BINARY_SIZE             8
+#define SALT_SIZE               sizeof(struct custom_salt)
+#define BINARY_ALIGN            sizeof(uint32_t)
+#define SALT_ALIGN              1
 
-#define MIN_KEYS_PER_CRYPT	1
-#define MAX_KEYS_PER_CRYPT	1
+#define MIN_KEYS_PER_CRYPT      1
+#define MAX_KEYS_PER_CRYPT      256
+
+#ifndef OMP_SCALE
+#define OMP_SCALE               2 // Tuned w/ MKPC for core i7
+#endif
 
 static const unsigned char a2e[256] = {
 	0,  1,  2,  3, 55, 45, 46, 47, 22,  5, 37, 11, 12, 13, 14, 15,
@@ -134,44 +146,50 @@ static struct custom_salt {
 	unsigned char userid[8 + 1];
 } *cur_salt;
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE / sizeof(uint32_t)];
+static DES_key_schedule (*schedules);
+static int dirty;
 
 static void init(struct fmt_main *self)
 {
-#if defined (_OPENMP)
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
-	saved_key = mem_calloc_tiny(sizeof(*saved_key) *
-			self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	crypt_out = mem_calloc_tiny(sizeof(*crypt_out) * self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
+	omp_autotune(self, OMP_SCALE);
+
+	saved_key = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*saved_key));
+	crypt_out = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*crypt_out));
+	schedules = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*schedules));
+}
+
+static void done(void)
+{
+	MEM_FREE(schedules);
+	MEM_FREE(crypt_out);
+	MEM_FREE(saved_key);
 }
 
 static int valid(char *ciphertext, struct fmt_main *self)
 {
 	char *ctcopy;
 	char *keeptr;
-	char *p, *q;
-	int res;
-	if (strncmp(ciphertext, "$racf$*", 7))
+	char *p;
+	int extra;
+
+	if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN))
 		return 0;
 	ctcopy = strdup(ciphertext);
 	keeptr = ctcopy;
-	ctcopy += 7;
-	p = strtok(ctcopy, "*"); /* username */
-	if(!p)
+	ctcopy += FORMAT_TAG_LEN;
+	p = strtokm(ctcopy, "*"); /* username */
+	if (!p)
 		goto err;
-	if ((p = strtok(NULL, "*")) == NULL)	/* hash */
+	if ((p = strtokm(NULL, "*")) == NULL)	/* hash */
 		goto err;
-	q = p;
-	while (atoi16[ARCH_INDEX(*q)] != 0x7F)
-		q++;
-
-	res = !*q && q - p == CIPHERTEXT_LENGTH;
+	if (hexlenu(p, &extra) != CIPHERTEXT_LENGTH || extra)
+		goto err;
 	MEM_FREE(keeptr);
-	return res;
+	return 1;
 
 err:
 	MEM_FREE(keeptr);
@@ -184,10 +202,12 @@ static void *get_salt(char *ciphertext)
 	char *keeptr = ctcopy, *username;
 	static struct custom_salt cs;
 
-	ctcopy += 7;	/* skip over "$racf$*" */
-	username = strtok(ctcopy, "*");
+	memset(&cs, 0, sizeof(cs));
+	ctcopy += FORMAT_TAG_LEN;	/* skip over "$racf$*" */
+	username = strtokm(ctcopy, "*");
 	/* process username */
 	strncpy((char*)cs.userid, username, 8);
+	cs.userid[8] = 0; // terminate username at 8 bytes
 	ascii2ebcdic(cs.userid);
 	process_userid(cs.userid);
 #ifdef RACF_DEBUG
@@ -219,13 +239,8 @@ static void *get_binary(char *ciphertext)
 	return out;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & 0xf; }
-static int get_hash_1(int index) { return crypt_out[index][0] & 0xff; }
-static int get_hash_2(int index) { return crypt_out[index][0] & 0xfff; }
-static int get_hash_3(int index) { return crypt_out[index][0] & 0xffff; }
-static int get_hash_4(int index) { return crypt_out[index][0] & 0xfffff; }
-static int get_hash_5(int index) { return crypt_out[index][0] & 0xffffff; }
-static int get_hash_6(int index) { return crypt_out[index][0] & 0x7ffffff; }
+#define COMMON_GET_HASH_VAR crypt_out
+#include "common-get-hash.h"
 
 static void set_salt(void *salt)
 {
@@ -234,43 +249,41 @@ static void set_salt(void *salt)
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
-	int index = 0;
+	const int count = *pcount;
+	int index;
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
-		DES_cblock des_key;
-		DES_key_schedule schedule;
-		DES_cblock ivec;
-		int i;
+	for (index = 0; index < count; index++) {
+		if (dirty) {
+			DES_cblock des_key;
+			int i;
 
-		/* process key */
-		for(i = 0; saved_key[index][i]; i++)
-			des_key[i] = a2e_precomputed[ARCH_INDEX(saved_key[index][i])];
+			/* process key */
+			for (i = 0; saved_key[index][i]; i++)
+				des_key[i] = a2e_precomputed[ARCH_INDEX(saved_key[index][i])];
 
-		/* replace missing characters in userid by (EBCDIC space (0x40) XOR 0x55) << 1 */
-		while(i < 8)
-			des_key[i++] = 0x2a;
+			/* replace missing characters in userid by (EBCDIC space (0x40) XOR 0x55) << 1 */
+			while(i < 8)
+				des_key[i++] = 0x2a;
 
-		DES_set_key_unchecked(&des_key, &schedule);
-
+			DES_set_key_unchecked(&des_key, &schedules[index]);
+		}
 		/* do encryption */
-		memset(ivec, 0, 8);
-		DES_cbc_encrypt(cur_salt->userid, (unsigned char*)crypt_out[index], 8, &schedule, &ivec, DES_ENCRYPT);
+		DES_ecb_encrypt((const_DES_cblock*)cur_salt->userid, (DES_cblock*)crypt_out[index], &schedules[index], DES_ENCRYPT);
 	}
+	dirty = 0;
+
 	return count;
 }
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#ifdef _OPENMP
-	for (; index < count; index++)
-#endif
-		if (!memcmp(binary, crypt_out[index], BINARY_SIZE))
+	int index;
+
+	for (index = 0; index < count; index++)
+		if (!memcmp(binary, crypt_out[index], ARCH_SIZE))
 			return 1;
 	return 0;
 }
@@ -287,11 +300,8 @@ static int cmp_exact(char *source, int index)
 
 static void racf_set_key(char *key, int index)
 {
-	int saved_key_length = strlen(key);
-	if (saved_key_length > 8)
-		saved_key_length = 8;
-	memcpy(saved_key[index], key, saved_key_length);
-	saved_key[index][saved_key_length] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
+	dirty = 1;
 }
 
 static char *get_key(int index)
@@ -306,30 +316,28 @@ struct fmt_main fmt_racf = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
-                DEFAULT_ALIGN,
+		BINARY_ALIGN,
 		SALT_SIZE,
-                SALT_ALIGN,
+		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
+		FMT_CASE | FMT_TRUNC | FMT_8_BIT | FMT_OMP | FMT_OMP_BAD,
 		{ NULL },
-#endif
+		{ FORMAT_TAG },
 		racf_tests
 	}, {
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		fmt_default_prepare,
 		valid,
 		fmt_default_split,
 		get_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			fmt_default_binary_hash_0,
@@ -341,22 +349,20 @@ struct fmt_main fmt_racf = {
 			fmt_default_binary_hash_6
 		},
 		fmt_default_salt_hash,
+		NULL,
 		set_salt,
 		racf_set_key,
 		get_key,
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+#define COMMON_GET_HASH_LINK
+#include "common-get-hash.h"
 		},
 		cmp_all,
 		cmp_one,
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

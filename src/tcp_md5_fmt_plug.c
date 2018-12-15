@@ -8,11 +8,19 @@
  * modification, are permitted.
  */
 
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_tcpmd5;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_tcpmd5);
+#else
+
 #include <string.h>
+
 #ifdef _OPENMP
 #include <omp.h>
-#define OMP_SCALE 2048 // XXX
 #endif
+
+#define OMP_SCALE               16  // MKPC and OMP_SCALE tuned on Core i5-6500
 
 #include "arch.h"
 #include "md5.h"
@@ -24,7 +32,7 @@
 #include "memdbg.h"
 
 #define FORMAT_LABEL            "tcp-md5"
-#define FORMAT_NAME             "TCP MD5 Signatures, BGP"
+#define FORMAT_NAME             "TCP MD5 Signatures, BGP, MSDP"
 #define FORMAT_TAG              "$tcpmd5$"
 #define TAG_LENGTH              (sizeof(FORMAT_TAG) - 1)
 #define ALGORITHM_NAME          "MD5 32/" ARCH_BITS_STR
@@ -33,14 +41,13 @@
 
 // Linux Kernel says "#define TCP_MD5SIG_MAXKEYLEN 80"
 #define PLAINTEXT_LENGTH        80
-
 #define BINARY_SIZE             16
-#define BINARY_ALIGN            sizeof(ARCH_WORD_32)
+#define BINARY_ALIGN            sizeof(uint32_t)
 #define SALT_SIZE               sizeof(struct custom_salt)
-#define SALT_ALIGN              MEM_ALIGN_NONE
+#define SALT_ALIGN              sizeof(int)
+#define MAX_SALT                1500
 #define MIN_KEYS_PER_CRYPT      1
-#define MAX_KEYS_PER_CRYPT      1
-#define HEXCHARS                "0123456789abcdef"
+#define MAX_KEYS_PER_CRYPT      128
 
 static struct fmt_tests tests[] = {
 	/* BGP TCP_MD5SIG hashes */
@@ -51,28 +58,30 @@ static struct fmt_tests tests[] = {
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
 static int *saved_len;
-static ARCH_WORD_32 (*crypt_out)[BINARY_SIZE / sizeof(ARCH_WORD_32)];
+static uint32_t (*crypt_out)[BINARY_SIZE / sizeof(uint32_t)];
 
 static struct custom_salt {
 	int length;
-	unsigned char salt[1024]; // XXX but should be OK
+	unsigned char salt[MAX_SALT]; // fixed length, but should be OK
 } *cur_salt;
 
 static void init(struct fmt_main *self)
 {
-#ifdef _OPENMP
-	int omp_t = omp_get_num_threads();
+	omp_autotune(self, OMP_SCALE);
 
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
-	saved_key = mem_calloc_tiny(sizeof(*saved_key) *
-		self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	saved_len = mem_calloc_tiny(sizeof(*saved_len) *
-		self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
-	crypt_out = mem_calloc_tiny(sizeof(*crypt_out) *
-		self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
+	saved_key = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*saved_key));
+	saved_len = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*saved_len));
+	crypt_out = mem_calloc(self->params.max_keys_per_crypt,
+	                       sizeof(*crypt_out));
+}
+
+static void done(void)
+{
+	MEM_FREE(crypt_out);
+	MEM_FREE(saved_len);
+	MEM_FREE(saved_key);
 }
 
 static int valid(char *ciphertext, struct fmt_main *self)
@@ -89,14 +98,14 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	if (!q)
 		return 0;
 	q = q + 1;
-	if ((q - p - 1) > SALT_SIZE * 2)
+	if ((q - p - 1) > MAX_SALT * 2)
 		return 0;
 
-	len = strspn(q, HEXCHARS);
+	len = strspn(q, HEXCHARS_lc);
 	if (len != BINARY_SIZE * 2 || len != strlen(q))
 		return 0;
 
-	if (strspn(p, HEXCHARS) != q - p - 1)
+	if (strspn(p, HEXCHARS_lc) != q - p - 1)
 		return 0;
 
 	return 1;
@@ -141,14 +150,6 @@ static void *get_binary(char *ciphertext)
 	return out;
 }
 
-static int get_hash_0(int index) { return crypt_out[index][0] & 0xf; }
-static int get_hash_1(int index) { return crypt_out[index][0] & 0xff; }
-static int get_hash_2(int index) { return crypt_out[index][0] & 0xfff; }
-static int get_hash_3(int index) { return crypt_out[index][0] & 0xffff; }
-static int get_hash_4(int index) { return crypt_out[index][0] & 0xfffff; }
-static int get_hash_5(int index) { return crypt_out[index][0] & 0xffffff; }
-static int get_hash_6(int index) { return crypt_out[index][0] & 0x7ffffff; }
-
 static void set_salt(void *salt)
 {
 	cur_salt = (struct custom_salt *)salt;
@@ -156,13 +157,13 @@ static void set_salt(void *salt)
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
-	int index = 0;
+	const int count = *pcount;
+	int index;
+
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 		MD5_CTX ctx;
 
 		MD5_Init(&ctx);
@@ -171,16 +172,16 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 		MD5_Update(&ctx, saved_key[index], saved_len[index]);
 		MD5_Final((unsigned char*)crypt_out[index], &ctx);
 	}
+
 	return count;
 }
 
 static int cmp_all(void *binary, int count)
 {
-	int index = 0;
-#ifdef _OPENMP
-	for (; index < count; index++)
-#endif
-		if (((ARCH_WORD_32*)binary)[0] == crypt_out[index][0])
+	int index;
+
+	for (index = 0; index < count; index++)
+		if (((uint32_t*)binary)[0] == crypt_out[index][0])
 			return 1;
 	return 0;
 }
@@ -215,57 +216,46 @@ struct fmt_main fmt_tcpmd5 = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
-		DEFAULT_ALIGN,
+		BINARY_ALIGN,
 		SALT_SIZE,
-		DEFAULT_ALIGN,
+		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
+		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_HUGE_INPUT,
 		{ NULL },
-#endif
+		{ FORMAT_TAG },
 		tests
 	}, {
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		fmt_default_prepare,
 		valid,
 		fmt_default_split,
 		get_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
-			fmt_default_binary_hash_0,
-			fmt_default_binary_hash_1,
-			fmt_default_binary_hash_2,
-			fmt_default_binary_hash_3,
-			fmt_default_binary_hash_4,
-			fmt_default_binary_hash_5,
-			fmt_default_binary_hash_6
+			fmt_default_binary_hash
 		},
 		fmt_default_salt_hash,
+		NULL,
 		set_salt,
 		tcpmd5_set_key,
 		get_key,
 		fmt_default_clear_keys,
 		crypt_all,
 		{
-			get_hash_0,
-			get_hash_1,
-			get_hash_2,
-			get_hash_3,
-			get_hash_4,
-			get_hash_5,
-			get_hash_6
+			fmt_default_get_hash
 		},
 		cmp_all,
 		cmp_one,
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

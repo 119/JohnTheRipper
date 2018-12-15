@@ -8,13 +8,17 @@
  * There's ABSOLUTELY NO WARRANTY, express or implied.
  */
 
+#include <stdint.h>
 #include <string.h>
 
 #include "common.h"
 #include "formats.h"
+#include "options.h"
 #include "memdbg.h"
 
 #define FORMAT_LABEL			"dummy"
+#define FORMAT_TAG			"$dummy$"
+#define FORMAT_TAG_LEN			(sizeof(FORMAT_TAG)-1)
 #define FORMAT_NAME			""
 #define ALGORITHM_NAME			"N/A"
 
@@ -26,12 +30,12 @@
 #define MAX_PLAINTEXT_LENGTH		(PLAINTEXT_BUFFER_SIZE - 3) // 125
 
 typedef struct {
-	ARCH_WORD_32 hash;
+	uint32_t hash;
 	char c0;
 } dummy_binary;
 
 #define BINARY_SIZE			sizeof(dummy_binary)
-#define BINARY_ALIGN			sizeof(ARCH_WORD_32)
+#define BINARY_ALIGN			sizeof(uint32_t)
 #define SALT_SIZE			0
 #define SALT_ALIGN			1
 
@@ -41,6 +45,8 @@ typedef struct {
 static struct fmt_tests tests[] = {
 	{"$dummy$64756d6d79", "dummy"},
 	{"$dummy$", ""},
+	{"$dummy$00", ""}, // note, NOT canonical
+	{"$dummy$0064756d6d79", ""}, // note, NOT canonical
 	{"$dummy$70617373776f7264", "password"},
 	{NULL}
 };
@@ -52,7 +58,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 {
 	char *p, *q, c;
 
-	if (strncmp(ciphertext, "$dummy$", 7))
+	if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN))
 		return 0;
 
 	p = strrchr(ciphertext, '$');
@@ -64,9 +70,7 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	q = ++p;
 	while ((c = *q)) {
 		q++;
-		if (atoi16[ARCH_INDEX(c)] == 0x7F)
-			return 0;
-		if (c >= 'A' && c <= 'F') /* support lowercase only */
+		if (atoi16l[ARCH_INDEX(c)] == 0x7F)
 			return 0;
 	}
 
@@ -82,13 +86,15 @@ static int valid(char *ciphertext, struct fmt_main *self)
 		 * password length, but otherwise would be valid.
 		 * Would one warning for each invalid hash be better?
 		 */
-		if (warned < 2 && ((q - p) >> 1) > MAX_PLAINTEXT_LENGTH) {
+		if (options.verbosity >= VERB_DEFAULT && warned < 2 &&
+		    ((q - p) >> 1) > MAX_PLAINTEXT_LENGTH) {
 			warned = 2;
 			fprintf(stderr,
-			        "dummy password length %d > max. supported lengh %d\n",
+			        "dummy password length %d > max. supported length %d\n",
 				(int)((q - p) >> 1), MAX_PLAINTEXT_LENGTH);
 		}
-		else if (warned == 0 && ((q - p) >> 1) > PLAINTEXT_LENGTH) {
+		else if (options.verbosity >= VERB_DEFAULT && warned == 0 &&
+		         ((q - p) >> 1) > PLAINTEXT_LENGTH) {
 			warned = 1;
 			/*
 			 * Should a hint to recompile with adjusted PLAINTEXT_LENGTH
@@ -101,6 +107,24 @@ static int valid(char *ciphertext, struct fmt_main *self)
 		return 0;
 	}
 	return 1;
+}
+
+static char *split(char *ciphertext, int index, struct fmt_main *self)
+{
+	// canonical fix for any hash with embedded null.
+	char *cp;
+	if (strncmp(ciphertext, FORMAT_TAG, FORMAT_TAG_LEN))
+		return ciphertext;
+	cp = &ciphertext[FORMAT_TAG_LEN];
+	while (cp[0] && cp[1]) {
+		if (cp[0] == '0' && cp[1] == '0') {
+			char *cp2 = str_alloc_copy(ciphertext);
+			cp2[cp-ciphertext] = 0;
+			return cp2;
+		}
+		cp += 2;
+	}
+	return ciphertext;
 }
 
 static char *decode(char *ciphertext)
@@ -119,9 +143,9 @@ static char *decode(char *ciphertext)
 	return out;
 }
 
-static MAYBE_INLINE ARCH_WORD_32 string_hash(char *s)
+static MAYBE_INLINE uint32_t string_hash(char *s)
 {
-	ARCH_WORD_32 hash, extra;
+	uint32_t hash, extra;
 	char *p;
 
 	p = s + 2;
@@ -159,6 +183,7 @@ static void *binary(char *ciphertext)
 	static dummy_binary out;
 	char *decoded;
 
+	memset(&out, 0, sizeof(out));	/* Jumbo only */
 	decoded = decode(ciphertext);
 
 	out.hash = string_hash(decoded);
@@ -169,80 +194,80 @@ static void *binary(char *ciphertext)
 
 static int binary_hash_0(void *binary)
 {
-	ARCH_WORD_32 hash = ((dummy_binary *)binary)->hash;
+	uint32_t hash = ((dummy_binary *)binary)->hash;
 	hash ^= hash >> 8;
-	return (hash ^ (hash >> 4)) & 0xf;
+	return (hash ^ (hash >> 4)) & PH_MASK_0;
 }
 
 static int binary_hash_1(void *binary)
 {
-	ARCH_WORD_32 hash = ((dummy_binary *)binary)->hash;
-	return (hash ^ (hash >> 8)) & 0xff;
+	uint32_t hash = ((dummy_binary *)binary)->hash;
+	return (hash ^ (hash >> 8)) & PH_MASK_1;
 }
 
 static int binary_hash_2(void *binary)
 {
-	ARCH_WORD_32 hash = ((dummy_binary *)binary)->hash;
-	return (hash ^ (hash >> 12)) & 0xfff;
+	uint32_t hash = ((dummy_binary *)binary)->hash;
+	return (hash ^ (hash >> 12)) & PH_MASK_2;
 }
 
 static int binary_hash_3(void *binary)
 {
-	return ((dummy_binary *)binary)->hash & 0xffff;
+	return ((dummy_binary *)binary)->hash & PH_MASK_3;
 }
 
 static int binary_hash_4(void *binary)
 {
-	return ((dummy_binary *)binary)->hash & 0xfffff;
+	return ((dummy_binary *)binary)->hash & PH_MASK_4;
 }
 
 static int binary_hash_5(void *binary)
 {
-	return ((dummy_binary *)binary)->hash & 0xffffff;
+	return ((dummy_binary *)binary)->hash & PH_MASK_5;
 }
 
 static int binary_hash_6(void *binary)
 {
-	return ((dummy_binary *)binary)->hash & 0x7ffffff;
+	return ((dummy_binary *)binary)->hash & PH_MASK_6;
 }
 
 static int get_hash_0(int index)
 {
-	ARCH_WORD_32 hash = string_hash(saved_key[index]);
+	uint32_t hash = string_hash(saved_key[index]);
 	hash ^= hash >> 8;
-	return (hash ^ (hash >> 4)) & 0xf;
+	return (hash ^ (hash >> 4)) & PH_MASK_0;
 }
 
 static int get_hash_1(int index)
 {
-	ARCH_WORD_32 hash = string_hash(saved_key[index]);
-	return (hash ^ (hash >> 8)) & 0xff;
+	uint32_t hash = string_hash(saved_key[index]);
+	return (hash ^ (hash >> 8)) & PH_MASK_1;
 }
 
 static int get_hash_2(int index)
 {
-	ARCH_WORD_32 hash = string_hash(saved_key[index]);
-	return (hash ^ (hash >> 12)) & 0xfff;
+	uint32_t hash = string_hash(saved_key[index]);
+	return (hash ^ (hash >> 12)) & PH_MASK_2;
 }
 
 static int get_hash_3(int index)
 {
-	return string_hash(saved_key[index]) & 0xffff;
+	return string_hash(saved_key[index]) & PH_MASK_3;
 }
 
 static int get_hash_4(int index)
 {
-	return string_hash(saved_key[index]) & 0xfffff;
+	return string_hash(saved_key[index]) & PH_MASK_4;
 }
 
 static int get_hash_5(int index)
 {
-	return string_hash(saved_key[index]) & 0xffffff;
+	return string_hash(saved_key[index]) & PH_MASK_5;
 }
 
 static int get_hash_6(int index)
 {
-	return string_hash(saved_key[index]) & 0x7ffffff;
+	return string_hash(saved_key[index]) & PH_MASK_6;
 }
 
 static void set_key(char *key, int index)
@@ -295,6 +320,7 @@ struct fmt_main fmt_dummy = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
 		BINARY_ALIGN,
@@ -303,9 +329,8 @@ struct fmt_main fmt_dummy = {
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
+		{ FORMAT_TAG },
 		tests
 	}, {
 		fmt_default_init,
@@ -313,12 +338,10 @@ struct fmt_main fmt_dummy = {
 		fmt_default_reset,
 		fmt_default_prepare,
 		valid,
-		fmt_default_split,
+		split,
 		binary,
 		fmt_default_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			binary_hash_0,
@@ -330,6 +353,7 @@ struct fmt_main fmt_dummy = {
 			binary_hash_6
 		},
 		fmt_default_salt_hash,
+		NULL,
 		fmt_default_set_salt,
 		set_key,
 		get_key,

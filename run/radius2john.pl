@@ -113,6 +113,15 @@ sub process_packet {
         }
 
         $iner_data = NetPacket::Ethernet::strip($packet);
+    } elsif ($linktype == 113) {
+        # LINUX_SLL "cooked capture"
+        $protocol = unpack("n", substr($packet, 14, 2));
+        if ($protocol == 0x0800) {
+            $iner_data = substr($packet, 16);
+        } else {
+            print STDERR "cooked capture with protocol $protocol not supported.\n";
+            return;
+        }
     } else {
         print STDERR "Link type $linktype not supported.\n" ;
         return ;
@@ -133,12 +142,12 @@ sub process_packet {
     my $radius= new Net::Radius::Packet($dict, $udp->{'data'});
     $radius->show_unknown_entries(0) ;
 
-    process_radius($ip, $radius) ;
+    process_radius($ip, $radius, $udp->{'data'}) ;
 }
 
 
 sub process_radius {
-    my ($ip, $rad) = @_ ;
+    my ($ip, $rad, $udpdata) = @_ ;
 
     local $_= $rad-> code ;
 
@@ -154,15 +163,16 @@ sub process_radius {
     }
     elsif (/Access-Accept/ || /Access-Challenge/ || /Access-Reject/) {
         my $key=$ip->{'dest_ip'}. '-' . $rad->identifier() ;
+        print STDERR $_." ".($key)."\n";
         return unless defined($requests{$key}) ;
-        dump_response($ip->{'dest_ip'}, $requests{$key}, $rad) ;
+        dump_response($ip->{'dest_ip'}, $requests{$key}, $rad, $udpdata) ;
     }
 }
 
 sub dump_response {
     # Extract md5 hash from the response packet,
     # and build salt from the response packet and the corresponding request authenticator
-    my ($ip, $req_ra, $rad) = @_ ;
+    my ($ip, $req_ra, $rad, $udpdata) = @_ ;
 
     return if ($UNIQUE && defined ($dumped_ips{$ip})) ;
 
@@ -170,11 +180,13 @@ sub dump_response {
     my $hash = $rad->authenticator() ;
 
     #extract the packet raw data to get the salt
-    my $salt= $rad->pack() ;
+    my $salt= $udpdata;
     #replace Response Authenticator with the Request Authenticator
     substr($salt, 4, 16)=$req_ra ;
 
-    print $ip . ':$dynamic_1009$' .
+    my $type = '1009';
+    if (length($salt) > 16) { $type = '1017'; }
+    print $ip . ':$dynamic_' . $type . '$' .
         unpack('H*', $hash) .
         '$HEX$' . unpack('H*', $salt) .
         "\n" ;

@@ -1,43 +1,57 @@
 /* PDF cracker patch for JtR. Hacked together during Monsoon of 2012 by
- * Dhiru Kholia <dhiru.kholia at gmail.com> .
+ * Dhiru Kholia <dhiru.kholia at gmail.com>.
  *
  * This software is Copyright (c) 2012, Dhiru Kholia <dhiru.kholia at gmail.com>
  *
- * Uses code from Sumatra PDF and MuPDF which are under GPL
+ * Uses code from Sumatra PDF and MuPDF which are under GPL.
  *
- * Edited by Shane Quigley 2013
+ * Edited by Shane Quigley in 2013.
  */
 
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_pdf;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_pdf);
+#else
+
 #include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "arch.h"
 #include "params.h"
 #include "common.h"
 #include "formats.h"
 #include "misc.h"
 #include "md5.h"
+#include "aes.h"
+#include "sha2.h"
 #include "rc4.h"
 #include "pdfcrack_md5.h"
-#include <openssl/aes.h>
-#include "sha2.h"
-#ifdef _OPENMP
-#include <omp.h>
-#define OMP_SCALE               64
-#endif
+#include "loader.h"
 #include "memdbg.h"
 
 #define FORMAT_LABEL        "PDF"
 #define FORMAT_NAME         ""
+#define FORMAT_TAG          "$pdf$"
+#define FORMAT_TAG_LEN      (sizeof(FORMAT_TAG)-1)
+#define FORMAT_TAG_OLD      "$pdf$Standard*"
+#define FORMAT_TAG_OLD_LEN  (sizeof(FORMAT_TAG_OLD)-1)
 #define ALGORITHM_NAME      "MD5 SHA2 RC4/AES 32/" ARCH_BITS_STR
 #define BENCHMARK_COMMENT   ""
-#define BENCHMARK_LENGTH    -1000
+#define BENCHMARK_LENGTH    0
 #define PLAINTEXT_LENGTH    32
 #define BINARY_SIZE         0
-#define SALT_SIZE		sizeof(struct custom_salt)
+#define SALT_SIZE           sizeof(struct custom_salt)
+#define BINARY_ALIGN        1
+#define SALT_ALIGN          sizeof(int)
 #define MIN_KEYS_PER_CRYPT  1
-#define MAX_KEYS_PER_CRYPT  1
+#define MAX_KEYS_PER_CRYPT  4
 
-#if defined (_OPENMP)
-static int omp_t = 1;
+#ifndef OMP_SCALE
+#define OMP_SCALE           8 // Tuned w/ MKPC for core i7
 #endif
 
 static char (*saved_key)[PLAINTEXT_LENGTH + 1];
@@ -54,7 +68,7 @@ static struct custom_salt {
 	unsigned char o[127];
 	unsigned char ue[32];
 	unsigned char oe[32];
-	unsigned char id[32];
+	unsigned char id[128];
 	int length;
 	int length_id;
 	int length_u;
@@ -82,22 +96,25 @@ static struct fmt_tests pdf_tests[] = {
 	{"$pdf$4*4*128*-4*1*16*f7bc2744e1652cf61ca83cac8fccb535*32*f55cc5032f04b985c5aeacde5ec4270f0122456a91bae5134273a6db134c87c4*32*785d891cdcb5efa59893c78f37e7b75acef8924951039b4fa13f62d92bb3b660", "L4sV3g4z"},
 	{"$pdf$4*4*128*-4*1*16*ec8ea2af2977db1faa4a955904dc956f*32*fc413edb049720b1f8eac87a358faa740122456a91bae5134273a6db134c87c4*32*1ba7aed2f19c77ac6b5061230b62e80b48fc42918f92aef689ceb07d26204991", "ZZt0pr0x"},
 	{"$pdf$4*4*128*-4*1*16*56761d6da774d8d47387dccf1a84428c*32*640782cab5b7c8f6cf5eab82c38016540122456a91bae5134273a6db134c87c4*32*b5720d5f3d9675a280c6bb8050cbb169e039b578b2de4a42a40dc14765e064cf", "24Le`m0ns"},
+	/* This hash exposed a problem with our length_id check */
+	{"$pdf$1*2*40*-4*1*36*65623237393831382d636439372d343130332d613835372d343164303037316639386134*32*c7230519f7db63ab1676fa30686428f0f997932bf831f1c1dcfa48cfb3b7fe99*32*161cd2f7c95283ca9db930b36aad3571ee6f5fb5632f30dc790e19c5069c86b8", "vision"},
 	{NULL}
 };
 
 static void init(struct fmt_main *self)
 {
-#if defined (_OPENMP)
-	omp_t = omp_get_max_threads();
-	self->params.min_keys_per_crypt *= omp_t;
-	omp_t *= OMP_SCALE;
-	self->params.max_keys_per_crypt *= omp_t;
-#endif
-	saved_key = mem_calloc_tiny(sizeof(*saved_key) *
-			self->params.max_keys_per_crypt, MEM_ALIGN_WORD);
+	omp_autotune(self, OMP_SCALE);
+
+	saved_key = mem_calloc(sizeof(*saved_key), self->params.max_keys_per_crypt);
 	any_cracked = 0;
 	cracked_size = sizeof(*cracked) * self->params.max_keys_per_crypt;
-	cracked = mem_calloc_tiny(cracked_size, MEM_ALIGN_WORD);
+	cracked = mem_calloc(sizeof(*cracked), self->params.max_keys_per_crypt);
+}
+
+static void done(void)
+{
+	MEM_FREE(cracked);
+	MEM_FREE(saved_key);
 }
 
 static int valid(char *ciphertext, struct fmt_main *self)
@@ -106,51 +123,64 @@ static int valid(char *ciphertext, struct fmt_main *self)
 	char *p;
 	int res;
 
-	if (strncmp(ciphertext,  "$pdf$", 5) != 0)
+	if (strncmp(ciphertext,  FORMAT_TAG, FORMAT_TAG_LEN))
 		return 0;
 
 	ctcopy = strdup(ciphertext);
 	keeptr = ctcopy;
-	ctcopy += 5;
-	if ((p = strtok(ctcopy, "*")) == NULL)	/* V */
+	ctcopy += FORMAT_TAG_LEN;
+	if ((p = strtokm(ctcopy, "*")) == NULL)	/* V */
 		goto err;
-	if ((p = strtok(NULL, "*")) == NULL)	/* R */
+	if (!isdec(p)) goto err;
+	if ((p = strtokm(NULL, "*")) == NULL)	/* R */
 		goto err;
-	if ((p = strtok(NULL, "*")) == NULL)	/* length */
+	if (!isdec(p)) goto err;
+	if ((p = strtokm(NULL, "*")) == NULL)	/* length */
 		goto err;
+	if (!isdec(p)) goto err;
 	res = atoi(p);
-	if (res < 0 || res > 256)
+	if (res > 256)
 		goto err;
-	if ((p = strtok(NULL, "*")) == NULL)	/* P */
+	if ((p = strtokm(NULL, "*")) == NULL)	/* P */
 		goto err;
-	if ((p = strtok(NULL, "*")) == NULL)	/* encrypt_metadata */
+	if (!isdec_negok(p)) goto err;
+	if ((p = strtokm(NULL, "*")) == NULL)	/* encrypt_metadata */
 		goto err;
-	if ((p = strtok(NULL, "*")) == NULL)	/* length_id */
+	if ((p = strtokm(NULL, "*")) == NULL)	/* length_id */
 		goto err;
+	if (!isdec(p)) goto err;
 	res = atoi(p);
-	if (res > 32)
+	if (res > 128)
 		goto err;
-	if ((p = strtok(NULL, "*")) == NULL)	/* id */
+	if ((p = strtokm(NULL, "*")) == NULL)	/* id */
 		goto err;
 	if (strlen(p) != res * 2)
 		goto err;
-	if ((p = strtok(NULL, "*")) == NULL)	/* length_u */
+	if (!ishexlc(p))
 		goto err;
+	if ((p = strtokm(NULL, "*")) == NULL)	/* length_u */
+		goto err;
+	if (!isdec(p)) goto err;
 	res = atoi(p);
 	if (res > 127)
 		goto err;
-	if ((p = strtok(NULL, "*")) == NULL)	/* u */
+	if ((p = strtokm(NULL, "*")) == NULL)	/* u */
 		goto err;
 	if (strlen(p) != res * 2)
 		goto err;
-	if ((p = strtok(NULL, "*")) == NULL)	/* length_o */
+	if (!ishexlc(p))
 		goto err;
+	if ((p = strtokm(NULL, "*")) == NULL)	/* length_o */
+		goto err;
+	if (!isdec(p)) goto err;
 	res = atoi(p);
 	if (res > 127)
 		goto err;
-	if ((p = strtok(NULL, "*")) == NULL)	/* o */
+	if ((p = strtokm(NULL, "*")) == NULL)	/* o */
 		goto err;
 	if (strlen(p) != res * 2)
+		goto err;
+	if (!ishexlc(p))
 		goto err;
 	MEM_FREE(keeptr);
 	return 1;
@@ -160,69 +190,62 @@ err:
 	return 0;
 }
 
-static int ishex(char *q)
-{
-       while (atoi16[ARCH_INDEX(*q)] != 0x7F)
-               q++;
-       return !*q;
-}
-
 static int old_valid(char *ciphertext, struct fmt_main *self)
 {
 	char *ctcopy, *ptr, *keeptr;
 	int res;
 
-	if (strncmp(ciphertext, "$pdf$Standard*", 14))
+	if (strncmp(ciphertext, FORMAT_TAG_OLD, FORMAT_TAG_OLD_LEN))
 		return 0;
 	if (!(ctcopy = strdup(ciphertext)))
 		return 0;
 	keeptr = ctcopy;
-	ctcopy += 14;
-	if (!(ptr = strtok(ctcopy, "*"))) /* o_string */
+	ctcopy += FORMAT_TAG_OLD_LEN;
+	if (!(ptr = strtokm(ctcopy, "*"))) /* o_string */
 		goto error;
-	if (!ishex(ptr))
+	if (!ishexlc(ptr))
 		goto error;
-	if (!(ptr = strtok(NULL, "*"))) /* u_string */
+	if (!(ptr = strtokm(NULL, "*"))) /* u_string */
 		goto error;
-	if (!ishex(ptr))
+	if (!ishexlc(ptr))
 		goto error;
-	if (!(ptr = strtok(NULL, "*"))) /* fileIDLen */
+	if (!(ptr = strtokm(NULL, "*"))) /* fileIDLen */
 		goto error;
 	if (strncmp(ptr, "16", 2))
 		goto error;
-	if (!(ptr = strtok(NULL, "*"))) /* fileID */
+	if (!(ptr = strtokm(NULL, "*"))) /* fileID */
 		goto error;
-	if (!ishex(ptr))
+	if (!ishexlc(ptr))
 		goto error;
-	if (!(ptr = strtok(NULL, "*"))) /* encryptMetaData */
-		goto error;
-	res = atoi(ptr);
-	if (res != 0 && res != 1)
-		goto error;
-	if (!(ptr = strtok(NULL, "*"))) /* work_with_user */
+	if (!(ptr = strtokm(NULL, "*"))) /* encryptMetaData */
 		goto error;
 	res = atoi(ptr);
 	if (res != 0 && res != 1)
 		goto error;
-	if (!(ptr = strtok(NULL, "*"))) /* have_userpassword */
+	if (!(ptr = strtokm(NULL, "*"))) /* work_with_user */
 		goto error;
 	res = atoi(ptr);
 	if (res != 0 && res != 1)
 		goto error;
-	if (!(ptr = strtok(NULL, "*"))) /* version_major */
+	if (!(ptr = strtokm(NULL, "*"))) /* have_userpassword */
 		goto error;
-	if (!(ptr = strtok(NULL, "*"))) /* version_minor */
+	res = atoi(ptr);
+	if (res != 0 && res != 1)
 		goto error;
-	if (!(ptr = strtok(NULL, "*"))) /* length */
+	if (!(ptr = strtokm(NULL, "*"))) /* version_major */
+		goto error;
+	if (!(ptr = strtokm(NULL, "*"))) /* version_minor */
+		goto error;
+	if (!(ptr = strtokm(NULL, "*"))) /* length */
 		goto error;
 	res = atoi(ptr);
 	if (res < 0 || res > 256)
 		goto error;
-	if (!(ptr = strtok(NULL, "*"))) /* permissions */
+	if (!(ptr = strtokm(NULL, "*"))) /* permissions */
 		goto error;
-	if (!(ptr = strtok(NULL, "*"))) /* revision */
+	if (!(ptr = strtokm(NULL, "*"))) /* revision */
 		goto error;
-	if (!(ptr = strtok(NULL, "*"))) /* version */
+	if (!(ptr = strtokm(NULL, "*"))) /* version */
 		goto error;
 	MEM_FREE(keeptr);
 	return 1;
@@ -239,12 +262,12 @@ char * convert_old_to_new(char ciphertext[])
 	const char *fields[14];
 	char *p;
 	int c = 0;
-	p = strtok(ctcopy, "*");
+	p = strtokm(ctcopy, "*");
 	for (c = 0; c < 14; c++) {
 		fields[c] = p;
-		p = strtok (NULL, "*");
+		p = strtokm(NULL, "*");
 	}
-	strcpy(out,"$pdf$");
+	strcpy(out,FORMAT_TAG);
 	strcat(out,fields[13]);
 	strcat(out,"*");
 	strcat(out,fields[12]);
@@ -268,18 +291,11 @@ char * convert_old_to_new(char ciphertext[])
 
 static char *prepare(char *split_fields[10], struct fmt_main *self)
 {
-	// if it is the old format
-	if (strncmp(split_fields[1], "$pdf$Standard*", 14) == 0){
-		if(old_valid(split_fields[1], self)) {
-			char * in_new_format = convert_old_to_new(split_fields[1]);
-			// following line segfaults!
-			// strcpy(split_fields[1], in_new_format);
-			return in_new_format;
-		}else{
-			//Return something invalid
-			return "";
-		}
-	}
+	// Convert old format to new one
+	if (!strncmp(split_fields[1], FORMAT_TAG_OLD, FORMAT_TAG_OLD_LEN) &&
+	    old_valid(split_fields[1], self))
+		return convert_old_to_new(split_fields[1]);
+
 	return split_fields[1];
 }
 
@@ -290,34 +306,35 @@ static void *get_salt(char *ciphertext)
 	int i;
 	char *p;
 	static struct custom_salt cs;
-	ctcopy += 5;	/* skip over "$pdf$" marker */
-	p = strtok(ctcopy, "*");
+	memset(&cs, 0, sizeof(cs));
+	ctcopy += FORMAT_TAG_LEN;	/* skip over "$pdf$" marker */
+	p = strtokm(ctcopy, "*");
 	cs.V = atoi(p);
-	p = strtok(NULL, "*");
+	p = strtokm(NULL, "*");
 	cs.R = atoi(p);
-	p = strtok(NULL, "*");
+	p = strtokm(NULL, "*");
 	cs.length = atoi(p);
-	p = strtok(NULL, "*");
+	p = strtokm(NULL, "*");
 	cs.P = atoi(p);
-	p = strtok(NULL, "*");
+	p = strtokm(NULL, "*");
 	cs.encrypt_metadata = atoi(p);
-	p = strtok(NULL, "*");
+	p = strtokm(NULL, "*");
 	cs.length_id = atoi(p);
-	p = strtok(NULL, "*");
+	p = strtokm(NULL, "*");
 	for (i = 0; i < cs.length_id; i++)
 		cs.id[i] =
 		    atoi16[ARCH_INDEX(p[i * 2])] * 16 +
 		    atoi16[ARCH_INDEX(p[i * 2 + 1])];
-	p = strtok(NULL, "*");
+	p = strtokm(NULL, "*");
 	cs.length_u = atoi(p);
-	p = strtok(NULL, "*");
+	p = strtokm(NULL, "*");
 	for (i = 0; i < cs.length_u; i++)
 		cs.u[i] =
 		    atoi16[ARCH_INDEX(p[i * 2])] * 16 +
 		    atoi16[ARCH_INDEX(p[i * 2 + 1])];
-	p = strtok(NULL, "*");
+	p = strtokm(NULL, "*");
 	cs.length_o = atoi(p);
-	p = strtok(NULL, "*");
+	p = strtokm(NULL, "*");
 	for (i = 0; i < cs.length_o; i++)
 		cs.o[i] =
 		    atoi16[ARCH_INDEX(p[i * 2])] * 16 +
@@ -333,11 +350,7 @@ static void set_salt(void *salt)
 
 static void pdf_set_key(char *key, int index)
 {
-	int saved_key_length = strlen(key);
-	if (saved_key_length > PLAINTEXT_LENGTH)
-		saved_key_length = PLAINTEXT_LENGTH;
-	memcpy(saved_key[index], key, saved_key_length);
-	saved_key[index][saved_key_length] = 0;
+	strnzcpy(saved_key[index], key, sizeof(*saved_key));
 }
 
 static char *get_key(int index)
@@ -578,7 +591,7 @@ static void pdf_compute_user_password(unsigned char *password,  unsigned char *o
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
+	const int count = *pcount;
 	int index = 0;
 
 	if (any_cracked) {
@@ -588,21 +601,31 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 #ifdef _OPENMP
 #pragma omp parallel for
-	for (index = 0; index < count; index++)
 #endif
-	{
+	for (index = 0; index < count; index++) {
 #if !defined(_OPENMP) && defined (__CYGWIN32__) && defined (MEMDBG_ON)
 		static  /* work around for some 'unknown' bug in cygwin gcc when using memdbg.h code. I have NO explanation, JimF. */
 #endif
 		unsigned char output[32];
 		pdf_compute_user_password((unsigned char*)saved_key[index], output);
 		if (crypt_out->R == 2 || crypt_out->R == 5 || crypt_out->R == 6)
-			if(memcmp(output, crypt_out->u, 32) == 0)
-				any_cracked = cracked[index] = 1;
+			if (memcmp(output, crypt_out->u, 32) == 0) {
+				cracked[index] = 1;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+				any_cracked |= 1;
+			}
 		if (crypt_out->R == 3 || crypt_out->R == 4)
-			if(memcmp(output, crypt_out->u, 16) == 0)
-				any_cracked = cracked[index] = 1;
+			if (memcmp(output, crypt_out->u, 16) == 0) {
+				cracked[index] = 1;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+				any_cracked |= 1;
+			}
 	}
+
 	return count;
 }
 
@@ -621,6 +644,18 @@ static int cmp_exact(char *source, int index)
 	return cracked[index];
 }
 
+/*
+ * Report revision as tunable cost, since between revisions 2 and 6,
+ * only revisions 3 and 4 seem to have a similar c/s rate.
+ */
+static unsigned int pdf_revision(void *salt)
+{
+	struct custom_salt *my_salt;
+
+	my_salt = salt;
+	return (unsigned int) my_salt->R;
+}
+
 struct fmt_main fmt_pdf = {
 	{
 		FORMAT_LABEL,
@@ -628,36 +663,39 @@ struct fmt_main fmt_pdf = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
-		DEFAULT_ALIGN,
+		BINARY_ALIGN,
 		SALT_SIZE,
-		DEFAULT_ALIGN,
+		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
 		FMT_CASE | FMT_8_BIT | FMT_OMP,
-#if FMT_MAIN_VERSION > 11
-		{ NULL },
-#endif
+		{
+			"revision",
+		},
+		{ FORMAT_TAG, FORMAT_TAG_OLD },
 		pdf_tests
 	},
 	{
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		prepare,
 		valid,
 		fmt_default_split,
 		fmt_default_binary,
 		get_salt,
-#if FMT_MAIN_VERSION > 11
-		{ NULL },
-#endif
+		{
+			pdf_revision,
+		},
 		fmt_default_source,
 		{
 			fmt_default_binary_hash
 		},
 		fmt_default_salt_hash,
+		NULL,
 		set_salt,
 		pdf_set_key,
 		get_key,
@@ -671,3 +709,5 @@ struct fmt_main fmt_pdf = {
 		cmp_exact
 	}
 };
+
+#endif /* plugin stanza */

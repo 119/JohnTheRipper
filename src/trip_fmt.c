@@ -1,6 +1,6 @@
 /*
  * This file is part of John the Ripper password cracker,
- * Copyright (c) 2011,2012 by Solar Designer
+ * Copyright (c) 2011,2012,2017 by Solar Designer
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted.
@@ -8,6 +8,7 @@
  * There's ABSOLUTELY NO WARRANTY, express or implied.
  */
 
+#include <stdint.h>
 #include <string.h>
 #include <assert.h>
 
@@ -44,8 +45,8 @@ static struct fmt_tests tests[] = {
 
 #define ALGORITHM_NAME			DES_BS_ALGORITHM_NAME
 
-#define BINARY_SIZE			sizeof(ARCH_WORD_32)
-#define BINARY_ALIGN			sizeof(ARCH_WORD_32)
+#define BINARY_SIZE			sizeof(uint32_t)
+#define BINARY_ALIGN			sizeof(uint32_t)
 
 #define TRIPCODE_SCALE			0x40
 
@@ -114,12 +115,11 @@ static void init(struct fmt_main *self)
 #define howmany(x, y) (((x) + ((y) - 1)) / (y))
 	worst_case_block_count = 0xFFF +
 	    howmany(fmt_trip.params.max_keys_per_crypt - 0xFFF, DES_BS_DEPTH);
-	crypt_out = mem_alloc_tiny(sizeof(*crypt_out) * worst_case_block_count,
+	crypt_out = mem_calloc_align(sizeof(*crypt_out), worst_case_block_count,
 	    MEM_ALIGN_CACHE);
-	memset(crypt_out, 0, sizeof(*crypt_out) * worst_case_block_count);
 
 #if DES_bs_mt
-	l2g = mem_alloc_tiny(sizeof(*l2g) * DES_bs_max_kpc, MEM_ALIGN_CACHE);
+	l2g = mem_calloc_align(sizeof(*l2g), DES_bs_max_kpc, MEM_ALIGN_CACHE);
 #endif
 
 	hash_func = NULL;
@@ -141,7 +141,7 @@ static void init(struct fmt_main *self)
 	}
 #endif
 
-	buffer = mem_alloc_tiny(sizeof(*buffer) *
+	buffer = mem_calloc_align(sizeof(*buffer),
 	    fmt_trip.params.max_keys_per_crypt,
 	    MEM_ALIGN_CACHE);
 
@@ -156,6 +156,17 @@ static void init(struct fmt_main *self)
 		else
 			salt_map[i] = '.';
 	}
+}
+
+static void done(void)
+{
+	MEM_FREE(buffer);
+#if DES_bs_mt
+	MEM_FREE(l2g);
+#endif
+#if DES_BS
+	MEM_FREE(crypt_out);
+#endif
 }
 
 static int valid(char *ciphertext, struct fmt_main *self)
@@ -193,43 +204,38 @@ static void *get_binary(char *ciphertext)
 
 static int binary_hash_0(void *binary)
 {
-	return *(ARCH_WORD_32 *)binary & 0xF;
+	unsigned int w = *(uint32_t *)binary;
+	return ((w >> 1) & 0x80) | (w & 0x7F);
 }
 
 static int binary_hash_1(void *binary)
 {
-	unsigned int w = *(ARCH_WORD_32 *)binary;
-	return ((w >> 1) & 0x80) | (w & 0x7F);
+	unsigned int w = *(uint32_t *)binary;
+	return ((w >> 1) & 0xF80) | (w & 0x7F);
 }
 
 static int binary_hash_2(void *binary)
 {
-	unsigned int w = *(ARCH_WORD_32 *)binary;
-	return ((w >> 1) & 0xF80) | (w & 0x7F);
+	unsigned int w = *(uint32_t *)binary;
+	return ((w >> 2) & 0xC000) | ((w >> 1) & 0x3F80) | (w & 0x7F);
 }
 
 static int binary_hash_3(void *binary)
 {
-	unsigned int w = *(ARCH_WORD_32 *)binary;
-	return ((w >> 2) & 0xC000) | ((w >> 1) & 0x3F80) | (w & 0x7F);
+	unsigned int w = *(uint32_t *)binary;
+	return ((w >> 2) & 0xFC000) | ((w >> 1) & 0x3F80) | (w & 0x7F);
 }
 
 static int binary_hash_4(void *binary)
 {
-	unsigned int w = *(ARCH_WORD_32 *)binary;
-	return ((w >> 2) & 0xFC000) | ((w >> 1) & 0x3F80) | (w & 0x7F);
-}
-
-static int binary_hash_5(void *binary)
-{
-	unsigned int w = *(ARCH_WORD_32 *)binary;
+	unsigned int w = *(uint32_t *)binary;
 	return ((w >> 3) & 0xE00000) |
 	    ((w >> 2) & 0x1FC000) | ((w >> 1) & 0x3F80) | (w & 0x7F);
 }
 
-static int binary_hash_6(void *binary)
+static int binary_hash_5(void *binary)
 {
-	unsigned int w = *(ARCH_WORD_32 *)binary;
+	unsigned int w = *(uint32_t *)binary;
 	return ((w >> 3) & 0x7E00000) |
 	    ((w >> 2) & 0x1FC000) | ((w >> 1) & 0x3F80) | (w & 0x7F);
 }
@@ -270,13 +276,12 @@ static int NAME(int index) \
 	} \
 }
 
-define_get_hash(get_hash_0, DES_bs_get_hash_0)
+define_get_hash(get_hash_0, DES_bs_get_hash_0t)
 define_get_hash(get_hash_1, DES_bs_get_hash_1t)
 define_get_hash(get_hash_2, DES_bs_get_hash_2t)
 define_get_hash(get_hash_3, DES_bs_get_hash_3t)
 define_get_hash(get_hash_4, DES_bs_get_hash_4t)
 define_get_hash(get_hash_5, DES_bs_get_hash_5t)
-define_get_hash(get_hash_6, DES_bs_get_hash_6t)
 
 #else
 
@@ -290,11 +295,7 @@ static int binary_hash_1(void *binary)
 	return DES_STD_HASH_1(*(ARCH_WORD *)binary);
 }
 
-static int binary_hash_2(void *binary)
-{
-	return DES_STD_HASH_2(*(ARCH_WORD *)binary);
-}
-
+#define binary_hash_2 NULL
 #define binary_hash_3 NULL
 #define binary_hash_4 NULL
 #define binary_hash_5 NULL
@@ -302,7 +303,10 @@ static int binary_hash_2(void *binary)
 
 static int get_hash_0(int index)
 {
-	return DES_STD_HASH_0(buffer[index].aligned.binary[0]);
+	ARCH_WORD binary;
+
+	binary = buffer[index].aligned.binary[0];
+	return DES_STD_HASH_0(binary);
 }
 
 static int get_hash_1(int index)
@@ -313,14 +317,7 @@ static int get_hash_1(int index)
 	return DES_STD_HASH_1(binary);
 }
 
-static int get_hash_2(int index)
-{
-	ARCH_WORD binary;
-
-	binary = buffer[index].aligned.binary[0];
-	return DES_STD_HASH_2(binary);
-}
-
+#define get_hash_2 NULL
 #define get_hash_3 NULL
 #define get_hash_4 NULL
 #define get_hash_5 NULL
@@ -491,7 +488,7 @@ static MAYBE_INLINE void crypt_traverse_by_salt(int count)
 
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
-	int count = *pcount;
+	const int count = *pcount;
 	crypt_link_by_salt(count);
 	crypt_traverse_by_salt(count);
 	return count;
@@ -519,7 +516,7 @@ static int cmp_one(void *binary, int index)
 	int block = buffer[index].block;
 	MAYBE_T0;
 	blkcpy(DES_bs_all.B, crypt_out[block], 32);
-	return DES_bs_cmp_one((ARCH_WORD_32 *)binary, 32, buffer[index].index);
+	return DES_bs_cmp_one((uint32_t *)binary, 32, buffer[index].index);
 }
 
 static int cmp_exact(char *source, int index)
@@ -584,6 +581,7 @@ struct fmt_main fmt_trip = {
 		ALGORITHM_NAME,
 		BENCHMARK_COMMENT,
 		BENCHMARK_LENGTH,
+		0,
 		PLAINTEXT_LENGTH,
 		BINARY_SIZE,
 		BINARY_ALIGN,
@@ -591,30 +589,34 @@ struct fmt_main fmt_trip = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
+/*
+ * Characters 2 and 3 of passwords form a descrypt salt.  Formally, 8-bit
+ * characters are invalid in descrypt salts, but our implementation, as well as
+ * most others, actually handles them in some way, and the 8th bit is not
+ * necessarily ignored there.  Hence, we set FMT_8_BIT, even though the 8th bit
+ * is ignored for most character positions and its behavior for positions 2 and
+ * 3 is not precisely defined.
+ */
 #if DES_BS && DES_bs_mt
-		FMT_OMP |
+		FMT_OMP | FMT_OMP_BAD |
 #endif
 #if DES_BS
-		FMT_CASE | FMT_BS,
-#else
-		FMT_CASE,
+		FMT_BS |
 #endif
-#if FMT_MAIN_VERSION > 11
+		FMT_TRUNC | FMT_CASE | FMT_8_BIT,
 		{ NULL },
-#endif
+		{ NULL },
 		tests
 	}, {
 		init,
-		fmt_default_done,
+		done,
 		fmt_default_reset,
 		fmt_default_prepare,
 		valid,
 		fmt_default_split,
 		get_binary,
 		fmt_default_salt,
-#if FMT_MAIN_VERSION > 11
 		{ NULL },
-#endif
 		fmt_default_source,
 		{
 			binary_hash_0,
@@ -623,9 +625,10 @@ struct fmt_main fmt_trip = {
 			binary_hash_3,
 			binary_hash_4,
 			binary_hash_5,
-			binary_hash_6
+			NULL
 		},
 		fmt_default_salt_hash,
+		NULL,
 		fmt_default_set_salt,
 		set_key,
 		get_key,
@@ -638,7 +641,7 @@ struct fmt_main fmt_trip = {
 			get_hash_3,
 			get_hash_4,
 			get_hash_5,
-			get_hash_6
+			NULL
 		},
 		cmp_all,
 		cmp_one,

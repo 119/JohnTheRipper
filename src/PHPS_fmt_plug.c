@@ -30,6 +30,17 @@
  *
  */
 
+#if AC_BUILT
+#include "autoconfig.h"
+#endif
+#ifndef DYNAMIC_DISABLED
+
+#if FMT_EXTERNS_H
+extern struct fmt_main fmt_PHPS;
+#elif FMT_REGISTERS_H
+john_register_one(&fmt_PHPS);
+#else
+
 #include <string.h>
 
 #include "common.h"
@@ -49,15 +60,22 @@
 #define MD5_HEX_SIZE		(MD5_BINARY_SIZE * 2)
 
 #define BINARY_SIZE			MD5_BINARY_SIZE
+#define BINARY_ALIGN		MEM_ALIGN_WORD
 
 #define SALT_SIZE			3
+#define DYNA_SALT_SIZE		(sizeof(char*))
+#define SALT_ALIGN			MEM_ALIGN_WORD
 
-#define PLAINTEXT_LENGTH	32
+// set PLAINTEXT_LENGTH to 0, so dyna will set this
+#define PLAINTEXT_LENGTH	0
 #define CIPHERTEXT_LENGTH	(1 + 4 + 1 + SALT_SIZE * 2 + 1 + MD5_HEX_SIZE)
 
 static struct fmt_tests phps_tests[] = {
 	{"$PHPS$433925$5d756853cd63acee76e6dcd6d3728447", "welcome"},
 	{"$PHPS$73616c$aba22b2ceb7c841473c03962b145feb3", "password"},
+	{"$PHPS$247824$ad14afbbf0e16d4ad8c8985263a3d051","test"},  // salt is $x$ (I want to test that a $ works)
+	{"$dynamic_6$ad14afbbf0e16d4ad8c8985263a3d051$HEX$247824","test"},
+	//{"$dynamic_6$ad14afbbf0e16d4ad8c8985263a3d051$$x$","test"}, // fails $HEX$ IS required by dyna
 	{NULL}
 };
 
@@ -97,25 +115,58 @@ static char *Convert(char *Buf, char *ciphertext)
 
 static char *our_split(char *ciphertext, int index, struct fmt_main *self)
 {
-	return Convert(Conv_Buf, ciphertext);
-}
+	if (!strncmp(ciphertext, "$dynamic_6$", 11)) {
+		// convert back into $PHPS$ format
+		static char Buf[128];
+		char *cp;
 
-static char *our_prepare(char *split_fields[10], struct fmt_main *self)
-{
-	return pDynamic_6->methods.prepare(split_fields, self);
+		strcpy(Buf, "$PHPS$");
+		cp = strchr(&ciphertext[11], '$');
+		++cp;
+		if (!strncmp(cp, "HEX$", 4)) {
+			cp += 4;
+			strcat(Buf, cp);
+		} else {
+			int i, len = strlen(cp);
+			char *cp2 = &Buf[strlen(Buf)];
+			for (i = 0; i < len; ++i)
+				cp2 += sprintf(cp2, "%02x", *cp++);
+		}
+		strcat(Buf, "$");
+		sprintf(&Buf[strlen(Buf)], "%32.32s", &ciphertext[11]);
+		strlwr(&Buf[6]);
+		return Buf;
+	}
+	if (!strncmp(ciphertext, "$PHPS$", 6)) {
+		static char Buf[128];
+		strnzcpy(Buf, ciphertext, sizeof(Buf));
+		strlwr(&Buf[6]);
+		return Buf;
+	}
+	return ciphertext;
 }
 
 static int phps_valid(char *ciphertext, struct fmt_main *self)
 {
 	int i;
-	if (!ciphertext ) // || strlen(ciphertext) < CIPHERTEXT_LENGTH)
+
+	if (!ciphertext )
 		return 0;
 
 	get_ptr();
-	i = strlen(ciphertext);
+	i = strnlen(ciphertext, CIPHERTEXT_LENGTH + 1);
 
 	if (i != CIPHERTEXT_LENGTH) {
-		return pDynamic_6->methods.valid(ciphertext, pDynamic_6);
+		int val = pDynamic_6->methods.valid(ciphertext, pDynamic_6);
+		char *cp;
+		int wanted_len = 3+1; // salt length + length of the '$' char.
+
+		if (!val)
+			return 0;
+		cp = strrchr(ciphertext, '$');
+		if (strstr(ciphertext, "$HEX$"))
+			wanted_len += 3; // salt is in hex.
+		return cp && strlen(cp) == wanted_len;
 	}
 
 	if (strncmp(ciphertext, "$PHPS$", 6) != 0)
@@ -143,6 +194,7 @@ static void * our_salt(char *ciphertext)
 }
 static void * our_binary(char *ciphertext)
 {
+	get_ptr();
 	return pDynamic_6->methods.binary(Convert(Conv_Buf, ciphertext));
 }
 
@@ -152,10 +204,9 @@ struct fmt_main fmt_PHPS =
 		// setup the labeling and stuff. NOTE the max and min crypts are set to 1
 		// here, but will be reset within our init() function.
 		FORMAT_LABEL, FORMAT_NAME, ALGORITHM_NAME, BENCHMARK_COMMENT, BENCHMARK_LENGTH,
-		PLAINTEXT_LENGTH, BINARY_SIZE, DEFAULT_ALIGN, SALT_SIZE+1, DEFAULT_ALIGN, 1, 1, FMT_CASE | FMT_8_BIT,
-#if FMT_MAIN_VERSION > 11
+		0, PLAINTEXT_LENGTH, BINARY_SIZE, BINARY_ALIGN, DYNA_SALT_SIZE, SALT_ALIGN, 1, 1, FMT_CASE | FMT_8_BIT | FMT_DYNAMIC | FMT_SPLIT_UNIFIES_CASE,
 		{ NULL },
-#endif
+		{ NULL },
 		phps_tests
 	},
 	{
@@ -165,19 +216,23 @@ struct fmt_main fmt_PHPS =
 		fmt_default_done,
 		fmt_default_reset,
 		fmt_default_prepare,
-		phps_valid
+		phps_valid,
+		our_split
 	}
 };
+
+static void link_funcs() {
+	fmt_PHPS.methods.salt   = our_salt;
+	fmt_PHPS.methods.binary = our_binary;
+	fmt_PHPS.methods.split = our_split;
+	fmt_PHPS.methods.prepare = fmt_default_prepare;
+}
 
 static void phps_init(struct fmt_main *self)
 {
 	if (self->private.initialized == 0) {
-		pDynamic_6 = dynamic_THIN_FORMAT_LINK(&fmt_PHPS, Convert(Conv_Buf, phps_tests[0].ciphertext), "phps", 1);
-		fmt_PHPS.methods.salt   = our_salt;
-		fmt_PHPS.methods.binary = our_binary;
-		fmt_PHPS.methods.split = our_split;
-		fmt_PHPS.methods.prepare = our_prepare;
-		fmt_PHPS.params.algorithm_name = pDynamic_6->params.algorithm_name;
+		get_ptr();
+		pDynamic_6->methods.init(pDynamic_6);
 		self->private.initialized = 1;
 	}
 }
@@ -185,18 +240,10 @@ static void phps_init(struct fmt_main *self)
 static void get_ptr() {
 	if (!pDynamic_6) {
 		pDynamic_6 = dynamic_THIN_FORMAT_LINK(&fmt_PHPS, Convert(Conv_Buf, phps_tests[0].ciphertext), "phps", 0);
-		fmt_PHPS.methods.salt   = our_salt;
-		fmt_PHPS.methods.binary = our_binary;
-		fmt_PHPS.methods.split = our_split;
-		fmt_PHPS.methods.prepare = our_prepare;
+		link_funcs();
 	}
 }
 
-/**
- * GNU Emacs settings: K&R with 1 tab indent.
- * Local Variables:
- * c-file-style: "k&r"
- * c-basic-offset: 8
- * indent-tabs-mode: t
- * End:
- */
+#endif /* plugin stanza */
+
+#endif /* DYNAMIC_DISABLED */
